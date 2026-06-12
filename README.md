@@ -4,6 +4,8 @@ A **Streamlit GUI** for automated ohmic-drop (*iR*) compensation of
 linear-sweep voltammetry (LSV) data, using the uncompensated resistance
 **Ru** estimated from electrochemical impedance spectroscopy (EIS).
 
+**🔗 Live app:** <https://lsv-ir-compensation-calculation.streamlit.app/>
+
 > Estimate `Ru` from an EIS Nyquist arc, then apply a user-selected
 > iR-compensation factor (5 – 85 %) to your LSV curve and export the
 > corrected data.
@@ -137,6 +139,33 @@ result.potential_corrected   # iR-corrected potentials (V)
 - Compensation is intentionally capped at **85 %** — full (100 %) positive
   feedback can over-correct and induce oscillation; partial compensation is
   safer and is the project default.
+
+---
+
+## Security
+
+Because the app accepts arbitrary uploaded files on a public URL, several
+safeguards are built in:
+
+- **Upload limits.** `.streamlit/config.toml` caps upload size (15 MB) and
+  message size, keeps XSRF protection on, disables usage telemetry, and hides
+  Python tracebacks from end users (`showErrorDetails = false`).
+- **Malicious-file defenses** (`ir_compensation/data_io.py`): Excel archives
+  are checked for **decompression-bomb** expansion before parsing; tables are
+  rejected above row/column caps (memory-exhaustion / DoS guard); the number of
+  parsed column-pairs is capped; and header-derived labels are stripped of
+  control characters / newlines before display or CSV output (prevents
+  CSV/markdown injection).
+- **No persisted data.** Uploads are processed in memory only; nothing is
+  written to disk. The sample is **not preloaded**, and a **Clear / reset**
+  button wipes session data.
+- **Optional password gate.** Set an `app_password` secret (see
+  `.streamlit/secrets.toml.example`) to require a password; comparison is
+  constant-time. Leave it unset for a fully public app. `secrets.toml` is
+  git-ignored, so credentials are never committed.
+
+To restrict *who* can open the app entirely, you can also limit viewers under
+the app's **Settings → Sharing** on Streamlit Community Cloud.
 
 ---
 

@@ -13,6 +13,7 @@ Workflow
 
 from __future__ import annotations
 
+import hmac
 import io
 
 import numpy as np
@@ -59,6 +60,35 @@ def render_citation() -> None:
         )
 
 
+def require_access() -> bool:
+    """Optional password gate.
+
+    Open by default. If an ``app_password`` secret is configured (via
+    ``.streamlit/secrets.toml`` locally or the app's Secrets on Streamlit
+    Cloud), visitors must enter it before using the app. Uses a constant-time
+    comparison to avoid timing side-channels and never echoes the password.
+    """
+    try:
+        expected = st.secrets["app_password"]
+    except Exception:
+        return True  # no password set -> public access
+
+    if st.session_state.get("authed"):
+        return True
+
+    st.title("⚡ Automated iR Compensation")
+    st.text_input("Password", type="password", key="_pw")
+    if st.button("Enter"):
+        if hmac.compare_digest(str(st.session_state.get("_pw", "")),
+                               str(expected)):
+            st.session_state["authed"] = True
+            del st.session_state["_pw"]
+            st.rerun()
+        else:
+            st.error("Incorrect password.")
+    return False
+
+
 def png_download(fig, filename: str, key: str,
                  label: str = "⬇️ Download figure (PNG)") -> None:
     """Render a button that exports a Plotly figure as a high-res PNG.
@@ -89,20 +119,38 @@ def sidebar_data_loader():
     datasets parsed from repeated column pairs in the sheet/file.
     """
     st.sidebar.header("1 · Data source")
+
+    # Clear / reset: bump a nonce so the file_uploader widgets are recreated
+    # empty, and wipe loaded state. Uploads live only in this session's memory.
+    if "uploader_nonce" not in st.session_state:
+        st.session_state.uploader_nonce = 0
+    if st.sidebar.button("🗑️ Clear / reset files",
+                         help="Remove uploaded files and start over."):
+        st.session_state.uploader_nonce += 1
+        for k in list(st.session_state.keys()):
+            if k not in ("uploader_nonce", "authed"):
+                del st.session_state[k]
+        st.rerun()
+    nonce = st.session_state.uploader_nonce
+
+    # Upload is the default; the bundled sample is opt-in (not preloaded).
     source = st.sidebar.radio(
         "Choose input",
-        ["Sample workbook", "Upload Excel workbook", "Upload two CSV files"],
+        ["Upload Excel workbook", "Upload two CSV files", "Use bundled sample"],
         help="Excel: EIS sheet = Z', Z'' pairs; LSV sheet = Potential, Current "
              "pairs. Several datasets may sit side-by-side as repeated pairs.",
     )
 
     try:
-        if source in ("Sample workbook", "Upload Excel workbook"):
-            if source == "Sample workbook":
+        if source in ("Use bundled sample", "Upload Excel workbook"):
+            if source == "Use bundled sample":
                 src = SAMPLE_PATH
                 name = "sample-data/Book1.xlsx"
             else:
-                up = st.sidebar.file_uploader("Excel (.xlsx)", type=["xlsx", "xls"])
+                up = st.sidebar.file_uploader(
+                    "Excel (.xlsx)", type=["xlsx", "xls"],
+                    key=f"xlsx_{nonce}",
+                )
                 if up is None:
                     st.info("⬅️ Upload an Excel workbook to begin.")
                     return None, None, None
@@ -124,9 +172,12 @@ def sidebar_data_loader():
             return eis_list, lsv_list, name
 
         # Two CSV files
-        eis_up = st.sidebar.file_uploader("EIS CSV (Z', Z'')", type=["csv", "txt"])
+        eis_up = st.sidebar.file_uploader(
+            "EIS CSV (Z', Z'')", type=["csv", "txt"], key=f"eis_csv_{nonce}"
+        )
         lsv_up = st.sidebar.file_uploader(
-            "LSV CSV (Potential, Current)", type=["csv", "txt"]
+            "LSV CSV (Potential, Current)", type=["csv", "txt"],
+            key=f"lsv_csv_{nonce}",
         )
         if eis_up is None or lsv_up is None:
             st.info("⬅️ Upload both CSV files to begin.")
@@ -298,29 +349,33 @@ _PALETTE = ["#d62728", "#2ca02c", "#9467bd", "#ff7f0e", "#8c564b",
             "#e377c2", "#17becf", "#bcbd22"]
 
 
-def _build_export_csv(lsv_d, results, ru, current_unit, source_label) -> str:
-    """Assemble a CSV with metadata comment lines + one column block per factor."""
-    meta = [
-        "# Automated iR compensation — corrected LSV data",
-        f"# Source: {source_label}",
-        f"# Ru (uncompensated resistance) = {ru:.4f} ohm",
-        f"# Current unit in source = {current_unit}",
-        f"# Compensation factors (%) = {', '.join(str(r.factor_percent) for r in results)}",
-        "# Formula: E_corrected = E_measured - (factor/100) * I * Ru",
-    ]
-    cols = {
-        "Potential_raw_V": lsv_d.potential,
-        f"Current_{current_unit}": lsv_d.current,
-    }
+def _build_export_csv(lsv_d, results, ru, current_unit) -> str:
+    """Assemble an Origin-friendly CSV of Potential-vs-Current pairs.
+
+    Layout (no comment lines, so OriginLab / Excel import it directly):
+
+        Potential_raw_V, Current_<unit>,
+        Ecorr_<f>pct_Ru<ru>ohm_V, Current_<unit>,  (one pair per factor)
+
+    Each curve is a consecutive (X = Potential, Y = Current) pair — set the
+    potential column as X in Origin and plot the adjacent current as Y. Ru and
+    the compensation % are encoded in the corrected-potential column names, so
+    the provenance travels with the data. Raw pair comes first, then factors in
+    ascending order; the file can also be re-loaded by this app.
+    """
+    cur_header = f"Current_{current_unit}"
+    headers = ["Potential_raw_V", cur_header]
+    columns = [lsv_d.potential, lsv_d.current]
     for r in results:
         p = int(r.factor_percent)
-        cols[f"iRdrop_{p}pct_V"] = r.ir_drop
-        cols[f"Ecorr_{p}pct_V"] = r.potential_corrected
-    body = pd.DataFrame(cols).to_csv(index=False)
-    return "\n".join(meta) + "\n" + body
+        headers += [f"Ecorr_{p}pct_Ru{ru:.2f}ohm_V", cur_header]
+        columns += [r.potential_corrected, lsv_d.current]
+    frame = pd.DataFrame(np.column_stack(columns))
+    frame.columns = headers  # allows the repeated Current header
+    return frame.to_csv(index=False)
 
 
-def render_lsv_tab(lsv_d, ru: float | None, source_label: str):
+def render_lsv_tab(lsv_d, ru: float | None):
     st.subheader("LSV — ohmic-drop (iR) correction")
     if ru is None:
         st.warning("Determine Ru on the **EIS / Ru Analysis** tab first.")
@@ -367,6 +422,13 @@ def render_lsv_tab(lsv_d, ru: float | None, source_label: str):
         for f in factors
     ]
 
+    # Data extents across raw + all corrected curves (defaults for axis range).
+    all_pot = np.concatenate(
+        [lsv_d.potential] + [r.potential_corrected for r in results]
+    )
+    x_lo, x_hi = float(np.min(all_pot)), float(np.max(all_pot))
+    y_lo, y_hi = float(np.min(lsv_d.current)), float(np.max(lsv_d.current))
+
     with right:
         view = st.radio(
             "Comparison view",
@@ -374,6 +436,27 @@ def render_lsv_tab(lsv_d, ru: float | None, source_label: str):
             horizontal=True,
             help="Both show the LSV with vs without iR compensation.",
         )
+        x_range = y_range = None
+        with st.expander("🔧 Axis range (applies to plot & PNG export)"):
+            if st.checkbox("Set axis limits manually"):
+                cx1, cx2 = st.columns(2)
+                xmin = cx1.number_input("X min (V)", value=round(x_lo, 3),
+                                        step=0.05, format="%.3f")
+                xmax = cx2.number_input("X max (V)", value=round(x_hi, 3),
+                                        step=0.05, format="%.3f")
+                cy1, cy2 = st.columns(2)
+                ymin = cy1.number_input(f"Y min ({current_unit})",
+                                        value=round(y_lo, 3), step=0.5,
+                                        format="%.3f")
+                ymax = cy2.number_input(f"Y max ({current_unit})",
+                                        value=round(y_hi, 3), step=0.5,
+                                        format="%.3f")
+                if xmax > xmin:
+                    x_range = [xmin, xmax]
+                if ymax > ymin:
+                    y_range = [ymin, ymax]
+                else:
+                    st.caption("Max must exceed min; using auto range.")
         if view == "Overlay (same axes)":
             fig = go.Figure()
             fig.add_trace(
@@ -423,11 +506,20 @@ def render_lsv_tab(lsv_d, ru: float | None, source_label: str):
             )
             fig.update_layout(title="LSV — with vs without iR compensation")
 
+        # Apply manual axis ranges (affects both the on-screen plot and PNG).
+        if x_range is not None:
+            fig.update_xaxes(range=x_range)
+        if y_range is not None:
+            fig.update_yaxes(range=y_range)
+
+        # Legend at the bottom so it never overlaps the title / subplot titles.
         fig.update_layout(
             template="plotly_white",
-            height=440,
-            legend=dict(orientation="h", yanchor="bottom", y=1.02),
-            margin=dict(l=10, r=10, t=70, b=10),
+            height=470,
+            title=dict(y=0.97, yanchor="top"),
+            legend=dict(orientation="h", yanchor="top", y=-0.18,
+                        xanchor="center", x=0.5),
+            margin=dict(l=10, r=10, t=60, b=90),
         )
         st.plotly_chart(fig, use_container_width=True)
         fac_png = "-".join(str(int(r.factor_percent)) for r in results)
@@ -466,6 +558,13 @@ def render_lsv_tab(lsv_d, ru: float | None, source_label: str):
     )
     st.markdown("**Results summary**")
     st.dataframe(summary, use_container_width=True, hide_index=True)
+    st.download_button(
+        "⬇️ Download results table (CSV)",
+        data=summary.to_csv(index=False).encode("utf-8"),
+        file_name=f"ir_results_summary_Ru{ru:.1f}.csv",
+        mime="text/csv",
+        key="dl_summary",
+    )
 
     # Warn if any selected factor over-compensates, and recommend a safe one.
     if any(a.over_compensated for a in assessments):
@@ -501,7 +600,12 @@ def render_lsv_tab(lsv_d, ru: float | None, source_label: str):
             "re-check the EIS arc fit."
         )
 
-    csv_text = _build_export_csv(lsv_d, results, ru, current_unit, source_label)
+    csv_text = _build_export_csv(lsv_d, results, ru, current_unit)
+    st.caption(
+        "Export layout (Origin-friendly): consecutive Potential–Current pairs — "
+        "raw first, then one **corrected potential vs current** pair per factor. "
+        "Current is unchanged by iR compensation (only potential shifts)."
+    )
     with st.expander("Preview export (first lines)"):
         st.code("\n".join(csv_text.splitlines()[:14]), language="text")
     fac_tag = "-".join(str(int(r.factor_percent)) for r in results)
@@ -517,6 +621,9 @@ def render_lsv_tab(lsv_d, ru: float | None, source_label: str):
 # Main                                                                         #
 # --------------------------------------------------------------------------- #
 def main():
+    if not require_access():
+        st.stop()
+
     st.title("⚡ Automated iR Compensation")
     st.caption("EIS fitting → Ru extraction → LSV ohmic-drop correction")
 
@@ -546,16 +653,13 @@ def main():
         f"EIS cols: {eis_d.label}\n\nLSV cols: {lsv_d.label}"
     )
 
-    sample_tag = f"Sample {sel + 1}"
     tab_eis, tab_lsv = st.tabs(
         ["📈 EIS / Ru Analysis", "🔬 LSV iR Correction"]
     )
     with tab_eis:
         ru = render_eis_tab(eis_d, eis_list, sel)
     with tab_lsv:
-        render_lsv_tab(
-            lsv_d, ru, f"{label or 'uploaded data'} [{sample_tag}]"
-        )
+        render_lsv_tab(lsv_d, ru)
 
     render_citation()
     st.divider()

@@ -10,11 +10,65 @@ positional columns (first = x, second = y) when headers are unrecognised.
 
 from __future__ import annotations
 
+import zipfile
 from dataclasses import dataclass
 from pathlib import Path
 
 import numpy as np
 import pandas as pd
+
+
+# ---- safety limits for untrusted uploads -----------------------------------
+# A public deployment ingests arbitrary user files. These caps bound the work
+# done per upload so a crafted file cannot exhaust memory/CPU (denial of
+# service) or smuggle in pathological structure.
+MAX_UNCOMPRESSED_BYTES = 200 * 1024 * 1024  # xlsx is a zip: guard zip bombs
+MAX_ROWS = 500_000                          # reject absurdly tall tables
+MAX_COLS = 1_000                            # reject absurdly wide tables
+MAX_DATASETS = 100                          # cap parsed column-pairs
+_LABEL_MAXLEN = 60
+
+
+class DataValidationError(ValueError):
+    """Raised when an input file violates a safety limit or is malformed."""
+
+
+def _safe_label(value) -> str:
+    """Sanitise a header-derived label before it is displayed or written.
+
+    Strips control characters and newlines (which could break CSV/markdown
+    output or inject rows) and truncates length.
+    """
+    text = "".join(c for c in str(value) if c.isprintable())
+    text = text.replace("\r", " ").replace("\n", " ").strip()
+    return text[:_LABEL_MAXLEN] if text else "?"
+
+
+def _guard_excel_archive(src) -> None:
+    """Reject Excel files that decompress to an unsafe size (zip bombs).
+
+    .xlsx/.xlsm are ZIP archives; the upload size says nothing about how much
+    they expand in memory. Sum the declared uncompressed sizes and refuse the
+    file if it exceeds the cap. Leaves the stream position reset for re-reading.
+    """
+    seekable = hasattr(src, "seek")
+    if seekable:
+        src.seek(0)
+    try:
+        with zipfile.ZipFile(src) as zf:
+            total = 0
+            for info in zf.infolist():
+                total += info.file_size
+                if total > MAX_UNCOMPRESSED_BYTES:
+                    raise DataValidationError(
+                        "Excel file expands too large; rejected as a possible "
+                        "decompression bomb."
+                    )
+    except zipfile.BadZipFile as exc:
+        raise DataValidationError("Not a valid .xlsx workbook.") from exc
+    finally:
+        if seekable:
+            src.seek(0)
 
 
 # ---- column name hints -----------------------------------------------------
@@ -50,6 +104,7 @@ class LSVData:
 
 def list_sheets(path: str | Path) -> list[str]:
     """Return the sheet names of an Excel workbook."""
+    _guard_excel_archive(path)
     return pd.ExcelFile(path).sheet_names
 
 
@@ -62,17 +117,31 @@ def _match_column(columns: list[str], hints: tuple[str, ...]) -> str | None:
     return None
 
 
+def _check_shape(df: pd.DataFrame) -> pd.DataFrame:
+    """Reject tables whose size exceeds the safety caps (DoS guard)."""
+    if df.shape[0] > MAX_ROWS or df.shape[1] > MAX_COLS:
+        raise DataValidationError(
+            f"Input too large ({df.shape[0]} rows x {df.shape[1]} cols); "
+            f"limit is {MAX_ROWS} rows x {MAX_COLS} cols."
+        )
+    return df
+
+
 def _read_table(path, sheet: str | int | None) -> pd.DataFrame:
     # In-memory buffers (e.g. Streamlit uploads) have no path/suffix; route them
     # by sheet: a sheet argument implies Excel, otherwise CSV.
     if not isinstance(path, (str, Path)):
         if sheet is None:
-            return pd.read_csv(path)
-        return pd.read_excel(path, sheet_name=sheet)
+            return _check_shape(pd.read_csv(path))
+        _guard_excel_archive(path)
+        return _check_shape(pd.read_excel(path, sheet_name=sheet))
     path = Path(path)
     if path.suffix.lower() in (".csv", ".txt"):
-        return pd.read_csv(path)
-    return pd.read_excel(path, sheet_name=sheet if sheet is not None else 0)
+        return _check_shape(pd.read_csv(path))
+    _guard_excel_archive(path)
+    return _check_shape(
+        pd.read_excel(path, sheet_name=sheet if sheet is not None else 0)
+    )
 
 
 def _two_numeric_columns(
@@ -120,14 +189,18 @@ def _iter_column_pairs(df: pd.DataFrame):
     pair's headers.
     """
     cols = list(df.columns)
+    emitted = 0
     for k in range(0, len(cols) - 1, 2):
+        if emitted >= MAX_DATASETS:
+            break
         x_col, y_col = cols[k], cols[k + 1]
         x = pd.to_numeric(df[x_col], errors="coerce").to_numpy(dtype=float)
         y = pd.to_numeric(df[y_col], errors="coerce").to_numpy(dtype=float)
         mask = np.isfinite(x) & np.isfinite(y)
         if not mask.any():
             continue
-        label = f"{str(x_col).strip()} / {str(y_col).strip()}"
+        label = f"{_safe_label(x_col)} / {_safe_label(y_col)}"
+        emitted += 1
         yield label, x[mask], y[mask]
 
 

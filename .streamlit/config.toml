@@ -1,0 +1,22 @@
+# Hardened defaults for a public deployment.
+[server]
+# Cap upload size (MB). EIS/LSV files are tiny; this blunts DoS via huge files.
+maxUploadSize = 15
+maxMessageSize = 50
+# Cross-site request forgery protection (keep on). CORS must stay enabled for
+# XSRF protection to function.
+enableXsrfProtection = true
+enableCORS = true
+# No remote debugging / hot-reload exposure in production.
+runOnSave = false
+
+[browser]
+# Do not send usage telemetry.
+gatherUsageStats = false
+
+[client]
+# Don't surface Python tracebacks to end users (avoid info leakage).
+showErrorDetails = false
+
+[theme]
+base = "light"
