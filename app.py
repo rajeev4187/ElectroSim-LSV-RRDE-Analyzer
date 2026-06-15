@@ -26,7 +26,7 @@ from ir_compensation import correction, data_io, eis
 
 st.set_page_config(page_title="Automated iR Compensation", page_icon="⚡", layout="wide")
 
-SAMPLE_PATH = "sample-data/Book1.xlsx"
+SAMPLE_PATH = "sample-data/Book1-original data.xlsx"
 REPO_URL = "https://github.com/rajeev4187/LSV-iR-compensation-calculation"
 CITATION_TEXT = (
     "Kumar, R. (2026). Automated iR Compensation: EIS fitting and LSV "
@@ -196,19 +196,160 @@ def sidebar_data_loader():
 
 
 # --------------------------------------------------------------------------- #
+# Units & electrode area                                                      #
+# --------------------------------------------------------------------------- #
+_ABS_CURRENT_UNITS = ["mA", "A", "µA", "nA"]
+_DENSITY_CURRENT_UNITS = ["mA/cm²", "A/cm²", "µA/cm²", "nA/cm²"]
+
+
+def _detect_units(eis_label: str, lsv_label: str):
+    """Guess (current_unit, ru_unit) from the column-header labels.
+
+    The sample workbook's headers carry units (e.g. ``Current (mA/cm2)``,
+    ``Z' (Ohm)``); we read them so the sidebar dropdowns start on the right
+    choice. Returns ``None`` for either guess when nothing recognisable is
+    found, leaving that control on its default.
+    """
+    lsv = (lsv_label or "").lower()
+    eis = (eis_label or "").lower()
+    # Look only at the current half of the LSV label (after "current").
+    cur = lsv.split("current", 1)[1] if "current" in lsv else lsv
+    density = "cm2" in cur or "cm²" in cur
+
+    if "ma" in cur:
+        prefix = "mA"
+    elif "µa" in cur or "ua" in cur:
+        prefix = "µA"
+    elif "na" in cur:
+        prefix = "nA"
+    elif "a" in cur:
+        prefix = "A"
+    else:
+        prefix = None
+
+    current_unit = None
+    if prefix is not None:
+        current_unit = f"{prefix}/cm²" if density else prefix
+
+    ru_unit = None
+    if "ohm" in eis or "Ω".lower() in eis or "ω" in eis:
+        ru_unit = correction.RU_OHM_CM2 if ("cm2" in eis or "cm²" in eis) \
+            else correction.RU_OHM
+    return current_unit, ru_unit
+
+
+def sidebar_units(current_default: str | None = None,
+                  ru_default: str | None = None):
+    """Render the unit / electrode-area controls.
+
+    Returns ``(current_unit, ru_unit, area_cm2)``. The electrode area is only
+    collected (and returned non-None) when the LSV current and the EIS
+    resistance disagree on area-normalisation; otherwise the units are already
+    consistent and area is bypassed.
+    """
+    st.sidebar.header("3 · Units & electrode area")
+    st.sidebar.caption(
+        "The ohmic drop I·Ru must come out in volts. Tell the app how the LSV "
+        "current and the EIS resistance are reported — an electrode area is "
+        "only needed to reconcile a per-area quantity with a non-per-area one."
+    )
+    if current_default or ru_default:
+        st.sidebar.caption(
+            "ℹ️ Units pre-filled from the column headers — adjust if needed."
+        )
+
+    det_density = bool(current_default) and "cm²" in current_default
+    # Section A vs Section B: absolute current vs current density.
+    quantity = st.sidebar.radio(
+        "LSV current is reported as",
+        ["Absolute current (e.g. mA)", "Current density (e.g. mA/cm²)"],
+        index=1 if det_density else 0,
+        help="Absolute current pairs with Ru in Ω; current density pairs with "
+             "Ru in Ω·cm².",
+    )
+    is_density = quantity.startswith("Current density")
+    if is_density:
+        opts = _DENSITY_CURRENT_UNITS
+    else:
+        opts = _ABS_CURRENT_UNITS
+    cur_idx = opts.index(current_default) if current_default in opts else 0
+    current_unit = st.sidebar.selectbox(
+        "Current-density unit" if is_density else "Current unit",
+        opts, index=cur_idx,
+    )
+
+    ru_opts = list(correction.RU_UNITS)
+    ru_idx = ru_opts.index(ru_default) if ru_default in ru_opts else 0
+    ru_unit = st.sidebar.selectbox(
+        "EIS resistance (Ru) unit", ru_opts, index=ru_idx,
+        help="Ω for a raw resistance; Ω·cm² for an area-specific resistance.",
+    )
+
+    area_cm2 = None
+    if correction.needs_area(current_unit, ru_unit):
+        area_cm2 = st.sidebar.number_input(
+            "Electrode area (cm²)",
+            min_value=1e-4, value=0.04, step=0.01, format="%.4f",
+            help="Geometric (or active) electrode area used to convert between "
+                 "Ω and Ω·cm². Enter YOUR electrode's area — the default "
+                 "(0.04 cm²) is just a common value.",
+        )
+        if is_density:  # current mA/cm² + Ru in Ω
+            st.sidebar.caption(
+                f"↪ Ru (Ω) × {area_cm2:g} cm² → Ω·cm², then "
+                f"{current_unit} → A/cm² (÷1000 for mA) ⇒ iR drop in V."
+            )
+        else:  # absolute current + Ru in Ω·cm²
+            st.sidebar.caption(
+                f"↪ Ru (Ω·cm²) ÷ {area_cm2:g} cm² → Ω, then "
+                f"{current_unit} → A (÷1000 for mA) ⇒ iR drop in V."
+            )
+    else:
+        st.sidebar.caption(
+            f"✓ {current_unit} and Ru in {ru_unit} are already consistent — "
+            "no area needed (current scaled to base unit, e.g. mA ÷1000)."
+        )
+    return current_unit, ru_unit, area_cm2
+
+
+# --------------------------------------------------------------------------- #
 # EIS / Ru analysis tab                                                       #
 # --------------------------------------------------------------------------- #
-def render_eis_tab(eis_d, eis_list, sel) -> float | None:
-    """Render the EIS analysis tab and return the chosen Ru (ohm)."""
+def render_eis_tab(eis_d, eis_list, sel, ru_unit: str = "Ω",
+                   current_unit: str = "mA",
+                   area_cm2: float | None = None) -> float | None:
+    """Render the EIS analysis tab and return the raw Ru (file's unit).
+
+    The impedance is *displayed* in the unit that pairs with the LSV current
+    to give volts: **Ω·cm²** when the current is a density (the raw Ω data is
+    multiplied by the electrode area), otherwise **Ω**. The *returned* Ru is
+    the raw value in the file's own unit (``ru_unit``), so the LSV tab can show
+    both the raw Ru and the area-reconciled "Ru effective".
+    """
+    # Unit the analysis is reported in (pairs with the current quantity).
+    disp_unit = (correction.RU_OHM_CM2
+                 if correction.is_density_unit(current_unit)
+                 else correction.RU_OHM)
+    # Scale factor converting the file's impedance unit to disp_unit
+    # (×area for Ω→Ω·cm², ÷area for Ω·cm²→Ω, ×1 when already consistent).
+    scale = correction.reconcile_ru(1.0, ru_unit, current_unit, area_cm2)
+    zr = eis_d.z_real * scale
+    zi = eis_d.z_imag * scale
+
     st.subheader("EIS — uncompensated resistance (Ru) from the Nyquist arc")
     st.caption(
         f"Sample {sel + 1} · columns: {eis_d.label or 'Z′, Z″'}. The "
         "high-frequency real-axis intercept of the kinetic semicircle is Ru; "
         "adjust the arc range to exclude the low-frequency diffusion tail."
     )
+    if scale != 1.0:
+        st.caption(
+            f"ℹ️ Impedance reported in **{disp_unit}**: raw Z (Ω) × electrode "
+            f"area {area_cm2:g} cm² (current is a density)."
+        )
 
     n = len(eis_d)
-    auto_start, auto_stop = eis.auto_arc_range(eis_d.z_real, eis_d.z_imag)
+    auto_start, auto_stop = eis.auto_arc_range(zr, zi)
 
     left, right = st.columns([1, 2])
     with left:
@@ -231,23 +372,22 @@ def render_eis_tab(eis_d, eis_list, sel) -> float | None:
         manual_ru_val = None
         if method.startswith("Circle"):
             try:
-                ru_result = eis.fit_ru_circle(
-                    eis_d.z_real, eis_d.z_imag, start=start, stop=stop
-                )
+                ru_result = eis.fit_ru_circle(zr, zi, start=start, stop=stop)
             except Exception as exc:
                 st.error(f"Circle fit failed: {exc}")
         else:
-            quick = eis.fit_ru_circle(eis_d.z_real, eis_d.z_imag, start=start, stop=stop)
+            quick = eis.fit_ru_circle(zr, zi, start=start, stop=stop)
             manual_ru_val = st.number_input(
-                "Ru (Ω)", value=float(round(quick.ru, 3)), step=0.1, format="%.3f"
+                f"Ru ({disp_unit})", value=float(round(quick.ru, 3)),
+                step=0.1, format="%.3f"
             )
 
     with right:
         fig = go.Figure()
         fig.add_trace(
             go.Scatter(
-                x=eis_d.z_real,
-                y=np.abs(eis_d.z_imag),
+                x=zr,
+                y=np.abs(zi),
                 mode="markers",
                 name="EIS data",
                 marker=dict(size=7, color="#1f77b4"),
@@ -256,8 +396,8 @@ def render_eis_tab(eis_d, eis_list, sel) -> float | None:
         # Highlight the points selected for the fit.
         fig.add_trace(
             go.Scatter(
-                x=eis_d.z_real[start:stop],
-                y=np.abs(eis_d.z_imag)[start:stop],
+                x=zr[start:stop],
+                y=np.abs(zi)[start:stop],
                 mode="markers",
                 name="Fitted arc",
                 marker=dict(size=10, color="#ff7f0e", symbol="circle-open", line=dict(width=2)),
@@ -274,14 +414,14 @@ def render_eis_tab(eis_d, eis_list, sel) -> float | None:
             fig.add_trace(
                 go.Scatter(
                     x=[ru_for_marker], y=[0], mode="markers+text",
-                    name="Ru", text=[f"Ru={ru_for_marker:.2f} Ω"],
+                    name="Ru", text=[f"Ru={ru_for_marker:.2f} {disp_unit}"],
                     textposition="top center",
                     marker=dict(size=13, color="red", symbol="x"),
                 )
             )
         fig.update_layout(
-            xaxis_title="Z′ / Ω",
-            yaxis_title="−Z″ / Ω",
+            xaxis_title=f"Z′ / {disp_unit}",
+            yaxis_title=f"−Z″ / {disp_unit}",
             template="plotly_white",
             height=460,
             legend=dict(orientation="h", yanchor="bottom", y=1.02),
@@ -294,24 +434,37 @@ def render_eis_tab(eis_d, eis_list, sel) -> float | None:
             label="⬇️ Download Nyquist plot (PNG)",
         )
 
-    # Metrics row
+    # Metrics row. When the impedance was area-scaled, also surface the
+    # original (raw, un-normalised) Ru in the file's unit for reference.
+    show_raw = scale != 1.0
     chosen_ru = None
     if ru_result is not None:
-        c1, c2, c3, c4 = st.columns(4)
-        c1.metric("Ru (Ω)", f"{ru_result.ru:.3f}")
-        c2.metric("Rct (Ω)", f"{ru_result.rct:.3f}" if ru_result.rct else "—")
-        c3.metric(
-            "Ru + Rct (Ω)",
-            f"{ru_result.r_low:.3f}" if ru_result.r_low else "—",
-        )
-        c4.metric(
-            "Fit RMSE (Ω)",
-            f"{ru_result.rmse:.3f}" if ru_result.rmse else "—",
-        )
-        chosen_ru = ru_result.ru
+        cols = st.columns(5 if show_raw else 4)
+        i = 0
+        if show_raw:
+            cols[i].metric(f"Ru ({ru_unit}, original)",
+                           f"{ru_result.ru / scale:.3f}")
+            i += 1
+        cols[i].metric(f"Ru ({disp_unit})", f"{ru_result.ru:.3f}")
+        i += 1
+        cols[i].metric(f"Rct ({disp_unit})",
+                       f"{ru_result.rct:.3f}" if ru_result.rct else "—")
+        i += 1
+        cols[i].metric(f"Ru + Rct ({disp_unit})",
+                       f"{ru_result.r_low:.3f}" if ru_result.r_low else "—")
+        i += 1
+        cols[i].metric(f"Fit RMSE ({disp_unit})",
+                       f"{ru_result.rmse:.3f}" if ru_result.rmse else "—")
+        chosen_ru = ru_result.ru / scale  # raw, in the file's unit
     elif manual_ru_val is not None:
-        st.metric("Ru (Ω)", f"{manual_ru_val:.3f}")
-        chosen_ru = float(manual_ru_val)
+        if show_raw:
+            c1, c2 = st.columns(2)
+            c1.metric(f"Ru ({ru_unit}, original)",
+                      f"{manual_ru_val / scale:.3f}")
+            c2.metric(f"Ru ({disp_unit})", f"{manual_ru_val:.3f}")
+        else:
+            st.metric(f"Ru ({disp_unit})", f"{manual_ru_val:.3f}")
+        chosen_ru = float(manual_ru_val) / scale  # raw, in the file's unit
 
     # Batch view: circle-fit Ru for every loaded EIS sample.
     if len(eis_list) > 1:
@@ -319,20 +472,22 @@ def render_eis_tab(eis_d, eis_list, sel) -> float | None:
             rows = []
             for i, d in enumerate(eis_list):
                 try:
-                    rr = eis.fit_ru_circle(d.z_real, d.z_imag)
-                    rows.append({
-                        "Sample": f"Sample {i + 1}",
-                        "Columns": d.label,
-                        "Ru (Ω)": round(rr.ru, 3),
-                        "Rct (Ω)": round(rr.rct, 3) if rr.rct else None,
-                        "RMSE (Ω)": round(rr.rmse, 3) if rr.rmse else None,
-                    })
+                    rr = eis.fit_ru_circle(d.z_real * scale, d.z_imag * scale)
+                    row = {"Sample": f"Sample {i + 1}", "Columns": d.label}
+                    if show_raw:  # original Ru in the file's unit
+                        row[f"Ru ({ru_unit}, original)"] = round(rr.ru / scale, 3)
+                    row[f"Ru ({disp_unit})"] = round(rr.ru, 3)
+                    row[f"Rct ({disp_unit})"] = round(rr.rct, 3) if rr.rct else None
+                    row[f"RMSE ({disp_unit})"] = round(rr.rmse, 3) if rr.rmse else None
+                    rows.append(row)
                 except Exception as exc:
-                    rows.append({
-                        "Sample": f"Sample {i + 1}",
-                        "Columns": d.label, "Ru (Ω)": None,
-                        "Rct (Ω)": None, "RMSE (Ω)": f"fit failed: {exc}",
-                    })
+                    row = {"Sample": f"Sample {i + 1}", "Columns": d.label}
+                    if show_raw:
+                        row[f"Ru ({ru_unit}, original)"] = None
+                    row[f"Ru ({disp_unit})"] = None
+                    row[f"Rct ({disp_unit})"] = None
+                    row[f"RMSE ({disp_unit})"] = f"fit failed: {exc}"
+                    rows.append(row)
             st.dataframe(
                 pd.DataFrame(rows),
                 use_container_width=True, hide_index=True,
@@ -344,38 +499,47 @@ def render_eis_tab(eis_d, eis_list, sel) -> float | None:
 # --------------------------------------------------------------------------- #
 # LSV iR-correction tab                                                        #
 # --------------------------------------------------------------------------- #
-_FACTOR_CHOICES = [5, 10, 15, 20, 25, 30, 40, 50, 60, 70, 80, 85]
+_FACTOR_CHOICES = [5, 10, 15, 20, 25, 30, 40, 50, 60, 70, 80, 85, 90, 95, 100]
 _PALETTE = ["#d62728", "#2ca02c", "#9467bd", "#ff7f0e", "#8c564b",
             "#e377c2", "#17becf", "#bcbd22"]
 
 
-def _build_export_csv(lsv_d, results, ru, current_unit) -> str:
+def _ascii_unit(unit: str) -> str:
+    """Header-safe ASCII rendering of a unit (µ→u, ²→2, /→per, drop ·)."""
+    return (unit.replace("µ", "u").replace("²", "2")
+                .replace("·", "").replace("/", "per").replace("Ω", "ohm"))
+
+
+def _build_export_csv(lsv_d, results, ru, current_unit, ru_unit="Ω") -> str:
     """Assemble an Origin-friendly CSV of Potential-vs-Current pairs.
 
     Layout (no comment lines, so OriginLab / Excel import it directly):
 
         Potential_raw_V, Current_<unit>,
-        Ecorr_<f>pct_Ru<ru>ohm_V, Current_<unit>,  (one pair per factor)
+        Ecorr_<f>pct_Ru<ru><ru_unit>_V, Current_<unit>,  (one pair per factor)
 
     Each curve is a consecutive (X = Potential, Y = Current) pair — set the
-    potential column as X in Origin and plot the adjacent current as Y. Ru and
-    the compensation % are encoded in the corrected-potential column names, so
-    the provenance travels with the data. Raw pair comes first, then factors in
-    ascending order; the file can also be re-loaded by this app.
+    potential column as X in Origin and plot the adjacent current as Y. Ru
+    (with its unit) and the compensation % are encoded in the corrected-
+    potential column names, so the provenance travels with the data. Raw pair
+    comes first, then factors in ascending order; the file can also be
+    re-loaded by this app.
     """
-    cur_header = f"Current_{current_unit}"
+    cur_header = f"Current_{_ascii_unit(current_unit)}"
+    ru_tag = _ascii_unit(ru_unit)
     headers = ["Potential_raw_V", cur_header]
     columns = [lsv_d.potential, lsv_d.current]
     for r in results:
         p = int(r.factor_percent)
-        headers += [f"Ecorr_{p}pct_Ru{ru:.2f}ohm_V", cur_header]
+        headers += [f"Ecorr_{p}pct_Ru{ru:.2f}{ru_tag}_V", cur_header]
         columns += [r.potential_corrected, lsv_d.current]
     frame = pd.DataFrame(np.column_stack(columns))
     frame.columns = headers  # allows the repeated Current header
     return frame.to_csv(index=False)
 
 
-def render_lsv_tab(lsv_d, ru: float | None):
+def render_lsv_tab(lsv_d, ru: float | None, current_unit: str = "mA",
+                   ru_unit: str = "Ω", area_cm2: float | None = None):
     st.subheader("LSV — ohmic-drop (iR) correction")
     if ru is None:
         st.warning("Determine Ru on the **EIS / Ru Analysis** tab first.")
@@ -383,19 +547,27 @@ def render_lsv_tab(lsv_d, ru: float | None):
 
     left, right = st.columns([1, 2])
     with left:
-        st.metric("Using Ru (Ω)", f"{ru:.3f}")
-        current_unit = st.selectbox(
-            "Current unit (in the data file)",
-            ["mA", "A", "µA", "nA"],
-            index=0,
-            help="Used to convert I·Ru to volts.",
-        )
+        st.metric(f"Using Ru ({ru_unit})", f"{ru:.3f}")
+        if correction.needs_area(current_unit, ru_unit):
+            ru_eff = correction.reconcile_ru(ru, ru_unit, current_unit, area_cm2)
+            eff_unit = ("Ω·cm²" if correction.is_density_unit(current_unit)
+                        else "Ω")
+            st.caption(
+                f"Current is **{current_unit}** — using area {area_cm2:g} cm² "
+                f"→ effective Ru = **{ru_eff:.3f} {eff_unit}**. "
+                "(Set units in the sidebar · section 3.)"
+            )
+        else:
+            st.caption(
+                f"Current is **{current_unit}**, Ru in **{ru_unit}** — units "
+                "consistent. (Set units in the sidebar · section 3.)"
+            )
         factors = st.multiselect(
             "Compensation factors (%) — compare several",
             options=_FACTOR_CHOICES,
             default=[85],
             help="Each selected factor is corrected, plotted, and exported "
-                 "(project range: 5–85 %).",
+                 "(range 5–100 %; 85 % is the recommended safe default).",
         )
         custom = st.number_input(
             "…or add a custom factor (%)",
@@ -409,18 +581,24 @@ def render_lsv_tab(lsv_d, ru: float | None):
             st.info("Select at least one compensation factor.")
             return
         st.caption(
-            "E_corrected = E_measured − (factor) · I · Ru. "
-            "Partial compensation (≤ 85 %) avoids over-correction/oscillation."
+            "E_corrected = E_measured − (factor) · I · Ru. 100 % is full "
+            "correction; partial compensation (≤ 85 %) guards against "
+            "over-correction/oscillation when Ru is uncertain."
         )
 
     factors = sorted(set(factors))
-    results = [
-        correction.apply_ir_correction(
-            lsv_d.potential, lsv_d.current, ru,
-            factor_percent=f, current_unit=current_unit,
-        )
-        for f in factors
-    ]
+    try:
+        results = [
+            correction.apply_ir_correction(
+                lsv_d.potential, lsv_d.current, ru,
+                factor_percent=f, current_unit=current_unit,
+                ru_unit=ru_unit, area_cm2=area_cm2,
+            )
+            for f in factors
+        ]
+    except ValueError as exc:  # e.g. missing electrode area
+        st.error(f"Cannot apply correction: {exc}")
+        return
 
     # Data extents across raw + all corrected curves (defaults for axis range).
     all_pot = np.concatenate(
@@ -541,23 +719,38 @@ def render_lsv_tab(lsv_d, ru: float | None):
             return "borderline"
         return "✓ good"
 
-    # Per-factor summary table.
-    summary = pd.DataFrame(
-        {
-            "Compensation %": [int(r.factor_percent) for r in results],
-            "Ru (Ω)": [round(ru, 3)] * len(results),
-            "Max |iR drop| (mV)": [
-                round(float(np.max(np.abs(r.ir_drop))) * 1000, 2)
-                for r in results
-            ],
-            "Fold-back %": [
-                round(a.reverted_fraction * 100, 1) for a in assessments
-            ],
-            "Status": [_status(a) for a in assessments],
-        }
-    )
+    # Per-factor summary table. Show the raw Ru in its own unit, and — when an
+    # area reconciliation applies — the area-normalised "Ru effective".
+    n = len(results)
+    ru_col = f"Ru ({ru_unit})"
+    irdrop_col = "Max |iR drop| (mV)"
+    cols = {
+        "Compensation %": [int(r.factor_percent) for r in results],
+        ru_col: [round(ru, 4)] * n,
+    }
+    # Columns that should always render with fixed decimals (so values that
+    # happen to be whole numbers, e.g. 220.0, still show as 220.000).
+    numeric_fmt = {ru_col: "%.4f", irdrop_col: "%.3f", "Fold-back %": "%.1f"}
+    if correction.needs_area(current_unit, ru_unit):
+        ru_eff = results[0].ru_effective
+        eff_unit = ("Ω·cm²" if correction.is_density_unit(current_unit) else "Ω")
+        eff_col = f"Ru effective ({eff_unit})"
+        cols[eff_col] = [round(ru_eff, 4)] * n
+        numeric_fmt[eff_col] = "%.4f"
+    cols[irdrop_col] = [
+        round(float(np.max(np.abs(r.ir_drop))) * 1000, 4) for r in results
+    ]
+    cols["Fold-back %"] = [round(a.reverted_fraction * 100, 3) for a in assessments]
+    cols["Status"] = [_status(a) for a in assessments]
+    summary = pd.DataFrame(cols)
     st.markdown("**Results summary**")
-    st.dataframe(summary, use_container_width=True, hide_index=True)
+    st.dataframe(
+        summary, use_container_width=True, hide_index=True,
+        column_config={
+            c: st.column_config.NumberColumn(format=fmt)
+            for c, fmt in numeric_fmt.items()
+        },
+    )
     st.download_button(
         "⬇️ Download results table (CSV)",
         data=summary.to_csv(index=False).encode("utf-8"),
@@ -571,7 +764,8 @@ def render_lsv_tab(lsv_d, ru: float | None):
         bad = [int(r.factor_percent)
                for r, a in zip(results, assessments) if a.over_compensated]
         rec = correction.recommend_factor(
-            lsv_d.potential, lsv_d.current, ru, current_unit
+            lsv_d.potential, lsv_d.current, ru, current_unit,
+            ru_unit=ru_unit, area_cm2=area_cm2,
         )
         st.warning(
             f"⚠ Over-compensation at {', '.join(f'{b}%' for b in bad)}: the "
@@ -595,12 +789,12 @@ def render_lsv_tab(lsv_d, ru: float | None):
             "classic sign of too much compensation (and, in feedback hardware, "
             "of oscillation).\n"
             "- **Rule of thumb.** Increase the factor until just before "
-            "fold-back appears; this tool caps it at **85 %** for safety. If "
-            "fold-back shows up below 85 %, your `Ru` may be over-estimated — "
-            "re-check the EIS arc fit."
+            "fold-back appears. **100 %** is full correction; **85 %** is the "
+            "recommended safe default. If fold-back shows up well below 100 %, "
+            "your `Ru` may be over-estimated — re-check the EIS arc fit."
         )
 
-    csv_text = _build_export_csv(lsv_d, results, ru, current_unit)
+    csv_text = _build_export_csv(lsv_d, results, ru, current_unit, ru_unit)
     st.caption(
         "Export layout (Origin-friendly): consecutive Potential–Current pairs — "
         "raw first, then one **corrected potential vs current** pair per factor. "
@@ -653,13 +847,18 @@ def main():
         f"EIS cols: {eis_d.label}\n\nLSV cols: {lsv_d.label}"
     )
 
+    cur_default, ru_default = _detect_units(eis_d.label, lsv_d.label)
+    current_unit, ru_unit, area_cm2 = sidebar_units(cur_default, ru_default)
+
     tab_eis, tab_lsv = st.tabs(
         ["📈 EIS / Ru Analysis", "🔬 LSV iR Correction"]
     )
     with tab_eis:
-        ru = render_eis_tab(eis_d, eis_list, sel)
+        # Returns the raw Ru in the EIS file's unit; the LSV tab reconciles it
+        # with the electrode area to report both Ru and Ru effective.
+        ru = render_eis_tab(eis_d, eis_list, sel, ru_unit, current_unit, area_cm2)
     with tab_lsv:
-        render_lsv_tab(lsv_d, ru)
+        render_lsv_tab(lsv_d, ru, current_unit, ru_unit, area_cm2)
 
     render_citation()
     st.divider()
