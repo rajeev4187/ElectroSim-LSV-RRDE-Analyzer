@@ -1,4 +1,4 @@
-# LSV Analysis: iR Compensation, Tafel Slope Analysis
+# LSV Analysis: iR Compensation, Tafel Slope 
 
 A **Streamlit GUI** with two independent analytical workflows for
 electrochemical polarization data:
