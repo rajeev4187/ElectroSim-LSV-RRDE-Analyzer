@@ -97,22 +97,32 @@ def require_access() -> bool:
 
 def png_download(fig, filename: str, key: str,
                  label: str = "⬇️ Download figure (PNG)") -> None:
-    """Render a button that exports a Plotly figure as a high-res PNG.
+    """Render an on-demand button that exports a Plotly figure as a high-res PNG.
 
-    Falls back to a hint about the chart's built-in camera icon if server-side
-    rendering (kaleido) is unavailable.
+    Rendering is server-side (kaleido), which launches a headless browser per
+    call — too slow/fragile to run on *every* script rerun (it would fire on
+    every unrelated widget interaction, e.g. dragging a slider). Generation
+    only happens when the user clicks "Prepare"; the resulting bytes are
+    cached in session_state so the download button then persists across
+    reruns until the figure is prepared again.
     """
-    try:
-        png = fig.to_image(format="png", width=1100, height=520, scale=2)
-    except Exception as exc:  # kaleido missing / render error
-        st.caption(
-            f"PNG export unavailable ({exc}). Use the 📷 icon on the chart "
-            "to save a PNG instead."
+    bytes_key = f"_png_bytes_{key}"
+    if st.button(f"🖼️ Prepare {label}", key=f"_png_prep_{key}"):
+        try:
+            st.session_state[bytes_key] = fig.to_image(
+                format="png", width=1100, height=520, scale=2
+            )
+        except Exception as exc:  # kaleido missing / render error
+            st.session_state[bytes_key] = None
+            st.caption(
+                f"PNG export unavailable ({exc}). Use the 📷 icon on the "
+                "chart to save a PNG instead."
+            )
+    png = st.session_state.get(bytes_key)
+    if png:
+        st.download_button(
+            label, data=png, file_name=filename, mime="image/png", key=key
         )
-        return
-    st.download_button(
-        label, data=png, file_name=filename, mime="image/png", key=key
-    )
 
 
 # --------------------------------------------------------------------------- #
@@ -1127,18 +1137,16 @@ def render_tafel_tab() -> None:
             )
             slider_kwargs = ({} if range_key in st.session_state
                              else {"value": (int(a0), int(a1))})
-            start, stop = c1.select_slider(
-                "Fit range (Potential vs RHE)", options=list(range(n + 1)),
-                key=range_key,
-                format_func=lambda idx, _pot=pot, _n=n: (
-                    f"{_pot[idx]:.3f} V" if idx < _n else f"{_pot[-1]:.3f} V (end)"
-                ),
-                **slider_kwargs,
-                help="Shown as the actual potential at each handle. "
-                     "Auto-starts near the current onset and extends while "
+            start, stop = c1.slider(
+                "Fit range (index)", 0, n, key=range_key, **slider_kwargs,
+                help="Auto-starts near the current onset and extends while "
                      "the potential vs log|i| relationship stays linear; "
                      "drag either handle, or box-select the region on the "
                      "Tafel plot below, to fine-tune.",
+            )
+            c1.caption(
+                f"↪ Potential vs RHE: {pot[start]:.3f} V to "
+                f"{pot[min(stop, n - 1)]:.3f} V"
             )
             color = c2.color_picker(
                 "Color", value=_PALETTE[i % len(_PALETTE)], key=f"tafel_color_{i}"
