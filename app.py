@@ -33,17 +33,17 @@ st.set_page_config(
 )
 
 SAMPLE_PATH = "sample-data/Book1-original data.xlsx"
-REPO_URL = "https://github.com/rajeev4187/LSV-iR-compensation-calculation"
+REPO_URL = "https://github.com/rajeev4187/LSV-Analysis-iR-compensation-Tafel-slope"
 CITATION_TEXT = (
-    "Kumar, R. (2026). Automated iR Compensation: EIS fitting and LSV "
-    "correction (v1.0.0) [Computer software]. North Carolina Central "
+    "Kumar, R. (2026). LSV Analysis: iR Compensation and Tafel Slope "
+    "Analysis (v1.1.0) [Computer software]. North Carolina Central "
     f"University. {REPO_URL}"
 )
 CITATION_BIBTEX = (
-    "@software{kumar_ir_compensation_2026,\n"
+    "@software{kumar_lsv_analysis_2026,\n"
     "  author  = {Kumar, Rajeev},\n"
-    "  title   = {Automated iR Compensation: EIS fitting and LSV correction},\n"
-    "  version = {1.0.0},\n"
+    "  title   = {LSV Analysis: iR Compensation and Tafel Slope Analysis},\n"
+    "  version = {1.1.0},\n"
     "  year    = {2026},\n"
     f"  url     = {{{REPO_URL}}}\n"
     "}"
