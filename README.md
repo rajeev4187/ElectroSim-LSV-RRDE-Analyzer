@@ -1,4 +1,4 @@
-# LSV Analysis: iR Compensation, Tafel Slope 
+# LSV Analysis: iR Compensation, Tafel Slope
 
 A **Streamlit GUI** with two independent analytical workflows for
 electrochemical polarization data:
@@ -8,7 +8,8 @@ electrochemical polarization data:
    electrochemical impedance spectroscopy (EIS).
 2. **Tafel slope analysis** – fits the linear (activation-controlled) region
    of a polarization curve to extract the Tafel slope, with RHE reference
-   conversion and HER/OER/ORR mechanistic interpretation.
+   conversion and per-reaction mechanistic interpretation (HER, HOR, OER,
+   ORR, CO₂RR, N₂RR, NO₃RR and more).
 
 **🔗 Live app:** <https://lsv-analysis-ir-compensation-tafel-slope.streamlit.app/>
 
@@ -89,8 +90,8 @@ its own reference-electrode handling.
 - **Data source.** Upload one or more Excel workbooks or CSV files (one per
   sample/lot); each file (or repeated column pair within a file) becomes a
   sample you can select into a single **journal-style overlay plot**.
-- **Reference electrode → RHE conversion.** Electrochemical Tafel/HER/OER/ORR
-  data is conventionally reported vs. the reversible hydrogen electrode (RHE).
+- **Reference electrode → RHE conversion.** Electrochemical Tafel data is
+  conventionally reported vs. the reversible hydrogen electrode (RHE).
   If your data isn't already on that scale, pick the reference electrode used
   (SHE, SCE, Ag/AgCl variants, Hg/HgO, Hg/Hg₂SO₄, or a custom E° vs NHE) and
   the electrolyte pH; the app converts via
@@ -105,20 +106,32 @@ its own reference-electrode handling.
   once real curvature (e.g. the mass-transport-limited plateau) sets in. Each
   sample's range is independently adjustable via a **potential-labeled
   slider**, or by **box-selecting the region directly on the Tafel plot**.
-- **Per-sample reaction type.** Each sample is tagged HER, OER, ORR, or
+- **Per-sample reaction type.** Each sample is tagged with its reaction —
+  HER, HOR, OER, ORR, CO₂RR, CORR, N₂RR, NO₃RR, MOR, EOR, UOR, or
   Other/unspecified; samples of different reaction types can be combined in
   one overlay, with the **legend split into per-reaction groups**.
 - **Results.** Tafel slope (mV/dec, always reported as its positive magnitude
-  per literature convention), R², and — for HER specifically, since 0 V vs
+  per literature convention), R², and — for HER/HOR specifically, since 0 V vs
   RHE is exactly the H⁺/H₂ equilibrium potential — the extrapolated exchange
   current i₀. Each sample's fitted slope is compared against canonical
-  mechanistic benchmarks (e.g. ~120 mV/dec for a Volmer rate-determining step)
-  and summarized in a short auto-generated analysis paragraph per reaction.
+  mechanistic benchmarks for its reaction (e.g. ~120 mV/dec for a Volmer
+  rate-determining step in HER/HOR, or for a rate-determining first electron
+  transfer in CO₂RR/N₂RR/NO₃RR) and summarized in a short auto-generated
+  analysis paragraph per reaction. Reactions without a comparably canonical
+  slope table (CORR, MOR, EOR, UOR) are still fitted and plotted; their
+  benchmark column simply reads “—”.
 - **Journal-style export.** Both the Tafel plot and the Original LSV (linear,
   pre-log) polarization curve are rendered with an outer box border, no
-  interior gridlines, Arial fonts at a selectable 28/36 pt, and are
-  downloadable as PNGs (plot, and a separately rendered results table), along
-  with a CSV of the summary table.
+  interior gridlines, and Arial fonts at a selectable 28/36 pt.
+- **Every plot is downloadable three ways** (Tafel plot, Original LSV, results
+  table — and likewise the Nyquist and iR-comparison plots in the other tabs):
+  a high-resolution **PNG** (prepared on demand; the button is withdrawn as
+  soon as you change the figure, so a stale image is never downloaded), an
+  interactive **HTML** copy that always works even where the server-side PNG
+  renderer is unavailable, and a **CSV of exactly the plotted series** —
+  including each sample's fitted Tafel line — for replotting in Origin/Excel.
+  The results table sizes its own export canvas from its content, so no column
+  or row is clipped.
 
 ---
 
@@ -132,6 +145,13 @@ pip install -r requirements.txt
 
 Dependencies: `numpy`, `scipy`, `pandas`, `openpyxl`, `streamlit`, `plotly`,
 `kaleido` (server-side PNG export).
+
+`kaleido` 1.x renders PNGs through a headless Chrome. If none is present the
+app says so and the HTML/CSV downloads still work; install one with:
+
+```bash
+plotly_get_chrome
+```
 
 ## Running the app
 
@@ -236,7 +256,8 @@ fit.exchange_current         # extrapolated current at E(RHE) = 0
   The fold-back guard flags any factor that over-corrects.
 - **Tafel slope sign.** The fitted slope is always reported as its **positive
   magnitude** (mV/dec), matching literature convention, regardless of whether
-  the underlying reaction is anodic (OER) or cathodic (HER/ORR).
+  the underlying reaction is anodic (OER, HOR, MOR) or cathodic
+  (HER, ORR, CO₂RR, N₂RR, NO₃RR).
 
 ---
 
@@ -273,14 +294,14 @@ If you use this app (including a public Streamlit deployment) in your work,
 please cite it. Machine-readable metadata is in
 [`CITATION.cff`](CITATION.cff); a plain-text form:
 
-> Kumar, R. (2026). *LSV Analysis: iR Compensation and Tafel Slope Analysis*
+> Kumar, R. (2026). *LSV Analysis: iR Compensation and Tafel Slope*
 > (v1.1.0) [Computer software]. North Carolina Central University.
 > <https://github.com/rajeev4187/LSV-Analysis-iR-compensation-Tafel-slope>
 
 ```bibtex
 @software{kumar_lsv_analysis_2026,
   author  = {Kumar, Rajeev},
-  title   = {LSV Analysis: iR Compensation and Tafel Slope Analysis},
+  title   = {LSV Analysis: iR Compensation and Tafel Slope},
   version = {1.1.0},
   year    = {2026},
   url      = {https://github.com/rajeev4187/LSV-Analysis-iR-compensation-Tafel-slope}

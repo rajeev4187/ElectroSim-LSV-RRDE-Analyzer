@@ -218,8 +218,10 @@ def auto_tafel_range(potential: np.ndarray, log_i: np.ndarray,
     return _best_r2_window(x, y, min_frac)
 
 
-def fit_tafel(potential: np.ndarray, log_i: np.ndarray,
-             start: int | None = None, stop: int | None = None) -> TafelResult:
+def fit_tafel(
+    potential: np.ndarray, log_i: np.ndarray,
+    start: int | None = None, stop: int | None = None,
+) -> TafelResult:
     """Linear-fit ``potential`` vs ``log_i`` over ``[start, stop)``.
 
     Parameters
@@ -275,6 +277,15 @@ REACTION_REFERENCES: dict[str, tuple[tuple[float, str], ...]] = {
         (120.0, "Volmer–Heyrovsky mechanism, initial discharge "
                 "(Volmer) step rate-determining"),
     ),
+    # HOR is the reverse of HER and shares its elementary steps, so the same
+    # canonical slopes apply — read in the oxidation direction.
+    "HOR": (
+        (30.0, "Tafel–Volmer mechanism, dissociative H2 adsorption "
+               "(Tafel) step rate-determining"),
+        (40.0, "Heyrovsky–Volmer mechanism, electrochemical H2 oxidation "
+               "(Heyrovsky) step rate-determining"),
+        (120.0, "Volmer step (discharge of adsorbed H) rate-determining"),
+    ),
     "OER": (
         (40.0, "favorable multi-electron-transfer kinetics with a "
                "chemical step rate-limiting"),
@@ -288,6 +299,32 @@ REACTION_REFERENCES: dict[str, tuple[tuple[float, str], ...]] = {
                "rate-determining (Temkin-like adsorption)"),
         (120.0, "first electron-transfer step is rate-determining "
                 "(Langmuir-like adsorption)"),
+    ),
+    # The multi-electron small-molecule reductions below are conventionally
+    # read through the same two limiting cases: an initial one-electron
+    # transfer that is rate-determining (~2.303RT/alpha·F with alpha = 0.5,
+    # i.e. ~118-120 mV/dec), or a fast pre-equilibrium electron transfer
+    # followed by a rate-determining chemical step (~2.303RT/F, ~59-60
+    # mV/dec). Intermediate values usually indicate mixed control or a
+    # coverage-dependent mechanism rather than a clean assignment.
+    "CO₂RR": (
+        (60.0, "fast one-electron pre-equilibrium followed by a "
+               "rate-determining chemical step (e.g. protonation of "
+               "adsorbed *CO2⁻)"),
+        (120.0, "initial single-electron transfer to CO2 (formation of the "
+                "*CO2•⁻ radical anion) is rate-determining"),
+    ),
+    "N₂RR": (
+        (60.0, "electron transfer in pre-equilibrium with a rate-determining "
+               "chemical/protonation step of an adsorbed N-intermediate"),
+        (120.0, "first electron transfer to adsorbed N2 (*N2 → *N2H) is "
+                "rate-determining"),
+    ),
+    "NO₃RR": (
+        (60.0, "fast initial electron transfer followed by a rate-determining "
+               "chemical step (e.g. oxygen transfer, NO3⁻ → NO2⁻)"),
+        (120.0, "first electron transfer to adsorbed nitrate is "
+                "rate-determining"),
     ),
 }
 

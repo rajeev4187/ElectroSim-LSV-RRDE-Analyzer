@@ -1,6 +1,6 @@
 cff-version: 1.2.0
 message: "If you use this software, please cite it as below."
-title: "LSV Analysis: iR Compensation and Tafel Slope Analysis"
+title: "LSV Analysis: iR Compensation and Tafel Slope"
 abstract: >-
   A Streamlit application with two independent workflows for electrochemical
   polarization data: automated ohmic-drop (iR) compensation of linear-sweep

@@ -16,6 +16,7 @@ Workflow
 
 from __future__ import annotations
 
+import hashlib
 import hmac
 import io
 
@@ -36,13 +37,13 @@ SAMPLE_PATH = "sample-data/Book1-original data.xlsx"
 REPO_URL = "https://github.com/rajeev4187/LSV-Analysis-iR-compensation-Tafel-slope"
 CITATION_TEXT = (
     "Kumar, R. (2026). LSV Analysis: iR Compensation and Tafel Slope "
-    "Analysis (v1.1.0) [Computer software]. North Carolina Central "
+    "(v1.1.0) [Computer software]. North Carolina Central "
     f"University. {REPO_URL}"
 )
 CITATION_BIBTEX = (
     "@software{kumar_lsv_analysis_2026,\n"
     "  author  = {Kumar, Rajeev},\n"
-    "  title   = {LSV Analysis: iR Compensation and Tafel Slope Analysis},\n"
+    "  title   = {LSV Analysis: iR Compensation and Tafel Slope},\n"
     "  version = {1.1.0},\n"
     "  year    = {2026},\n"
     f"  url     = {{{REPO_URL}}}\n"
@@ -95,34 +96,146 @@ def require_access() -> bool:
     return False
 
 
-def png_download(fig, filename: str, key: str,
-                 label: str = "⬇️ Download figure (PNG)") -> None:
-    """Render an on-demand button that exports a Plotly figure as a high-res PNG.
+def _figure_signature(fig) -> str:
+    """Short fingerprint of a figure's current content.
 
-    Rendering is server-side (kaleido), which launches a headless browser per
-    call — too slow/fragile to run on *every* script rerun (it would fire on
-    every unrelated widget interaction, e.g. dragging a slider). Generation
-    only happens when the user clicks "Prepare"; the resulting bytes are
-    cached in session_state so the download button then persists across
-    reruns until the figure is prepared again.
+    Used to detect that a cached PNG no longer matches the figure on screen
+    (e.g. the user moved a fit-range slider after preparing the export), so a
+    stale image is never handed out as a download.
     """
-    bytes_key = f"_png_bytes_{key}"
-    if st.button(f"🖼️ Prepare {label}", key=f"_png_prep_{key}"):
-        try:
-            st.session_state[bytes_key] = fig.to_image(
-                format="png", width=1100, height=520, scale=2
+    try:
+        payload = fig.to_json()
+    except Exception:
+        payload = repr(fig)
+    return hashlib.sha1(payload.encode("utf-8", "replace")).hexdigest()
+
+
+# First entry of the colorway in Streamlit's own Plotly template. That
+# template paints with placeholder colours (#000001, #000036, …) which the
+# Streamlit *frontend* swaps for the real theme colours while drawing the
+# chart in the browser. Anything rendered outside that frontend — a
+# server-side PNG, or a standalone HTML file — takes them literally, which is
+# what turned exported figures (most visibly the results table, which sets no
+# template of its own) into a near-black block.
+_STREAMLIT_TEMPLATE_SENTINEL = "#000001"
+
+
+def _export_figure(fig):
+    """Return a copy of ``fig`` that is safe to render outside Streamlit.
+
+    Figures that already pin a real template (all the plots here use
+    ``plotly_white``) are returned untouched; one still carrying Streamlit's
+    placeholder-colour template is re-rendered on ``plotly_white``.
+    """
+    template = getattr(fig.layout, "template", None)
+    colorway = getattr(getattr(template, "layout", None), "colorway", None)
+    if not colorway or str(colorway[0]).lower() != _STREAMLIT_TEMPLATE_SENTINEL:
+        return fig
+    clone = go.Figure(fig)
+    clone.update_layout(template="plotly_white")
+    return clone
+
+
+def _export_size(fig, width: int | None, height: int | None) -> tuple[int, int]:
+    """Pixel size for a static export.
+
+    Defaults to the figure's own layout height when it sets one — a table
+    sizes itself by row count, so forcing the same fixed height on every
+    figure (as this used to) simply cut the last rows off.
+    """
+    if width is None:
+        width = 1100
+    if height is None:
+        height = int(getattr(fig.layout, "height", None) or 520)
+    return int(width), max(int(height), 200)
+
+
+def figure_downloads(fig, stem: str, key: str, what: str = "figure",
+                     width: int | None = None, height: int | None = None,
+                     data: "pd.DataFrame | None" = None) -> None:
+    """Render the download controls for one figure: PNG, interactive HTML and
+    (optionally) the plotted data as CSV.
+
+    PNG rendering is server-side (kaleido), which launches a headless browser
+    per call — too slow/fragile to run on *every* script rerun (it would fire
+    on every unrelated widget interaction, e.g. dragging a slider). It only
+    happens when the user clicks "Prepare"; the bytes are cached in
+    session_state together with a signature of the figure, so the download
+    button persists across reruns but is withdrawn as soon as the figure
+    itself changes. The HTML and CSV exports need no external renderer and are
+    therefore always available — they are the fallback when kaleido/Chrome is
+    unavailable on the host (e.g. a slim cloud container).
+    """
+    state_key = f"_export_{key}"
+    export_fig = _export_figure(fig)
+    sig = _figure_signature(export_fig)
+    cols = st.columns(3 if data is not None else 2)
+
+    with cols[0]:
+        if st.button(f"🖼️ Prepare {what} (PNG)", key=f"_png_prep_{key}",
+                     use_container_width=True):
+            w, h = _export_size(export_fig, width, height)
+            try:
+                st.session_state[state_key] = {
+                    "sig": sig,
+                    "bytes": export_fig.to_image(format="png", width=w,
+                                                 height=h, scale=2),
+                    "error": None,
+                }
+            except Exception as exc:  # kaleido missing / no Chrome / render error
+                st.session_state[state_key] = {
+                    "sig": sig, "bytes": None, "error": str(exc),
+                }
+        cached = st.session_state.get(state_key) or {}
+        if cached.get("bytes") and cached.get("sig") == sig:
+            st.download_button(
+                f"⬇️ {what} (PNG)", data=cached["bytes"],
+                file_name=f"{stem}.png", mime="image/png", key=f"_png_dl_{key}",
+                use_container_width=True,
             )
-        except Exception as exc:  # kaleido missing / render error
-            st.session_state[bytes_key] = None
+        elif cached.get("bytes"):
+            st.caption("↻ Figure changed — press Prepare again.")
+        elif cached.get("error"):
             st.caption(
-                f"PNG export unavailable ({exc}). Use the 📷 icon on the "
-                "chart to save a PNG instead."
+                f"PNG export unavailable ({cached['error']}). Use the HTML "
+                "download beside this button, or the 📷 icon on the chart."
             )
-    png = st.session_state.get(bytes_key)
-    if png:
-        st.download_button(
-            label, data=png, file_name=filename, mime="image/png", key=key
-        )
+
+    with cols[1]:
+        try:
+            html = export_fig.to_html(include_plotlyjs="cdn", full_html=True)
+            st.download_button(
+                f"⬇️ {what} (HTML)", data=html.encode("utf-8"),
+                file_name=f"{stem}.html", mime="text/html",
+                key=f"_html_dl_{key}", use_container_width=True,
+                help="Interactive page — opens in any browser (needs internet "
+                     "the first time, it loads plotly.js from a CDN) and can "
+                     "be saved as an image from there. Always available, even "
+                     "when the server-side PNG renderer is not.",
+            )
+        except Exception as exc:
+            st.caption(f"HTML export unavailable ({exc}).")
+
+    if data is not None:
+        with cols[2]:
+            st.download_button(
+                "⬇️ Plotted data (CSV)",
+                data=data.to_csv(index=False).encode("utf-8"),
+                file_name=f"{stem}_data.csv", mime="text/csv",
+                key=f"_csv_dl_{key}", use_container_width=True,
+                help="Exactly the series drawn above, for replotting in "
+                     "Origin/Excel.",
+            )
+
+
+def _padded_frame(columns: "dict[str, list]") -> pd.DataFrame:
+    """Build a DataFrame from unequal-length columns (each plotted series has
+    its own point count), padding the short ones with blanks so the CSV keeps
+    one column pair per series — the layout Origin/Excel expect."""
+    n = max((len(v) for v in columns.values()), default=0)
+    return pd.DataFrame({
+        k: list(v) + [""] * (n - len(v)) for k, v in columns.items()
+    })
 
 
 # --------------------------------------------------------------------------- #
@@ -445,9 +558,13 @@ def render_eis_tab(eis_d, eis_list, sel, ru_unit: str = "Ω",
         )
         fig.update_yaxes(scaleanchor="x", scaleratio=1)  # equal aspect -> true circle
         st.plotly_chart(fig, use_container_width=True)
-        png_download(
-            fig, f"nyquist_sample{sel + 1}.png", key="png_eis",
-            label="⬇️ Download Nyquist plot (PNG)",
+        nyquist_data = _padded_frame({
+            f"Z′ ({disp_unit})": zr,
+            f"−Z″ ({disp_unit})": np.abs(zi),
+        })
+        figure_downloads(
+            fig, f"nyquist_sample{sel + 1}", key="png_eis",
+            what="Nyquist plot", data=nyquist_data,
         )
 
     # Metrics row. When the impedance was area-scaled, also surface the
@@ -717,9 +834,17 @@ def render_lsv_tab(lsv_d, ru: float | None, current_unit: str = "mA",
         )
         st.plotly_chart(fig, use_container_width=True)
         fac_png = "-".join(str(int(r.factor_percent)) for r in results)
-        png_download(
-            fig, f"lsv_iR_comparison_f{fac_png}pct.png", key="png_lsv",
-            label="⬇️ Download comparison plot (PNG)",
+        plotted = {
+            "Potential raw (V)": lsv_d.potential,
+            f"Current raw ({current_unit})": lsv_d.current,
+        }
+        for r in results:
+            pct = int(r.factor_percent)
+            plotted[f"Potential iR-corrected {pct}% (V)"] = r.potential_corrected
+            plotted[f"Current iR-corrected {pct}% ({current_unit})"] = lsv_d.current
+        figure_downloads(
+            fig, f"lsv_iR_comparison_f{fac_png}pct", key="png_lsv",
+            what="Comparison plot", data=_padded_frame(plotted),
         )
 
     # Over-compensation assessment per factor (fold-back detection).
@@ -830,7 +955,16 @@ def render_lsv_tab(lsv_d, ru: float | None, current_unit: str = "mA",
 # --------------------------------------------------------------------------- #
 # Tafel slope analysis tab (independent data source)                          #
 # --------------------------------------------------------------------------- #
-_TAFEL_REACTIONS = ["HER", "OER", "ORR", "Other / unspecified"]
+# Reactions a sample can be tagged with. Those in tafel.REACTION_REFERENCES
+# also get a mechanistic benchmark in the results table; the rest are plain
+# labels (the benchmark column then reads "—"), which is deliberate — there
+# is no comparably canonical slope table for them.
+_TAFEL_REACTIONS = [
+    "HER", "HOR", "OER", "ORR",
+    "CO₂RR", "N₂RR", "NO₃RR", "CORR",
+    "MOR", "EOR", "UOR",
+    "Other / unspecified",
+]
 _TAFEL_FONT_SIZES = [28, 36]
 # Journal style: a closed box border (mirrored axis lines) around the plot,
 # with no interior gridlines.
@@ -998,8 +1132,8 @@ def render_tafel_tab() -> None:
     top1, top2, top3 = st.columns(3)
     default_reaction = top1.selectbox(
         "Default reaction (for newly added samples)", _TAFEL_REACTIONS, index=0,
-        help="Each sample gets its own reaction below (samples can mix "
-             "HER/OER/ORR in one overlay); this just sets the starting "
+        help="Each sample gets its own reaction below (samples of different "
+             "reactions can share one overlay); this just sets the starting "
              "value for samples you haven't set yet. The legend and "
              "analysis are split by reaction type.",
     )
@@ -1219,6 +1353,7 @@ def render_tafel_tab() -> None:
     st.markdown("**Original LSV (polarization curve)**")
     d_by_label = {lbl: d for lbl, d in chosen_series}
     lsv_fig = go.Figure()
+    lsv_plotted: dict[str, list] = {}
     for meta in fits:
         d = d_by_label.get(meta["orig_label"])
         if d is None:
@@ -1226,6 +1361,8 @@ def render_tafel_tab() -> None:
         pot_full = d.potential if already_rhe else tafel.to_rhe(d.potential, e_ref, ph)
         cur_full_scaled = _rescale_current(d.current, native_unit, current_unit)
         cur_full = cur_full_scaled / area_cm2 if convert_density else cur_full_scaled
+        lsv_plotted[f"{meta['label']} — E vs RHE (V)"] = list(pot_full)
+        lsv_plotted[f"{meta['label']} — current ({display_unit})"] = list(cur_full)
         lsv_fig.add_trace(go.Scatter(
             x=pot_full, y=cur_full, mode="lines", name=meta["label"],
             legendgroup=meta["reaction"],
@@ -1251,7 +1388,10 @@ def render_tafel_tab() -> None:
         lsv_fig, use_container_width=True,
         config={"edits": {"legendPosition": True}, "displaylogo": False},
     )
-    png_download(lsv_fig, "original_lsv_plot.png", key="png_lsv_original")
+    figure_downloads(
+        lsv_fig, "original_lsv_plot", key="png_lsv_original",
+        what="LSV plot", data=_padded_frame(lsv_plotted),
+    )
 
     results = []
     for f in fits:
@@ -1277,6 +1417,7 @@ def render_tafel_tab() -> None:
     multi_reaction = len(distinct_reactions) > 1
 
     fig = go.Figure()
+    tafel_plotted: dict[str, list] = {}
     for f, r in results:
         color = f["color"]
         start, stop = f["start"], f["stop"]
@@ -1284,6 +1425,12 @@ def render_tafel_tab() -> None:
         margin = int(round((stop - start) * vicinity_pct / 100.0))
         v0, v1 = max(0, start - margin), min(n_pts, stop + margin)
         grp = f["reaction"]
+        # Same slices that are drawn, so the CSV reproduces the plot exactly:
+        # the shown points, then the two endpoints of the fitted line.
+        tafel_plotted[f"{f['label']} — log10|i| ({display_unit})"] = \
+            list(f["log_i"][v0:v1])
+        tafel_plotted[f"{f['label']} — E vs RHE (V)"] = \
+            list(f["potential"][v0:v1])
         fig.add_trace(go.Scatter(
             x=f["log_i"][v0:v1], y=f["potential"][v0:v1], mode="lines+markers",
             name=f["label"],
@@ -1297,22 +1444,28 @@ def render_tafel_tab() -> None:
         yline = r.slope_v_per_dec * xline + r.intercept_v
         slope_abs = abs(r.slope_mv_per_dec)
         fit_color = _darken(color)
+        tafel_plotted[f"{f['label']} — fit line log10|i|"] = list(xline)
+        tafel_plotted[f"{f['label']} — fit line E (V)"] = list(yline)
         fig.add_trace(go.Scatter(
             x=xline, y=yline, mode="lines", showlegend=False, legendgroup=grp,
             name=f"{f['label']} — linear (Tafel) fit, {slope_abs:.0f} mV/dec",
             line=dict(color=fit_color, width=3, dash="dot"),
         ))
         xmid, ymid = float(np.mean(xline)), float(np.mean(yline))
-        label_text = (f"{slope_abs:.0f} mV/dec ({f['reaction']})" if multi_reaction
-                     else f"{slope_abs:.0f} mV/dec")
+        label_text = (
+            f"{slope_abs:.0f} mV/dec ({f['reaction']})" if multi_reaction
+            else f"{slope_abs:.0f} mV/dec"
+        )
         fig.add_annotation(
             x=xmid, y=ymid, text=label_text,
             showarrow=False, yshift=16,
             font=dict(family="Arial", color=fit_color, size=22),
         )
 
-    title_text = (f"Tafel plot — {' & '.join(distinct_reactions)}" if multi_reaction
-                 else "Tafel plot")
+    title_text = (
+        f"Tafel plot — {' & '.join(distinct_reactions)}" if multi_reaction
+        else "Tafel plot"
+    )
     fig.update_layout(
         title=dict(text=title_text, font=dict(family="Arial", size=font_size)),
         template="plotly_white",
@@ -1344,10 +1497,15 @@ def render_tafel_tab() -> None:
     st.plotly_chart(
         fig, use_container_width=True, key="tafel_plot_select",
         on_select="rerun", selection_mode=["box"],
-        config={"edits": {"annotationPosition": True, "legendPosition": True},
-               "displaylogo": False},
+        config={
+            "edits": {"annotationPosition": True, "legendPosition": True},
+            "displaylogo": False,
+        },
     )
-    png_download(fig, "tafel_combined_plot.png", key="png_tafel")
+    figure_downloads(
+        fig, "tafel_combined_plot", key="png_tafel", what="Tafel plot",
+        data=_padded_frame(tafel_plotted),
+    )
 
     rows = []
     for f, r in results:
@@ -1375,33 +1533,77 @@ def render_tafel_tab() -> None:
         key="dl_tafel_summary",
     )
 
-    table_fig = go.Figure(data=[go.Table(
-        header=dict(values=list(summary.columns), font=dict(family="Arial", size=font_size * 0.45),
-                    align="left"),
-        cells=dict(values=[summary[c] for c in summary.columns],
-                   font=dict(family="Arial", size=font_size * 0.4), align="left",
-                   height=int(font_size * 1.2)),
-    )])
-    table_fig.update_layout(
-        margin=dict(l=10, r=10, t=10, b=10),
-        height=90 + 40 * len(summary),
+    # Results table as a figure (Arial, publication-style). The exported
+    # canvas is sized from the table's own content: columns are widened in
+    # proportion to the longest string they hold (the mechanistic-benchmark
+    # column is far wider than "R2"), and the row height leaves room for the
+    # lines Plotly wraps text onto — otherwise long entries overlap and the
+    # last rows fall outside a fixed-size export.
+    cell_font = max(9.0, font_size * 0.4)
+    header_font = max(10.0, font_size * 0.45)
+    # Render the numbers explicitly (the CSV above keeps the full-precision
+    # floats); an intercept current is otherwise printed with a long tail of
+    # zeros that blows the column width out.
+    display = summary.copy()
+    intercept_col = f"Intercept current at E=0 ({display_unit})"
+    display[intercept_col] = [
+        "—" if v is None or not np.isfinite(v) else f"{v:.3e}"
+        for v in summary[intercept_col]
+    ]
+    display["R2"] = [f"{v:.4f}" for v in summary["R2"]]
+    str_cols = {c: display[c].astype(str) for c in display.columns}
+    widths = []
+    for c in display.columns:
+        longest = str_cols[c].str.len().max()
+        longest = int(longest) if pd.notna(longest) else 0
+        # +2 characters of breathing room so short entries aren't wrapped, and
+        # a cap so one long sentence can't squeeze every other column.
+        widths.append(min(max(len(str(c)), longest, 6) + 2, 46))
+    char_px = cell_font * 0.66
+    table_width = int(sum(widths) * char_px + 60)
+    # Worst-case wrapped lines in any cell of a row -> uniform row height.
+    max_wrap = max(
+        (int(np.ceil(len(v) / w)) for col, w in zip(display.columns, widths)
+         for v in str_cols[col]),
+        default=1,
     )
-    png_download(
-        table_fig, "tafel_results_table.png", key="png_tafel_table",
-        label="⬇️ Download results table (PNG, Arial)",
+    row_h = int(cell_font * 1.5 * max(1, max_wrap)) + 8
+    table_fig = go.Figure(data=[go.Table(
+        columnwidth=widths,
+        header=dict(values=list(display.columns),
+                    font=dict(family="Arial", size=header_font),
+                    align="left", height=int(header_font * 1.6) + 10),
+        cells=dict(values=[str_cols[c] for c in display.columns],
+                   font=dict(family="Arial", size=cell_font), align="left",
+                   height=row_h),
+    )])
+    table_height = int(header_font * 1.6) + 20 + row_h * len(display) + 20
+    table_fig.update_layout(
+        template="plotly_white",  # never export with Streamlit's placeholder colours
+        margin=dict(l=10, r=10, t=10, b=10),
+        width=table_width, height=table_height,
+    )
+    figure_downloads(  # CSV of this table is the summary button above
+        table_fig, "tafel_results_table", key="png_tafel_table",
+        what="Results table", width=table_width, height=table_height,
     )
     st.caption(
         "ℹ️ On the RHE scale, 0 V is exactly the H⁺/H₂ equilibrium potential, "
-        "so for **HER** the intercept current above is the physical *exchange "
-        "current* i₀. For **OER/ORR** (E_eq ≈ 1.23 V vs RHE) it is not — treat "
-        "it as a fit-extrapolation value only, or re-express as an "
-        "overpotential (η = E_RHE − 1.23 V) before fitting if i₀ is needed."
+        "so for **HER and HOR** the intercept current above is the physical "
+        "*exchange current* i₀. Every other reaction has its equilibrium "
+        "potential elsewhere — OER/ORR ≈ 1.23 V, NO₃RR (to NH₃) ≈ 0.69 V, "
+        "N₂RR (to NH₃) ≈ 0.09 V, CO₂RR ≈ −0.1 V (product-dependent) vs RHE — "
+        "so there the intercept is a fit-extrapolation value only. Re-express "
+        "the potential as an overpotential (η = E_RHE − E_eq) before fitting "
+        "if i₀ is what you need."
     )
 
     st.markdown("**Analysis**")
     for rxn in distinct_reactions:
-        entries = [(f["label"], abs(r.slope_mv_per_dec), r.r_squared)
-                  for f, r in results if f["reaction"] == rxn]
+        entries = [
+            (f["label"], abs(r.slope_mv_per_dec), r.r_squared)
+            for f, r in results if f["reaction"] == rxn
+        ]
         if multi_reaction:
             st.markdown(f"*{rxn}*")
         st.write(tafel.analysis_paragraph(rxn, entries))
@@ -1415,7 +1617,10 @@ def main():
         st.stop()
 
     st.title("⚡ LSV analysis-iR compensation, Tafel slope anlaysis")
-    st.caption("EIS fitting → Ru extraction → LSV ohmic-drop correction, plus independent Tafel-slope analysis")
+    st.caption(
+        "EIS fitting → Ru extraction → LSV ohmic-drop correction, plus "
+        "independent Tafel-slope analysis"
+    )
 
     eis_list, lsv_list, label = sidebar_data_loader()
 
@@ -1457,9 +1662,15 @@ def main():
             render_lsv_tab(lsv_d, ru, current_unit, ru_unit, area_cm2)
     else:
         with tab_eis:
-            st.info("⬅️ Load an EIS/LSV workbook or CSV pair in the sidebar (section 1) to use this tab.")
+            st.info(
+                "⬅️ Load an EIS/LSV workbook or CSV pair in the sidebar "
+                "(section 1) to use this tab."
+            )
         with tab_lsv:
-            st.info("⬅️ Load an EIS/LSV workbook or CSV pair in the sidebar (section 1) to use this tab.")
+            st.info(
+                "⬅️ Load an EIS/LSV workbook or CSV pair in the sidebar "
+                "(section 1) to use this tab."
+            )
 
     with tab_tafel:
         render_tafel_tab()
