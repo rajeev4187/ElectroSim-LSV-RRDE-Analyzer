@@ -1,4 +1,4 @@
-"""Streamlit GUI for automated iR compensation from EIS + LSV data.
+"""Streamlit GUI for LSV analysis: iR compensation and Tafel-slope analysis.
 
 Run with:
     streamlit run app.py
@@ -8,7 +8,10 @@ Workflow
 1. Upload an Excel workbook (Sheet 1 = EIS, Sheet 2 = LSV) or two CSV files.
 2. **EIS / Ru Analysis** tab: fit the Nyquist arc to extract Ru (and Rct).
 3. **LSV iR Correction** tab: apply the ohmic-drop correction with a
-   compensation factor selectable from 5 % to 85 %; download the result.
+   compensation factor selectable from 5 % to 100 %; download the result.
+4. **Tafel Slope Analysis** tab: independent of the above — upload its own
+   polarization-curve file and fit the linear (kinetic) region to extract the
+   Tafel slope.
 """
 
 from __future__ import annotations
@@ -22,9 +25,12 @@ import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 import streamlit as st
 
-from ir_compensation import correction, data_io, eis
+from ir_compensation import correction, data_io, eis, tafel
 
-st.set_page_config(page_title="Automated iR Compensation", page_icon="⚡", layout="wide")
+st.set_page_config(
+    page_title="LSV analysis-iR compensation, Tafel slope anlaysis",
+    page_icon="⚡", layout="wide",
+)
 
 SAMPLE_PATH = "sample-data/Book1-original data.xlsx"
 REPO_URL = "https://github.com/rajeev4187/LSV-iR-compensation-calculation"
@@ -76,7 +82,7 @@ def require_access() -> bool:
     if st.session_state.get("authed"):
         return True
 
-    st.title("⚡ Automated iR Compensation")
+    st.title("⚡ LSV analysis-iR compensation, Tafel slope anlaysis")
     st.text_input("Password", type="password", key="_pw")
     if st.button("Enter"):
         if hmac.compare_digest(str(st.session_state.get("_pw", "")),
@@ -812,59 +818,601 @@ def render_lsv_tab(lsv_d, ru: float | None, current_unit: str = "mA",
 
 
 # --------------------------------------------------------------------------- #
+# Tafel slope analysis tab (independent data source)                          #
+# --------------------------------------------------------------------------- #
+_TAFEL_REACTIONS = ["HER", "OER", "ORR", "Other / unspecified"]
+_TAFEL_FONT_SIZES = [28, 36]
+# Journal style: a closed box border (mirrored axis lines) around the plot,
+# with no interior gridlines.
+_BOX_AXIS_STYLE = dict(
+    showgrid=False, zeroline=False,
+    showline=True, linewidth=1.5, linecolor="black", mirror=True,
+    ticks="outside",
+)
+
+
+def _darken(hex_color: str, factor: float = 0.6) -> str:
+    """Darken a ``#rrggbb`` color so a fit line stands out against its own
+    sample's (lighter) data color."""
+    hex_color = hex_color.lstrip("#")
+    r, g, b = (int(hex_color[i:i + 2], 16) for i in (0, 2, 4))
+    return "#{:02x}{:02x}{:02x}".format(
+        *(max(0, int(c * factor)) for c in (r, g, b))
+    )
+
+
+def _selection_signature(points: list) -> tuple:
+    """Fingerprint a Plotly box-select event so it can be applied exactly
+    once (Streamlit keeps the same selection in session_state across
+    unrelated reruns; without this, it would keep re-overriding the fit
+    sliders after the user manually adjusts them)."""
+    return tuple(sorted(
+        (p.get("curve_number"), p.get("point_index")) for p in points
+    ))
+
+
+def _selection_range_for_sample(points: list, orig_label: str,
+                                log_i: np.ndarray) -> tuple[int, int] | None:
+    """Map a Tafel-plot box-select event back to a ``(start, stop)`` index
+    range for one sample: keep only the selected points whose ``customdata``
+    matches this sample, then find the index span in its own log|i| array
+    covering that x-range. Returns ``None`` if the selection doesn't touch
+    this sample."""
+    xs = []
+    for p in points:
+        cd = p.get("customdata")
+        if isinstance(cd, (list, tuple)):
+            cd = cd[0] if cd else None
+        if cd == orig_label and p.get("x") is not None:
+            xs.append(float(p["x"]))
+    if len(xs) < 2:
+        return None
+    lo, hi = min(xs), max(xs)
+    idx = np.flatnonzero((log_i >= lo - 1e-9) & (log_i <= hi + 1e-9))
+    if len(idx) < 3:
+        return None
+    return int(idx.min()), int(idx.max()) + 1
+
+
+def _tafel_data_loader() -> list[tuple[str, "data_io.LSVData"]]:
+    """File uploader local to the Tafel tab — independent of the main sidebar
+    EIS/LSV loader. Multiple files (different samples/lots) may be uploaded
+    at once; each becomes one or more labelled series so several samples can
+    be combined into one journal-style overlay. Returns a flat list of
+    ``(label, LSVData)``."""
+    st.markdown(
+        "**Data source** (independent of the EIS/LSV loader above) — upload "
+        "one or more files, one per sample; they can be combined into a "
+        "single overlay plot below."
+    )
+    source = st.radio(
+        "Choose input",
+        ["Upload Excel workbook(s)", "Upload CSV file(s)"],
+        horizontal=True,
+        key="tafel_source",
+        help="Columns: Potential, Current (or current density). Several "
+             "datasets may also sit side-by-side within one file as "
+             "repeated column pairs.",
+    )
+    def _dedup(label: str, seen: dict[str, int]) -> str:
+        seen[label] = seen.get(label, 0) + 1
+        return label if seen[label] == 1 else f"{label} ({seen[label]})"
+
+    series: list[tuple[str, "data_io.LSVData"]] = []
+    seen_labels: dict[str, int] = {}
+    try:
+        if source == "Upload Excel workbook(s)":
+            ups = st.file_uploader(
+                "Excel (.xlsx)", type=["xlsx", "xls"], key="tafel_xlsx",
+                accept_multiple_files=True,
+            )
+            if not ups:
+                st.info("⬆️ Upload one or more workbooks to begin.")
+                return []
+            first_sheets = data_io.list_sheets(io.BytesIO(ups[0].getvalue()))
+            sheet = st.selectbox(
+                "Sheet (applied to every uploaded workbook)",
+                first_sheets, index=0, key="tafel_sheet",
+            )
+            for up in ups:
+                base = up.name.rsplit(".", 1)[0]
+                try:
+                    sheets_here = data_io.list_sheets(io.BytesIO(up.getvalue()))
+                    use_sheet = sheet if sheet in sheets_here else sheets_here[0]
+                    ds = data_io.load_lsv_datasets(
+                        io.BytesIO(up.getvalue()), sheet=use_sheet
+                    )
+                except Exception as exc:
+                    st.warning(f"{up.name}: {exc}")
+                    continue
+                for d in ds:
+                    label = f"{base} · {d.label}" if len(ds) > 1 else base
+                    series.append((_dedup(label, seen_labels), d))
+            return series
+
+        ups = st.file_uploader(
+            "CSV (Potential, Current)", type=["csv", "txt"], key="tafel_csv",
+            accept_multiple_files=True,
+        )
+        if not ups:
+            st.info("⬆️ Upload one or more CSV files to begin.")
+            return []
+        for up in ups:
+            base = up.name.rsplit(".", 1)[0]
+            try:
+                ds = data_io.load_lsv_datasets(io.BytesIO(up.getvalue()), sheet=None)
+            except Exception as exc:
+                st.warning(f"{up.name}: {exc}")
+                continue
+            for d in ds:
+                label = f"{base} · {d.label}" if len(ds) > 1 else base
+                series.append((_dedup(label, seen_labels), d))
+        return series
+    except Exception as exc:
+        st.error(f"Could not load data: {exc}")
+        return []
+
+
+def render_tafel_tab() -> None:
+    st.subheader("Tafel slope analysis")
+    st.caption(
+        "Fits E = a + b·log₁₀|i| over the linear (activation-controlled) "
+        "region of a polarization curve; **b** is the Tafel slope, reported "
+        "as its positive magnitude (mV/dec) per literature convention. This "
+        "tab has its own file upload and does not use the EIS/LSV data "
+        "loaded in the sidebar."
+    )
+
+    series = _tafel_data_loader()
+    if not series:
+        return
+    st.success(
+        f"Loaded {len(series)} sample(s): " + ", ".join(lbl for lbl, _ in series)
+    )
+
+    top1, top2, top3 = st.columns(3)
+    default_reaction = top1.selectbox(
+        "Default reaction (for newly added samples)", _TAFEL_REACTIONS, index=0,
+        help="Each sample gets its own reaction below (samples can mix "
+             "HER/OER/ORR in one overlay); this just sets the starting "
+             "value for samples you haven't set yet. The legend and "
+             "analysis are split by reaction type.",
+    )
+    font_size = top2.selectbox(
+        "Figure/table export font size (pt)", _TAFEL_FONT_SIZES, index=0,
+        help="Font is fixed to Arial for publication-style export.",
+    )
+    vicinity_pct = top3.number_input(
+        "Final-plot vicinity margin (%)", min_value=0, max_value=300,
+        value=25, step=5, key="tafel_vicinity_pct",
+        help="Once the fit range below looks right, the final Tafel plot "
+             "keeps only the points in this window around it (as a % of "
+             "the fit-region width) instead of the full sweep — set to a "
+             "large value (e.g. 300) to show everything.",
+    )
+
+    st.markdown("**Current unit & electrode area**")
+    cur1, cur2, cur3 = st.columns([1.4, 1, 1])
+    convert_density = cur1.checkbox(
+        "Convert absolute current to current density (÷ electrode area)",
+        value=False, key="tafel_convert_density",
+        help="Enable if the uploaded current is absolute (e.g. mA) and you "
+             "want the Tafel analysis reported as a current density "
+             "(e.g. mA/cm²) instead.",
+    )
+    if convert_density:
+        current_unit = cur2.selectbox(
+            "Current unit (as uploaded, absolute)", _ABS_CURRENT_UNITS,
+            index=0, key="tafel_current_unit_abs",
+        )
+        area_cm2 = cur3.number_input(
+            "Electrode area (cm²)", min_value=1e-4, value=0.04, step=0.01,
+            format="%.4f", key="tafel_area_cm2",
+        )
+        display_unit = f"{current_unit}/cm²"
+        st.caption(
+            f"↪ Current density = current ({current_unit}) ÷ {area_cm2:g} "
+            f"cm² → reported as {display_unit}."
+        )
+    else:
+        current_unit = cur2.selectbox(
+            "Current unit", _ABS_CURRENT_UNITS + _DENSITY_CURRENT_UNITS,
+            index=0, key="tafel_current_unit",
+        )
+        area_cm2 = None
+        display_unit = current_unit
+
+    labels = [lbl for lbl, _ in series]
+    chosen = st.multiselect(
+        "Samples to combine (journal-style overlay)",
+        labels, default=labels[: min(len(labels), 8)], key="tafel_chosen",
+    )
+    if not chosen:
+        st.info("Select at least one sample to plot.")
+        return
+    chosen_series = [(lbl, d) for lbl, d in series if lbl in chosen]
+
+    st.markdown("**Reference electrode → RHE conversion**")
+    st.caption(
+        "E(RHE) = E(measured) + E°(reference vs NHE) + 0.0592 V·pH⁻¹ × pH. "
+        "All fitting, plotting, and the exported data below use the "
+        "RHE-converted potential."
+    )
+    already_rhe = st.checkbox(
+        "Input data is already reported vs RHE (skip conversion)",
+        value=False, key="tafel_already_rhe",
+    )
+    e_ref, ph = 0.0, 0.0
+    if not already_rhe:
+        rc1, rc2, rc3 = st.columns([2, 1, 1])
+        ref_names = list(tafel.REFERENCE_ELECTRODES) + ["Custom"]
+        ref_choice = rc1.selectbox(
+            "Reference electrode used for the input data", ref_names,
+            index=0, key="tafel_ref_electrode",
+        )
+        if ref_choice == "Custom":
+            e_ref = rc2.number_input(
+                "E° vs NHE (V)", value=0.000, step=0.001, format="%.3f",
+                key="tafel_ref_custom",
+            )
+        else:
+            e_ref = tafel.REFERENCE_ELECTRODES[ref_choice]
+            rc2.metric("E° vs NHE (V)", f"{e_ref:.3f}")
+        ph = rc3.number_input(
+            "Electrolyte pH", min_value=0.0, max_value=14.0, value=7.0,
+            step=0.1, key="tafel_ph",
+        )
+        st.caption(
+            f"↪ E(RHE) = E(measured) + {e_ref:.3f} V + 0.0592 × {ph:g} = "
+            f"E(measured) + {(e_ref + tafel.NERNST_SLOPE_V_PER_PH * ph):.3f} V"
+        )
+
+    # A box-select drag on the Tafel plot below (key "tafel_plot_select")
+    # lands here as a fresh selection event; apply it to the affected
+    # sample(s)' fit-range widgets exactly once (a signature check stops it
+    # from re-clobbering a later manual slider drag on an unrelated rerun).
+    prior_points = []
+    prior_event = st.session_state.get("tafel_plot_select")
+    if prior_event is not None:
+        try:
+            prior_points = prior_event.get("selection", {}).get("points", [])
+        except Exception:
+            prior_points = []
+    sel_sig = _selection_signature(prior_points)
+    apply_selection = bool(prior_points) and sel_sig != st.session_state.get(
+        "_tafel_last_selection_sig"
+    )
+    if apply_selection:
+        st.session_state["_tafel_last_selection_sig"] = sel_sig
+
+    fits = []
+    with st.expander(
+        "🔧 Per-sample Tafel fit range & line color — auto-detected starting "
+        "near the reaction onset; drag to adjust, or box-select the region "
+        "directly on the Tafel plot below",
+        expanded=True,
+    ):
+        for i, (lbl, d) in enumerate(chosen_series):
+            mask = d.current != 0
+            if not mask.any():
+                st.warning(f"{lbl}: all currents are zero — skipped.")
+                continue
+            pot = d.potential[mask] if already_rhe else tafel.to_rhe(
+                d.potential[mask], e_ref, ph
+            )
+            cur = d.current[mask] / area_cm2 if convert_density else d.current[mask]
+            log_i = tafel.log_current(cur)
+            n = len(pot)
+            a0, a1 = tafel.auto_tafel_range(pot, log_i, current=cur)
+            range_key = f"tafel_range_{i}"
+            if apply_selection:
+                try:
+                    sel_range = _selection_range_for_sample(prior_points, lbl, log_i)
+                except Exception:
+                    sel_range = None
+                if sel_range is not None:
+                    st.session_state[range_key] = sel_range
+            c0, cr, c1, c2 = st.columns([1.1, 0.9, 2.0, 0.5])
+            display_name = c0.text_input(
+                "Legend name", value=lbl, key=f"tafel_name_{i}",
+                help="Shown in the plot legend; edit if the auto-detected "
+                     "name isn't the one you want.",
+            )
+            sample_reaction = cr.selectbox(
+                "Reaction", _TAFEL_REACTIONS,
+                index=_TAFEL_REACTIONS.index(default_reaction),
+                key=f"tafel_reaction_{i}",
+                help="This sample's legend and analysis are grouped under "
+                     "this reaction.",
+            )
+            slider_kwargs = ({} if range_key in st.session_state
+                             else {"value": (int(a0), int(a1))})
+            start, stop = c1.select_slider(
+                "Fit range (Potential vs RHE)", options=list(range(n)),
+                key=range_key, format_func=lambda idx: f"{pot[idx]:.3f} V",
+                **slider_kwargs,
+                help="Shown as the actual potential at each handle. "
+                     "Auto-starts near the current onset and extends while "
+                     "the potential vs log|i| relationship stays linear; "
+                     "drag either handle, or box-select the region on the "
+                     "Tafel plot below, to fine-tune.",
+            )
+            color = c2.color_picker(
+                "Color", value=_PALETTE[i % len(_PALETTE)], key=f"tafel_color_{i}"
+            )
+            fits.append(dict(label=display_name or lbl, orig_label=lbl,
+                             reaction=sample_reaction,
+                             potential=pot, log_i=log_i,
+                             start=start, stop=stop, color=color))
+
+    if not fits:
+        st.error("No usable samples (all-zero current).")
+        return
+
+    # Group samples by reaction (stable) so each reaction's traces sit
+    # together in plot/legend order, enabling a split legend per reaction.
+    fits.sort(key=lambda f: _TAFEL_REACTIONS.index(f["reaction"]))
+
+    axis_font = dict(family="Arial", size=font_size)
+    small_font = dict(family="Arial", size=max(12, round(font_size * 0.5)))
+
+    # Original LSV (linear-scale polarization curve), before the log-current
+    # Tafel transform — shown for context alongside the derived Tafel plot.
+    st.markdown("**Original LSV (polarization curve)**")
+    sample_meta = {f["orig_label"]: f for f in fits}
+    d_by_label = {lbl: d for lbl, d in chosen_series}
+    lsv_fig = go.Figure()
+    seen_lsv_groups = set()
+    for meta in fits:
+        d = d_by_label.get(meta["orig_label"])
+        if d is None:
+            continue
+        pot_full = d.potential if already_rhe else tafel.to_rhe(d.potential, e_ref, ph)
+        cur_full = d.current / area_cm2 if convert_density else d.current
+        grp = meta["reaction"]
+        first_in_group = grp not in seen_lsv_groups
+        seen_lsv_groups.add(grp)
+        lsv_fig.add_trace(go.Scatter(
+            x=pot_full, y=cur_full, mode="lines", name=meta["label"],
+            legendgroup=grp,
+            legendgrouptitle=dict(text=grp) if first_in_group else None,
+            line=dict(color=meta["color"], width=3),
+        ))
+    lsv_fig.update_layout(
+        title=dict(text="Original LSV", font=dict(family="Arial", size=font_size)),
+        template="plotly_white", height=460, font=axis_font,
+        legend=dict(x=0.02, y=0.98, xanchor="left", yanchor="top", font=small_font,
+                    bgcolor="rgba(255,255,255,0.7)", bordercolor="black", borderwidth=1),
+        margin=dict(l=10, r=10, t=60, b=10),
+    )
+    lsv_fig.update_xaxes(
+        title=dict(text="Potential vs RHE / V", font=dict(family="Arial", size=font_size)),
+        tickfont=dict(family="Arial", size=font_size), **_BOX_AXIS_STYLE,
+    )
+    lsv_fig.update_yaxes(
+        title=dict(text=f"Current ({display_unit})", font=dict(family="Arial", size=font_size)),
+        tickfont=dict(family="Arial", size=font_size), **_BOX_AXIS_STYLE,
+    )
+    st.plotly_chart(lsv_fig, use_container_width=True, config={"displaylogo": False})
+    png_download(lsv_fig, "original_lsv_plot.png", key="png_lsv_original")
+
+    results = []
+    for f in fits:
+        try:
+            r = tafel.fit_tafel(f["potential"], f["log_i"], f["start"], f["stop"])
+        except Exception as exc:
+            st.warning(f"{f['label']}: fit failed ({exc})")
+            continue
+        results.append((f, r))
+    if not results:
+        return
+
+    st.markdown("**Tafel plot**")
+    st.caption(
+        f"Showing only the data within {vicinity_pct:g}% of each sample's "
+        "fit-region width around its selected linear range (adjust above "
+        "or widen the fit range in the expander if the plot looks too tight)."
+    )
+    distinct_reactions = []
+    for f, _ in results:
+        if f["reaction"] not in distinct_reactions:
+            distinct_reactions.append(f["reaction"])
+    multi_reaction = len(distinct_reactions) > 1
+
+    fig = go.Figure()
+    seen_tafel_groups = set()
+    for f, r in results:
+        color = f["color"]
+        start, stop = f["start"], f["stop"]
+        n_pts = len(f["log_i"])
+        margin = int(round((stop - start) * vicinity_pct / 100.0))
+        v0, v1 = max(0, start - margin), min(n_pts, stop + margin)
+        grp = f["reaction"]
+        first_in_group = grp not in seen_tafel_groups
+        seen_tafel_groups.add(grp)
+        fig.add_trace(go.Scatter(
+            x=f["log_i"][v0:v1], y=f["potential"][v0:v1], mode="lines+markers",
+            name=f["label"],
+            legendgroup=grp,
+            legendgrouptitle=dict(text=grp) if first_in_group else None,
+            marker=dict(size=10, color=color, opacity=0.55),
+            line=dict(color=color, width=1),
+            customdata=[f["orig_label"]] * (v1 - v0),
+        ))
+        xs = f["log_i"][f["start"]:f["stop"]]
+        xline = np.array([float(np.min(xs)), float(np.max(xs))])
+        yline = r.slope_v_per_dec * xline + r.intercept_v
+        slope_abs = abs(r.slope_mv_per_dec)
+        fit_color = _darken(color)
+        fig.add_trace(go.Scatter(
+            x=xline, y=yline, mode="lines", showlegend=False, legendgroup=grp,
+            name=f"{f['label']} — linear (Tafel) fit, {slope_abs:.0f} mV/dec",
+            line=dict(color=fit_color, width=3, dash="dot"),
+        ))
+        xmid, ymid = float(np.mean(xline)), float(np.mean(yline))
+        label_text = (f"{slope_abs:.0f} mV/dec ({f['reaction']})" if multi_reaction
+                     else f"{slope_abs:.0f} mV/dec")
+        fig.add_annotation(
+            x=xmid, y=ymid, text=label_text,
+            showarrow=False, yshift=16,
+            font=dict(family="Arial", color=fit_color, size=22),
+        )
+
+    fig.update_layout(
+        title=dict(text=f"Tafel plot — {' & '.join(distinct_reactions)}",
+                    font=dict(family="Arial", size=font_size)),
+        template="plotly_white",
+        height=560,
+        font=axis_font,  # baseline (inherited by legend/annotations unless overridden)
+        legend=dict(x=0.02, y=0.98, xanchor="left", yanchor="top", font=small_font,
+                    bgcolor="rgba(255,255,255,0.7)", bordercolor="black", borderwidth=1),
+        margin=dict(l=10, r=10, t=60, b=10),
+        dragmode="select",
+    )
+    # Axis titles/ticks are the "axes" text: always the full 28/36 pt Arial.
+    fig.update_xaxes(
+        title=dict(text=f"log₁₀ |Current| ({display_unit})",
+                   font=dict(family="Arial", size=font_size)),
+        tickfont=dict(family="Arial", size=font_size), **_BOX_AXIS_STYLE,
+    )
+    fig.update_yaxes(
+        title=dict(text="Potential vs RHE / V", font=dict(family="Arial", size=font_size)),
+        tickfont=dict(family="Arial", size=font_size), **_BOX_AXIS_STYLE,
+    )
+    st.caption(
+        "🖱️ Drag a box around a sample's linear region to set its fit range "
+        "directly (mouse now defaults to box-select instead of zoom — use "
+        "the toolbar's zoom icon or double-click to reset the view). Drag a "
+        "slope label to reposition it before exporting."
+    )
+    st.plotly_chart(
+        fig, use_container_width=True, key="tafel_plot_select",
+        on_select="rerun", selection_mode=["box"],
+        config={"edits": {"annotationPosition": True}, "displaylogo": False},
+    )
+    png_download(fig, "tafel_combined_plot.png", key="png_tafel")
+
+    rows = []
+    for f, r in results:
+        slope_abs = abs(r.slope_mv_per_dec)
+        ref = tafel.nearest_reference(slope_abs, f["reaction"])
+        rows.append({
+            "Sample": f["label"],
+            "Reaction": f["reaction"],
+            "Tafel slope (mV/dec)": round(slope_abs, 1),
+            "R2": round(r.r_squared, 4),
+            f"Intercept current at E=0 ({display_unit})": r.exchange_current,
+            "Fit points": f["stop"] - f["start"],
+            "Nearest mechanistic benchmark": (
+                f"~{ref[0]:.0f} mV/dec ({ref[1]})" if ref else "—"
+            ),
+        })
+    summary = pd.DataFrame(rows)
+    st.markdown("**Results summary**")
+    st.dataframe(summary, use_container_width=True, hide_index=True)
+    st.download_button(
+        "⬇️ Download Tafel fit summary (CSV)",
+        data=summary.to_csv(index=False).encode("utf-8"),
+        file_name="tafel_fit_summary.csv",
+        mime="text/csv",
+        key="dl_tafel_summary",
+    )
+
+    table_fig = go.Figure(data=[go.Table(
+        header=dict(values=list(summary.columns), font=dict(family="Arial", size=font_size * 0.45),
+                    align="left"),
+        cells=dict(values=[summary[c] for c in summary.columns],
+                   font=dict(family="Arial", size=font_size * 0.4), align="left",
+                   height=int(font_size * 1.2)),
+    )])
+    table_fig.update_layout(
+        margin=dict(l=10, r=10, t=10, b=10),
+        height=90 + 40 * len(summary),
+    )
+    png_download(
+        table_fig, "tafel_results_table.png", key="png_tafel_table",
+        label="⬇️ Download results table (PNG, Arial)",
+    )
+    st.caption(
+        "ℹ️ On the RHE scale, 0 V is exactly the H⁺/H₂ equilibrium potential, "
+        "so for **HER** the intercept current above is the physical *exchange "
+        "current* i₀. For **OER/ORR** (E_eq ≈ 1.23 V vs RHE) it is not — treat "
+        "it as a fit-extrapolation value only, or re-express as an "
+        "overpotential (η = E_RHE − 1.23 V) before fitting if i₀ is needed."
+    )
+
+    st.markdown("**Analysis**")
+    for rxn in distinct_reactions:
+        entries = [(f["label"], abs(r.slope_mv_per_dec), r.r_squared)
+                  for f, r in results if f["reaction"] == rxn]
+        if multi_reaction:
+            st.markdown(f"*{rxn}*")
+        st.write(tafel.analysis_paragraph(rxn, entries))
+
+
+# --------------------------------------------------------------------------- #
 # Main                                                                         #
 # --------------------------------------------------------------------------- #
 def main():
     if not require_access():
         st.stop()
 
-    st.title("⚡ Automated iR Compensation")
-    st.caption("EIS fitting → Ru extraction → LSV ohmic-drop correction")
+    st.title("⚡ LSV analysis-iR compensation, Tafel slope anlaysis")
+    st.caption("EIS fitting → Ru extraction → LSV ohmic-drop correction, plus independent Tafel-slope analysis")
 
     eis_list, lsv_list, label = sidebar_data_loader()
-    if not eis_list or not lsv_list:
-        st.stop()
 
-    # Link EIS dataset i with LSV dataset i (paired samples).
-    n_pairs = min(len(eis_list), len(lsv_list))
-    st.sidebar.header("2 · Sample")
-    if len(eis_list) != len(lsv_list):
-        st.sidebar.warning(
-            f"EIS has {len(eis_list)} dataset(s) but LSV has "
-            f"{len(lsv_list)}. Pairing the first {n_pairs} by position."
+    tab_eis, tab_lsv, tab_tafel = st.tabs(
+        ["📈 EIS / Ru Analysis", "🔬 LSV iR Correction", "📐 Tafel Slope Analysis"]
+    )
+
+    if eis_list and lsv_list:
+        # Link EIS dataset i with LSV dataset i (paired samples).
+        n_pairs = min(len(eis_list), len(lsv_list))
+        st.sidebar.header("2 · Sample")
+        if len(eis_list) != len(lsv_list):
+            st.sidebar.warning(
+                f"EIS has {len(eis_list)} dataset(s) but LSV has "
+                f"{len(lsv_list)}. Pairing the first {n_pairs} by position."
+            )
+        options = list(range(n_pairs))
+        sel = st.sidebar.selectbox(
+            "Active sample (EIS ↔ LSV pair)",
+            options,
+            format_func=lambda i: f"Sample {i + 1}",
+            help="EIS pair i is linked to LSV pair i.",
         )
-    options = list(range(n_pairs))
-    sel = st.sidebar.selectbox(
-        "Active sample (EIS ↔ LSV pair)",
-        options,
-        format_func=lambda i: f"Sample {i + 1}",
-        help="EIS pair i is linked to LSV pair i.",
-    )
-    eis_d, lsv_d = eis_list[sel], lsv_list[sel]
-    st.sidebar.success(
-        f"Loaded: {label}\n\n{n_pairs} sample(s) · "
-        f"Sample {sel + 1}: EIS {len(eis_d)} pts · LSV {len(lsv_d)} pts\n\n"
-        f"EIS cols: {eis_d.label}\n\nLSV cols: {lsv_d.label}"
-    )
+        eis_d, lsv_d = eis_list[sel], lsv_list[sel]
+        st.sidebar.success(
+            f"Loaded: {label}\n\n{n_pairs} sample(s) · "
+            f"Sample {sel + 1}: EIS {len(eis_d)} pts · LSV {len(lsv_d)} pts\n\n"
+            f"EIS cols: {eis_d.label}\n\nLSV cols: {lsv_d.label}"
+        )
 
-    cur_default, ru_default = _detect_units(eis_d.label, lsv_d.label)
-    current_unit, ru_unit, area_cm2 = sidebar_units(cur_default, ru_default)
+        cur_default, ru_default = _detect_units(eis_d.label, lsv_d.label)
+        current_unit, ru_unit, area_cm2 = sidebar_units(cur_default, ru_default)
 
-    tab_eis, tab_lsv = st.tabs(
-        ["📈 EIS / Ru Analysis", "🔬 LSV iR Correction"]
-    )
-    with tab_eis:
-        # Returns the raw Ru in the EIS file's unit; the LSV tab reconciles it
-        # with the electrode area to report both Ru and Ru effective.
-        ru = render_eis_tab(eis_d, eis_list, sel, ru_unit, current_unit, area_cm2)
-    with tab_lsv:
-        render_lsv_tab(lsv_d, ru, current_unit, ru_unit, area_cm2)
+        with tab_eis:
+            # Returns the raw Ru in the EIS file's unit; the LSV tab reconciles it
+            # with the electrode area to report both Ru and Ru effective.
+            ru = render_eis_tab(eis_d, eis_list, sel, ru_unit, current_unit, area_cm2)
+        with tab_lsv:
+            render_lsv_tab(lsv_d, ru, current_unit, ru_unit, area_cm2)
+    else:
+        with tab_eis:
+            st.info("⬅️ Load an EIS/LSV workbook or CSV pair in the sidebar (section 1) to use this tab.")
+        with tab_lsv:
+            st.info("⬅️ Load an EIS/LSV workbook or CSV pair in the sidebar (section 1) to use this tab.")
+
+    with tab_tafel:
+        render_tafel_tab()
 
     render_citation()
     st.divider()
     st.caption(
-        f"Automated iR Compensation v1.0.0 · please cite if used "
-        f"([repository]({REPO_URL})). See **Cite this app** in the sidebar."
+        f"LSV analysis-iR compensation, Tafel slope anlaysis v1.1.0 · please "
+        f"cite if used ([repository]({REPO_URL})). See **Cite this app** in "
+        "the sidebar."
     )
 
 
