@@ -918,6 +918,7 @@ def _tafel_data_loader() -> list[tuple[str, "data_io.LSVData"]]:
              "datasets may also sit side-by-side within one file as "
              "repeated column pairs.",
     )
+
     def _dedup(label: str, seen: dict[str, int]) -> str:
         seen[label] = seen.get(label, 0) + 1
         return label if seen[label] == 1 else f"{label} ({seen[label]})"
@@ -1032,8 +1033,10 @@ def render_tafel_tab() -> None:
     if convert_density:
         abs_default = native_unit if native_unit in _ABS_CURRENT_UNITS else _ABS_CURRENT_UNITS[0]
         current_unit = cur2.selectbox(
-            "Current unit (absolute, before ÷ area)", _ABS_CURRENT_UNITS,
+            "Desired current unit", _ABS_CURRENT_UNITS,
             index=_ABS_CURRENT_UNITS.index(abs_default), key="tafel_current_unit_abs",
+            help="Current is auto-detected from the file and rescaled to "
+                 "this unit, then divided by the electrode area.",
         )
         area_cm2 = cur3.number_input(
             "Electrode area (cm²)", min_value=1e-4, value=0.04, step=0.01,
@@ -1054,9 +1057,10 @@ def render_tafel_tab() -> None:
         opts_all = _ABS_CURRENT_UNITS + _DENSITY_CURRENT_UNITS
         cur_idx = opts_all.index(cur_default) if cur_default in opts_all else 0
         current_unit = cur2.selectbox(
-            "Current unit", opts_all, index=cur_idx, key="tafel_current_unit",
-            help="Selecting a different unit of the same kind (e.g. mA → µA, "
-                 "or mA/cm² → A/cm²) rescales the values accordingly.",
+            "Desired current unit", opts_all, index=cur_idx, key="tafel_current_unit",
+            help="Current is auto-detected from the file; pick a different "
+                 "unit of the same kind (e.g. mA → µA, or mA/cm² → A/cm²) "
+                 "to rescale the values.",
         )
         area_cm2 = None
         display_unit = current_unit
@@ -1213,7 +1217,6 @@ def render_tafel_tab() -> None:
     # Original LSV (linear-scale polarization curve), before the log-current
     # Tafel transform — shown for context alongside the derived Tafel plot.
     st.markdown("**Original LSV (polarization curve)**")
-    sample_meta = {f["orig_label"]: f for f in fits}
     d_by_label = {lbl: d for lbl, d in chosen_series}
     lsv_fig = go.Figure()
     for meta in fits:
@@ -1322,14 +1325,15 @@ def render_tafel_tab() -> None:
         dragmode="select",
     )
     # Axis titles/ticks are the "axes" text: always the full 28/36 pt Arial.
+    # A sparse tick count (~4-5) keeps a publication-style plot uncluttered.
     fig.update_xaxes(
         title=dict(text=f"log₁₀ |Current| ({display_unit})",
                    font=dict(family="Arial", size=font_size)),
-        tickfont=dict(family="Arial", size=font_size), **_BOX_AXIS_STYLE,
+        tickfont=dict(family="Arial", size=font_size), nticks=5, **_BOX_AXIS_STYLE,
     )
     fig.update_yaxes(
         title=dict(text="Potential vs RHE / V", font=dict(family="Arial", size=font_size)),
-        tickfont=dict(family="Arial", size=font_size), **_BOX_AXIS_STYLE,
+        tickfont=dict(family="Arial", size=font_size), nticks=5, **_BOX_AXIS_STYLE,
     )
     st.caption(
         "🖱️ Drag a box around a sample's linear region to set its fit range "
