@@ -1128,8 +1128,11 @@ def render_tafel_tab() -> None:
             slider_kwargs = ({} if range_key in st.session_state
                              else {"value": (int(a0), int(a1))})
             start, stop = c1.select_slider(
-                "Fit range (Potential vs RHE)", options=list(range(n)),
-                key=range_key, format_func=lambda idx: f"{pot[idx]:.3f} V",
+                "Fit range (Potential vs RHE)", options=list(range(n + 1)),
+                key=range_key,
+                format_func=lambda idx, _pot=pot, _n=n: (
+                    f"{_pot[idx]:.3f} V" if idx < _n else f"{_pot[-1]:.3f} V (end)"
+                ),
                 **slider_kwargs,
                 help="Shown as the actual potential at each handle. "
                      "Auto-starts near the current onset and extends while "
