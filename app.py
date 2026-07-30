@@ -841,6 +841,20 @@ _BOX_AXIS_STYLE = dict(
 )
 
 
+def _rescale_current(raw: np.ndarray, from_unit: str, to_unit: str) -> np.ndarray:
+    """Convert a current (or current-density) array from ``from_unit`` to
+    ``to_unit``. Same-family only (both absolute or both density) — a
+    cross-family change (needs an electrode area) is left unconverted."""
+    if from_unit == to_unit:
+        return raw
+    from_density = correction.is_density_unit(from_unit)
+    to_density = correction.is_density_unit(to_unit)
+    table = correction.CURRENT_DENSITY_UNITS if from_density else correction.CURRENT_UNITS
+    if from_density != to_density or from_unit not in table or to_unit not in table:
+        return raw
+    return raw * (table[from_unit] / table[to_unit])
+
+
 def _darken(hex_color: str, factor: float = 0.6) -> str:
     """Darken a ``#rrggbb`` color so a fit line stands out against its own
     sample's (lighter) data color."""
@@ -1002,6 +1016,11 @@ def render_tafel_tab() -> None:
     )
 
     st.markdown("**Current unit & electrode area**")
+    # Auto-detect a sensible default from the first sample's column header
+    # (e.g. "Current (mA/cm2)"), same heuristic the EIS/LSV tabs use — the
+    # user can still override or opt into density conversion below.
+    cur_default, _ = _detect_units("", series[0][1].label) if series else (None, None)
+    native_unit = cur_default or "mA"
     cur1, cur2, cur3 = st.columns([1.4, 1, 1])
     convert_density = cur1.checkbox(
         "Convert absolute current to current density (÷ electrode area)",
@@ -1011,9 +1030,10 @@ def render_tafel_tab() -> None:
              "(e.g. mA/cm²) instead.",
     )
     if convert_density:
+        abs_default = native_unit if native_unit in _ABS_CURRENT_UNITS else _ABS_CURRENT_UNITS[0]
         current_unit = cur2.selectbox(
-            "Current unit (as uploaded, absolute)", _ABS_CURRENT_UNITS,
-            index=0, key="tafel_current_unit_abs",
+            "Current unit (absolute, before ÷ area)", _ABS_CURRENT_UNITS,
+            index=_ABS_CURRENT_UNITS.index(abs_default), key="tafel_current_unit_abs",
         )
         area_cm2 = cur3.number_input(
             "Electrode area (cm²)", min_value=1e-4, value=0.04, step=0.01,
@@ -1024,13 +1044,35 @@ def render_tafel_tab() -> None:
             f"↪ Current density = current ({current_unit}) ÷ {area_cm2:g} "
             f"cm² → reported as {display_unit}."
         )
+        if correction.is_density_unit(native_unit):
+            st.warning(
+                f"Detected current is already a density ({native_unit}); "
+                "the ÷ area conversion below assumes an absolute current. "
+                "Uncheck it to use the density as-is."
+            )
     else:
+        opts_all = _ABS_CURRENT_UNITS + _DENSITY_CURRENT_UNITS
+        cur_idx = opts_all.index(cur_default) if cur_default in opts_all else 0
         current_unit = cur2.selectbox(
-            "Current unit", _ABS_CURRENT_UNITS + _DENSITY_CURRENT_UNITS,
-            index=0, key="tafel_current_unit",
+            "Current unit", opts_all, index=cur_idx, key="tafel_current_unit",
+            help="Selecting a different unit of the same kind (e.g. mA → µA, "
+                 "or mA/cm² → A/cm²) rescales the values accordingly.",
         )
         area_cm2 = None
         display_unit = current_unit
+        if correction.is_density_unit(current_unit) != correction.is_density_unit(native_unit):
+            st.warning(
+                f"Detected current unit ({native_unit}) and the selected "
+                f"unit ({current_unit}) are different kinds (absolute vs. "
+                "density) — converting between them needs an electrode "
+                "area; enable 'Convert absolute current to current "
+                "density' above. Values are shown unconverted for now."
+            )
+    if cur_default:
+        st.caption(
+            f"ℹ️ Detected current unit from the column header: **{native_unit}**. "
+            "Values are automatically rescaled if you pick a different unit above."
+        )
 
     labels = [lbl for lbl, _ in series]
     chosen = st.multiselect(
@@ -1110,7 +1152,8 @@ def render_tafel_tab() -> None:
             pot = d.potential[mask] if already_rhe else tafel.to_rhe(
                 d.potential[mask], e_ref, ph
             )
-            cur = d.current[mask] / area_cm2 if convert_density else d.current[mask]
+            cur_scaled = _rescale_current(d.current[mask], native_unit, current_unit)
+            cur = cur_scaled / area_cm2 if convert_density else cur_scaled
             log_i = tafel.log_current(cur)
             n = len(pot)
             a0, a1 = tafel.auto_tafel_range(pot, log_i, current=cur)
@@ -1173,27 +1216,24 @@ def render_tafel_tab() -> None:
     sample_meta = {f["orig_label"]: f for f in fits}
     d_by_label = {lbl: d for lbl, d in chosen_series}
     lsv_fig = go.Figure()
-    seen_lsv_groups = set()
     for meta in fits:
         d = d_by_label.get(meta["orig_label"])
         if d is None:
             continue
         pot_full = d.potential if already_rhe else tafel.to_rhe(d.potential, e_ref, ph)
-        cur_full = d.current / area_cm2 if convert_density else d.current
-        grp = meta["reaction"]
-        first_in_group = grp not in seen_lsv_groups
-        seen_lsv_groups.add(grp)
+        cur_full_scaled = _rescale_current(d.current, native_unit, current_unit)
+        cur_full = cur_full_scaled / area_cm2 if convert_density else cur_full_scaled
         lsv_fig.add_trace(go.Scatter(
             x=pot_full, y=cur_full, mode="lines", name=meta["label"],
-            legendgroup=grp,
-            legendgrouptitle=dict(text=grp) if first_in_group else None,
+            legendgroup=meta["reaction"],
             line=dict(color=meta["color"], width=3),
         ))
     lsv_fig.update_layout(
         title=dict(text="Original LSV", font=dict(family="Arial", size=font_size)),
         template="plotly_white", height=460, font=axis_font,
         legend=dict(x=0.02, y=0.98, xanchor="left", yanchor="top", font=small_font,
-                    bgcolor="rgba(255,255,255,0.7)", bordercolor="black", borderwidth=1),
+                    bgcolor="rgba(255,255,255,0.7)", bordercolor="black", borderwidth=1,
+                    tracegroupgap=18),
         margin=dict(l=10, r=10, t=60, b=10),
     )
     lsv_fig.update_xaxes(
@@ -1204,7 +1244,10 @@ def render_tafel_tab() -> None:
         title=dict(text=f"Current ({display_unit})", font=dict(family="Arial", size=font_size)),
         tickfont=dict(family="Arial", size=font_size), **_BOX_AXIS_STYLE,
     )
-    st.plotly_chart(lsv_fig, use_container_width=True, config={"displaylogo": False})
+    st.plotly_chart(
+        lsv_fig, use_container_width=True,
+        config={"edits": {"legendPosition": True}, "displaylogo": False},
+    )
     png_download(lsv_fig, "original_lsv_plot.png", key="png_lsv_original")
 
     results = []
@@ -1231,7 +1274,6 @@ def render_tafel_tab() -> None:
     multi_reaction = len(distinct_reactions) > 1
 
     fig = go.Figure()
-    seen_tafel_groups = set()
     for f, r in results:
         color = f["color"]
         start, stop = f["start"], f["stop"]
@@ -1239,13 +1281,10 @@ def render_tafel_tab() -> None:
         margin = int(round((stop - start) * vicinity_pct / 100.0))
         v0, v1 = max(0, start - margin), min(n_pts, stop + margin)
         grp = f["reaction"]
-        first_in_group = grp not in seen_tafel_groups
-        seen_tafel_groups.add(grp)
         fig.add_trace(go.Scatter(
             x=f["log_i"][v0:v1], y=f["potential"][v0:v1], mode="lines+markers",
             name=f["label"],
             legendgroup=grp,
-            legendgrouptitle=dict(text=grp) if first_in_group else None,
             marker=dict(size=10, color=color, opacity=0.55),
             line=dict(color=color, width=1),
             customdata=[f["orig_label"]] * (v1 - v0),
@@ -1269,14 +1308,16 @@ def render_tafel_tab() -> None:
             font=dict(family="Arial", color=fit_color, size=22),
         )
 
+    title_text = (f"Tafel plot — {' & '.join(distinct_reactions)}" if multi_reaction
+                 else "Tafel plot")
     fig.update_layout(
-        title=dict(text=f"Tafel plot — {' & '.join(distinct_reactions)}",
-                    font=dict(family="Arial", size=font_size)),
+        title=dict(text=title_text, font=dict(family="Arial", size=font_size)),
         template="plotly_white",
         height=560,
         font=axis_font,  # baseline (inherited by legend/annotations unless overridden)
         legend=dict(x=0.02, y=0.98, xanchor="left", yanchor="top", font=small_font,
-                    bgcolor="rgba(255,255,255,0.7)", bordercolor="black", borderwidth=1),
+                    bgcolor="rgba(255,255,255,0.7)", bordercolor="black", borderwidth=1,
+                    tracegroupgap=18),
         margin=dict(l=10, r=10, t=60, b=10),
         dragmode="select",
     )
@@ -1293,13 +1334,14 @@ def render_tafel_tab() -> None:
     st.caption(
         "🖱️ Drag a box around a sample's linear region to set its fit range "
         "directly (mouse now defaults to box-select instead of zoom — use "
-        "the toolbar's zoom icon or double-click to reset the view). Drag a "
-        "slope label to reposition it before exporting."
+        "the toolbar's zoom icon or double-click to reset the view). Drag "
+        "the legend or a slope label to reposition it before exporting."
     )
     st.plotly_chart(
         fig, use_container_width=True, key="tafel_plot_select",
         on_select="rerun", selection_mode=["box"],
-        config={"edits": {"annotationPosition": True}, "displaylogo": False},
+        config={"edits": {"annotationPosition": True, "legendPosition": True},
+               "displaylogo": False},
     )
     png_download(fig, "tafel_combined_plot.png", key="png_tafel")
 
