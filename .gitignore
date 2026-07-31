@@ -216,3 +216,12 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# OS-generated junk
+.DS_Store
+Thumbs.db
+Desktop.ini
+
+# Editor workspace settings (local to a contributor's machine)
+.vscode/
+.idea/
