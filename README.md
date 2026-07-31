@@ -98,7 +98,7 @@ electrode.
   optional password gate can be set via a `app_password` secret.
 - Full technical notes (data format, security hardening, using the Python
   API without the GUI) are in the module docstrings under
-  [`ir_compensation/`](ir_compensation/).
+  [`scripts/modules/`](scripts/modules/).
 
 ---
 

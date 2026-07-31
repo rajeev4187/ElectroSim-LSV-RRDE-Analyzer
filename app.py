@@ -26,7 +26,7 @@ import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 import streamlit as st
 
-from ir_compensation import correction, data_io, eis, tafel
+from scripts.modules import correction, data_io, eis, tafel
 
 st.set_page_config(
     page_title="LSV analysis-iR compensation, Tafel slope anlaysis",
