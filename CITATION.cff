@@ -1,12 +1,15 @@
 cff-version: 1.2.0
 message: "If you use this software, please cite it as below."
-title: "LSV Analysis: iR Compensation and Tafel Slope"
+title: "ElectroSim-LSV-RRDE-Analyzer"
 abstract: >-
-  A Streamlit application with two independent workflows for electrochemical
-  polarization data: automated ohmic-drop (iR) compensation of linear-sweep
-  voltammetry (LSV) data using the uncompensated resistance (Ru) estimated
-  from an EIS Nyquist-arc circle fit, and Tafel slope analysis (with RHE
-  reference-electrode conversion and HER/OER/ORR mechanistic interpretation).
+  A Streamlit application for electrochemical polarization data: automated
+  ohmic-drop (iR) compensation of linear-sweep voltammetry (LSV) data using
+  the uncompensated resistance (Ru) estimated from an EIS Nyquist-arc circle
+  fit; LSV analysis (onset potential, benchmark overpotentials, Tafel slope,
+  with RHE reference-electrode conversion and mechanistic interpretation);
+  Koutecky-Levich analysis of multi-rotation-rate RDE data; and ORR/RRDE
+  analysis (onset/half-wave potential, electron-transfer number, and
+  peroxide yield from ring-disk data).
 type: software
 version: 1.1.0
 date-released: "2026-07-30"
@@ -26,6 +29,10 @@ keywords:
   - electrochemical impedance spectroscopy
   - linear sweep voltammetry
   - Tafel slope
+  - Koutecky-Levich
+  - rotating disk electrode
+  - rotating ring-disk electrode
+  - RRDE
   - HER
   - OER
   - ORR

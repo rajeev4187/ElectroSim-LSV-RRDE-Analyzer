@@ -1,4 +1,5 @@
-"""Streamlit GUI for LSV analysis: iR compensation and Tafel-slope analysis.
+"""ElectroSim-LSV-RRDE-Analyzer: a Streamlit GUI for iR compensation,
+Tafel-slope, Koutecky-Levich, and ORR/RRDE analysis.
 
 Run with:
     streamlit run app.py
@@ -9,9 +10,18 @@ Workflow
 2. **EIS / Ru Analysis** tab: fit the Nyquist arc to extract Ru (and Rct).
 3. **LSV iR Correction** tab: apply the ohmic-drop correction with a
    compensation factor selectable from 5 % to 100 %; download the result.
-4. **Tafel Slope Analysis** tab: independent of the above — upload its own
-   polarization-curve file and fit the linear (kinetic) region to extract the
-   Tafel slope.
+4. **LSV Analysis** tab: independent of the above — upload its own
+   polarization-curve file(s) and get the onset potential, overpotential at
+   benchmark current densities (e.g. j = 10 mA/cm²), and the Tafel slope of
+   the linear (kinetic) region.
+5. **K-L Analysis** tab: independent, multi-rotation-rate RDE data — the
+   classic Koutecky-Levich fit (1/j vs 1/sqrt(omega)) for the kinetic current
+   density and, given the electrolyte's O2 transport parameters, the
+   electron-transfer number n.
+6. **ORR / RRDE Analysis** tab: independent, one rotation rate (usually 1600
+   rpm) for onset/E1/2/Tafel plus (with ring current) electron number and
+   peroxide yield directly; several rotation rates for a merged ring/disk
+   comparison plot.
 """
 
 from __future__ import annotations
@@ -19,31 +29,36 @@ from __future__ import annotations
 import hashlib
 import hmac
 import io
+import re
+import zipfile
 
 import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
+from PIL import Image
 import streamlit as st
 
-from scripts.modules import correction, data_io, eis, tafel
+from scripts.modules import correction, data_io, eis, orr, tafel
+
+APP_NAME = "ElectroSim-LSV-RRDE-Analyzer"
 
 st.set_page_config(
-    page_title="LSV analysis-iR compensation, Tafel slope anlaysis",
+    page_title=APP_NAME,
     page_icon="⚡", layout="wide",
 )
 
 SAMPLE_PATH = "sample-data/Book1-original data.xlsx"
 REPO_URL = "https://github.com/rajeev4187/LSV-Analysis-iR-compensation-Tafel-slope"
 CITATION_TEXT = (
-    "Kumar, R. (2026). LSV Analysis: iR Compensation and Tafel Slope "
+    f"Kumar, R. (2026). {APP_NAME} "
     "(v1.1.0) [Computer software]. North Carolina Central "
     f"University. {REPO_URL}"
 )
 CITATION_BIBTEX = (
-    "@software{kumar_lsv_analysis_2026,\n"
+    "@software{kumar_electrosim_lsv_rrde_2026,\n"
     "  author  = {Kumar, Rajeev},\n"
-    "  title   = {LSV Analysis: iR Compensation and Tafel Slope},\n"
+    f"  title   = {{{APP_NAME}}},\n"
     "  version = {1.1.0},\n"
     "  year    = {2026},\n"
     f"  url     = {{{REPO_URL}}}\n"
@@ -83,7 +98,7 @@ def require_access() -> bool:
     if st.session_state.get("authed"):
         return True
 
-    st.title("⚡ LSV analysis-iR compensation, Tafel slope anlaysis")
+    st.title(f"⚡ {APP_NAME}")
     st.text_input("Password", type="password", key="_pw")
     if st.button("Enter"):
         if hmac.compare_digest(str(st.session_state.get("_pw", "")),
@@ -99,7 +114,7 @@ def require_access() -> bool:
 def _figure_signature(fig) -> str:
     """Short fingerprint of a figure's current content.
 
-    Used to detect that a cached PNG no longer matches the figure on screen
+    Used to detect that a cached TIFF no longer matches the figure on screen
     (e.g. the user moved a fit-range slider after preparing the export), so a
     stale image is never handed out as a download.
     """
@@ -114,7 +129,7 @@ def _figure_signature(fig) -> str:
 # template paints with placeholder colours (#000001, #000036, …) which the
 # Streamlit *frontend* swaps for the real theme colours while drawing the
 # chart in the browser. Anything rendered outside that frontend — a
-# server-side PNG, or a standalone HTML file — takes them literally, which is
+# server-side TIFF, or a standalone HTML file — takes them literally, which is
 # what turned exported figures (most visibly the results table, which sets no
 # template of its own) into a near-black block.
 _STREAMLIT_TEMPLATE_SENTINEL = "#000001"
@@ -150,21 +165,35 @@ def _export_size(fig, width: int | None, height: int | None) -> tuple[int, int]:
     return int(width), max(int(height), 200)
 
 
+def _render_tiff(export_fig, width: int, height: int) -> bytes:
+    """Render a figure to a 300 dpi, LZW-compressed TIFF — the raster format
+    most journals require for figure submission. Kaleido itself only
+    produces PNG/JPEG/WebP/SVG/PDF, so this renders a high-resolution PNG
+    first (scale=4, i.e. 4x the CSS pixel size) and converts it in-memory."""
+    png_bytes = export_fig.to_image(format="png", width=width, height=height,
+                                    scale=4)
+    image = Image.open(io.BytesIO(png_bytes))
+    buffer = io.BytesIO()
+    image.save(buffer, format="TIFF", dpi=(300, 300), compression="tiff_lzw")
+    return buffer.getvalue()
+
+
 def figure_downloads(fig, stem: str, key: str, what: str = "figure",
                      width: int | None = None, height: int | None = None,
                      data: "pd.DataFrame | None" = None) -> None:
-    """Render the download controls for one figure: PNG, interactive HTML and
-    (optionally) the plotted data as CSV.
+    """Render the download controls for one figure: TIFF, interactive HTML
+    and (optionally) the plotted data as CSV.
 
-    PNG rendering is server-side (kaleido), which launches a headless browser
-    per call — too slow/fragile to run on *every* script rerun (it would fire
-    on every unrelated widget interaction, e.g. dragging a slider). It only
-    happens when the user clicks "Prepare"; the bytes are cached in
-    session_state together with a signature of the figure, so the download
-    button persists across reruns but is withdrawn as soon as the figure
-    itself changes. The HTML and CSV exports need no external renderer and are
-    therefore always available — they are the fallback when kaleido/Chrome is
-    unavailable on the host (e.g. a slim cloud container).
+    TIFF rendering is server-side (kaleido + Pillow), which launches a
+    headless browser per call — too slow/fragile to run on *every* script
+    rerun (it would fire on every unrelated widget interaction, e.g.
+    dragging a slider). It only happens when the user clicks "Prepare"; the
+    bytes are cached in session_state together with a signature of the
+    figure, so the download button persists across reruns but is withdrawn
+    as soon as the figure itself changes. The HTML and CSV exports need no
+    external renderer and are therefore always available — they are the
+    fallback when kaleido/Chrome is unavailable on the host (e.g. a slim
+    cloud container).
     """
     state_key = f"_export_{key}"
     export_fig = _export_figure(fig)
@@ -172,14 +201,12 @@ def figure_downloads(fig, stem: str, key: str, what: str = "figure",
     cols = st.columns(3 if data is not None else 2)
 
     with cols[0]:
-        if st.button(f"🖼️ Prepare {what} (PNG)", key=f"_png_prep_{key}",
+        if st.button(f"🖼️ Prepare {what} (TIFF)", key=f"_tiff_prep_{key}",
                      use_container_width=True):
             w, h = _export_size(export_fig, width, height)
             try:
                 st.session_state[state_key] = {
-                    "sig": sig,
-                    "bytes": export_fig.to_image(format="png", width=w,
-                                                 height=h, scale=2),
+                    "sig": sig, "bytes": _render_tiff(export_fig, w, h),
                     "error": None,
                 }
             except Exception as exc:  # kaleido missing / no Chrome / render error
@@ -189,15 +216,15 @@ def figure_downloads(fig, stem: str, key: str, what: str = "figure",
         cached = st.session_state.get(state_key) or {}
         if cached.get("bytes") and cached.get("sig") == sig:
             st.download_button(
-                f"⬇️ {what} (PNG)", data=cached["bytes"],
-                file_name=f"{stem}.png", mime="image/png", key=f"_png_dl_{key}",
+                f"⬇️ {what} (TIFF)", data=cached["bytes"],
+                file_name=f"{stem}.tiff", mime="image/tiff", key=f"_tiff_dl_{key}",
                 use_container_width=True,
             )
         elif cached.get("bytes"):
             st.caption("↻ Figure changed — press Prepare again.")
         elif cached.get("error"):
             st.caption(
-                f"PNG export unavailable ({cached['error']}). Use the HTML "
+                f"TIFF export unavailable ({cached['error']}). Use the HTML "
                 "download beside this button, or the 📷 icon on the chart."
             )
 
@@ -211,7 +238,7 @@ def figure_downloads(fig, stem: str, key: str, what: str = "figure",
                 help="Interactive page — opens in any browser (needs internet "
                      "the first time, it loads plotly.js from a CDN) and can "
                      "be saved as an image from there. Always available, even "
-                     "when the server-side PNG renderer is not.",
+                     "when the server-side TIFF renderer is not.",
             )
         except Exception as exc:
             st.caption(f"HTML export unavailable ({exc}).")
@@ -476,6 +503,11 @@ def render_eis_tab(eis_d, eis_list, sel, ru_unit: str = "Ω",
             f"ℹ️ Impedance reported in **{disp_unit}**: raw Z (Ω) × electrode "
             f"area {area_cm2:g} cm² (current is a density)."
         )
+    font_size = st.selectbox(
+        "Figure/table export font size (pt)", _JOURNAL_FONT_SIZES, index=0,
+        key="eis_font_size",
+        help="Font is fixed to Arial for publication-style export.",
+    )
 
     n = len(eis_d)
     auto_start, auto_stop = eis.auto_arc_range(zr, zi)
@@ -548,14 +580,7 @@ def render_eis_tab(eis_d, eis_list, sel, ru_unit: str = "Ω",
                     marker=dict(size=13, color="red", symbol="x"),
                 )
             )
-        fig.update_layout(
-            xaxis_title=f"Z′ / {disp_unit}",
-            yaxis_title=f"−Z″ / {disp_unit}",
-            template="plotly_white",
-            height=460,
-            legend=dict(orientation="h", yanchor="bottom", y=1.02),
-            margin=dict(l=10, r=10, t=40, b=10),
-        )
+        _journal_axes_style(fig, f"Z′ / {disp_unit}", f"−Z″ / {disp_unit}", font_size)
         fig.update_yaxes(scaleanchor="x", scaleratio=1)  # equal aspect -> true circle
         st.plotly_chart(fig, use_container_width=True)
         nyquist_data = _padded_frame({
@@ -621,9 +646,16 @@ def render_eis_tab(eis_d, eis_list, sel, ru_unit: str = "Ω",
                     row[f"Rct ({disp_unit})"] = None
                     row[f"RMSE ({disp_unit})"] = f"fit failed: {exc}"
                     rows.append(row)
-            st.dataframe(
-                pd.DataFrame(rows),
-                use_container_width=True, hide_index=True,
+            batch_df = pd.DataFrame(rows)
+            st.dataframe(batch_df, use_container_width=True, hide_index=True)
+            st.download_button(
+                "⬇️ Download batch Ru table (CSV)",
+                data=batch_df.to_csv(index=False).encode("utf-8"),
+                file_name="eis_ru_batch.csv", mime="text/csv",
+                key="dl_eis_batch",
+            )
+            _journal_table_figure(
+                batch_df, font_size, "eis_ru_batch_table", key="png_eis_table",
             )
 
     return chosen_ru
@@ -713,6 +745,11 @@ def render_lsv_tab(lsv_d, ru: float | None, current_unit: str = "mA",
         if not factors:
             st.info("Select at least one compensation factor.")
             return
+        font_size = st.selectbox(
+            "Figure/table export font size (pt)", _JOURNAL_FONT_SIZES, index=0,
+            key="lsv_font_size",
+            help="Font is fixed to Arial for publication-style export.",
+        )
         st.caption(
             "E_corrected = E_measured − (factor) · I · Ru. 100 % is full "
             "correction; partial compensation (≤ 85 %) guards against "
@@ -748,7 +785,7 @@ def render_lsv_tab(lsv_d, ru: float | None, current_unit: str = "mA",
             help="Both show the LSV with vs without iR compensation.",
         )
         x_range = y_range = None
-        with st.expander("🔧 Axis range (applies to plot & PNG export)"):
+        with st.expander("🔧 Axis range (applies to plot & TIFF export)"):
             if st.checkbox("Set axis limits manually"):
                 cx1, cx2 = st.columns(2)
                 xmin = cx1.number_input("X min (V)", value=round(x_lo, 3),
@@ -817,21 +854,31 @@ def render_lsv_tab(lsv_d, ru: float | None, current_unit: str = "mA",
             )
             fig.update_layout(title="LSV — with vs without iR compensation")
 
-        # Apply manual axis ranges (affects both the on-screen plot and PNG).
+        # Apply manual axis ranges (affects both the on-screen plot and TIFF).
         if x_range is not None:
             fig.update_xaxes(range=x_range)
         if y_range is not None:
             fig.update_yaxes(range=y_range)
 
         # Legend at the bottom so it never overlaps the title / subplot titles.
+        # Journal style (Arial, box-border axes) applied globally, which
+        # works for both the single-axes overlay and the two-panel
+        # side-by-side view (update_xaxes/update_yaxes with no row/col
+        # target every axis in the figure).
         fig.update_layout(
             template="plotly_white",
             height=470,
+            font=dict(family="Arial", size=font_size),
             title=dict(y=0.97, yanchor="top"),
             legend=dict(orientation="h", yanchor="top", y=-0.18,
-                        xanchor="center", x=0.5),
+                        xanchor="center", x=0.5,
+                        font=dict(family="Arial", size=max(11, round(font_size * 0.55))),
+                        bgcolor="rgba(255,255,255,0.7)", bordercolor="black",
+                        borderwidth=1),
             margin=dict(l=10, r=10, t=60, b=90),
         )
+        fig.update_xaxes(**_BOX_AXIS_STYLE)
+        fig.update_yaxes(**_BOX_AXIS_STYLE)
         st.plotly_chart(fig, use_container_width=True)
         fac_png = "-".join(str(int(r.factor_percent)) for r in results)
         plotted = {
@@ -899,6 +946,12 @@ def render_lsv_tab(lsv_d, ru: float | None, current_unit: str = "mA",
         mime="text/csv",
         key="dl_summary",
     )
+    display = summary.copy()
+    for c, fmt in numeric_fmt.items():
+        display[c] = [fmt % v for v in summary[c]]
+    _journal_table_figure(  # CSV of this table is the results button above
+        display, font_size, f"ir_results_table_Ru{ru:.1f}", key="png_lsv_table",
+    )
 
     # Warn if any selected factor over-compensates, and recommend a safe one.
     if any(a.over_compensated for a in assessments):
@@ -965,14 +1018,103 @@ _TAFEL_REACTIONS = [
     "MOR", "EOR", "UOR",
     "Other / unspecified",
 ]
-_TAFEL_FONT_SIZES = [28, 36]
-# Journal style: a closed box border (mirrored axis lines) around the plot,
-# with no interior gridlines.
+# Publication-style export settings shared by every tab: a selectable Arial
+# font size and a closed box border (mirrored axis lines) with no interior
+# gridlines.
+_JOURNAL_FONT_SIZES = [28, 36]
 _BOX_AXIS_STYLE = dict(
     showgrid=False, zeroline=False,
     showline=True, linewidth=1.5, linecolor="black", mirror=True,
     ticks="outside",
 )
+
+
+def _journal_axes_style(fig, xtitle: str, ytitle: str, font_size: int,
+                        height: int = 460, yrange: list | None = None,
+                        legend_position: str = "top-left") -> None:
+    """Apply the shared journal look (Arial, box-border axes, a legend box)
+    to ``fig`` in place: ``plotly_white`` template, closed axis border, and a
+    bordered legend positioned inside the plot area."""
+    axis_font = dict(family="Arial", size=font_size)
+    small_font = dict(family="Arial", size=max(11, round(font_size * 0.55)))
+    positions = {
+        "top-left": dict(x=0.02, y=0.98, xanchor="left", yanchor="top"),
+        "bottom-left": dict(x=0.02, y=0.02, xanchor="left", yanchor="bottom"),
+    }
+    fig.update_layout(
+        template="plotly_white", height=height, font=axis_font,
+        legend=dict(**positions[legend_position], font=small_font,
+                    bgcolor="rgba(255,255,255,0.7)", bordercolor="black",
+                    borderwidth=1),
+        margin=dict(l=10, r=10, t=20, b=10),
+    )
+    fig.update_xaxes(
+        title=dict(text=xtitle, font=axis_font), tickfont=axis_font,
+        **_BOX_AXIS_STYLE,
+    )
+    fig.update_yaxes(
+        title=dict(text=ytitle, font=axis_font), tickfont=axis_font,
+        range=yrange, **_BOX_AXIS_STYLE,
+    )
+
+
+def _journal_table_figure(display_df: pd.DataFrame, font_size: int, stem: str,
+                          key: str, what: str = "Results table") -> None:
+    """Render ``display_df`` (already formatted to display-ready strings —
+    e.g. numbers pre-rounded/pre-formatted by the caller) as an Arial,
+    publication-style Plotly table figure, with TIFF/HTML downloads via
+    :func:`figure_downloads`. The export canvas is sized from the table's own
+    content: columns are widened in proportion to the longest string they
+    hold, and the row height leaves room for the lines Plotly wraps text
+    onto — otherwise long entries overlap and the last rows fall outside a
+    fixed-size export. Pair this with the caller's own CSV download of the
+    underlying (full-precision) data.
+    """
+    cell_font = max(9.0, font_size * 0.4)
+    header_font = max(10.0, font_size * 0.45)
+    # Explicit NaN/None check before stringifying: a plain ``.astype(str)``
+    # on a nullable numeric column leaves those entries as a raw float NaN
+    # instead of the string "nan" in some pandas versions, which then breaks
+    # the length-based sizing below.
+    str_cols = {
+        c: display_df[c].apply(lambda v: "—" if pd.isna(v) else str(v))
+        for c in display_df.columns
+    }
+    widths = []
+    for c in display_df.columns:
+        longest = str_cols[c].str.len().max()
+        longest = int(longest) if pd.notna(longest) else 0
+        # +2 characters of breathing room so short entries aren't wrapped, and
+        # a cap so one long sentence can't squeeze every other column.
+        widths.append(min(max(len(str(c)), longest, 6) + 2, 46))
+    char_px = cell_font * 0.66
+    table_width = int(sum(widths) * char_px + 60)
+    # Worst-case wrapped lines in any cell of a row -> uniform row height.
+    max_wrap = max(
+        (int(np.ceil(len(v) / w)) for col, w in zip(display_df.columns, widths)
+         for v in str_cols[col]),
+        default=1,
+    )
+    row_h = int(cell_font * 1.5 * max(1, max_wrap)) + 8
+    table_fig = go.Figure(data=[go.Table(
+        columnwidth=widths,
+        header=dict(values=list(display_df.columns),
+                    font=dict(family="Arial", size=header_font),
+                    align="left", height=int(header_font * 1.6) + 10),
+        cells=dict(values=[str_cols[c] for c in display_df.columns],
+                   font=dict(family="Arial", size=cell_font), align="left",
+                   height=row_h),
+    )])
+    table_height = int(header_font * 1.6) + 20 + row_h * len(display_df) + 20
+    table_fig.update_layout(
+        template="plotly_white",  # never export with Streamlit's placeholder colours
+        margin=dict(l=10, r=10, t=10, b=10),
+        width=table_width, height=table_height,
+    )
+    figure_downloads(
+        table_fig, stem, key=key, what=what,
+        width=table_width, height=table_height,
+    )
 
 
 def _rescale_current(raw: np.ndarray, from_unit: str, to_unit: str) -> np.ndarray:
@@ -997,6 +1139,19 @@ def _darken(hex_color: str, factor: float = 0.6) -> str:
     return "#{:02x}{:02x}{:02x}".format(
         *(max(0, int(c * factor)) for c in (r, g, b))
     )
+
+
+_REPLICATE_SUFFIX = re.compile(r"\s*\(\d+\)$")
+
+
+def _default_replicate_group(label: str) -> str:
+    """Guess a replicate-group name from a sample label by stripping a
+    trailing ``" (2)"``/``" (3)``/… — the exact suffix the data loader's own
+    de-duplication adds when the same base file/column name is uploaded more
+    than once (see ``_dedup`` in ``_tafel_data_loader``), which is exactly
+    the common case of uploading several repeat scans of one sample."""
+    stripped = _REPLICATE_SUFFIX.sub("", label).strip()
+    return stripped or label
 
 
 def _selection_signature(points: list) -> tuple:
@@ -1112,14 +1267,125 @@ def _tafel_data_loader() -> list[tuple[str, "data_io.LSVData"]]:
         return []
 
 
-def render_tafel_tab() -> None:
-    st.subheader("Tafel slope analysis")
+# Literature-typical pH for common supporting electrolytes, for the RHE
+# conversion below. Real pH depends on activity coefficients (concentrated
+# strong acid/base solutions don't follow pH = -log10[conc] exactly) and on
+# temperature — these are the values commonly cited as-is in the ORR/HER
+# electrocatalysis literature for RHE conversion, not first-principles
+# calculations; check against your own electrolyte when precision matters,
+# or measure it directly.
+_ELECTROLYTE_PH_PRESETS: dict[str, float] = {
+    "0.1 M KOH": 13.0,
+    "1 M KOH": 14.0,
+    "0.1 M NaOH": 13.0,
+    "1 M NaOH": 14.0,
+    "0.5 M H2SO4": 0.3,
+    "1 M H2SO4": 0.1,
+    "0.1 M HClO4": 1.0,
+}
+
+
+def _render_rhe_conversion(key_prefix: str, default_ph: float = 13.0):
+    """Render the "convert to RHE" controls shared by the LSV/K-L/ORR tabs.
+
+    Three ways to get there, picked with a radio button:
+
+    - **Already vs RHE** — no conversion.
+    - **Reference electrode + electrolyte pH** — the standard
+      ``E(RHE) = E(measured) + E°(ref vs NHE) + 0.0592·pH`` formula; the
+      electrolyte dropdown fills in a literature-typical pH (see
+      :data:`_ELECTROLYTE_PH_PRESETS`), overridable via "Custom".
+    - **Direct calibration offset** — bypasses the formula entirely for a
+      reference electrode that was calibrated directly against a reversible
+      hydrogen electrode *in the same electrolyte* (common practice for
+      Hg/HgO, Hg/Hg2SO4, etc.), since that single measured offset already
+      captures the electrolyte's actual pH/activity/junction-potential
+      effects more accurately than the nominal formula.
+
+    Returns a callable ``to_rhe(potential_array) -> ndarray``.
+    """
+    st.markdown("**Reference electrode → RHE conversion**")
+    mode = st.radio(
+        "How should potentials be converted to the RHE scale?",
+        ["Already vs RHE", "Reference electrode + electrolyte pH",
+         "Direct calibration offset"],
+        key=f"{key_prefix}_rhe_mode", horizontal=True,
+        help="Use 'Direct calibration offset' if you've measured your "
+             "reference electrode against an RHE in your own electrolyte "
+             "(e.g. Hg/HgO vs a Pt-wire RHE under H2 bubbling) — that "
+             "single offset is usually more accurate than the nominal "
+             "E° + pH formula.",
+    )
+
+    if mode == "Already vs RHE":
+        return lambda pot: np.asarray(pot, dtype=float)
+
+    if mode == "Direct calibration offset":
+        st.caption(
+            "E(RHE) = E(measured) + offset — skips the reference-electrode/"
+            "pH formula since a directly measured offset already accounts "
+            "for the electrolyte's actual pH, ionic strength, and junction "
+            "potential."
+        )
+        offset = st.number_input(
+            "Calibrated offset (V)", value=0.926, step=0.001, format="%.3f",
+            key=f"{key_prefix}_rhe_offset",
+            help="0.926 V is a commonly cited Hg/HgO-vs-RHE offset in 1 M "
+                 "KOH — replace with your own electrode's measured value.",
+        )
+        return lambda pot: np.asarray(pot, dtype=float) + offset
+
+    rc1, rc2 = st.columns([2, 1])
+    ref_names = list(tafel.REFERENCE_ELECTRODES) + ["Custom"]
+    ref_choice = rc1.selectbox(
+        "Reference electrode used for the input data", ref_names,
+        index=0, key=f"{key_prefix}_ref_electrode",
+    )
+    if ref_choice == "Custom":
+        e_ref = rc2.number_input(
+            "E° vs NHE (V)", value=0.000, step=0.001, format="%.3f",
+            key=f"{key_prefix}_ref_custom",
+        )
+    else:
+        e_ref = tafel.REFERENCE_ELECTRODES[ref_choice]
+        rc2.metric("E° vs NHE (V)", f"{e_ref:.3f}")
+
+    pc1, pc2 = st.columns([2, 1])
+    electrolyte_names = list(_ELECTROLYTE_PH_PRESETS) + ["Custom"]
+    default_electrolyte_idx = 0
+    electrolyte_choice = pc1.selectbox(
+        "Electrolyte (sets a literature-typical pH — pick Custom to enter "
+        "your own or a measured value)",
+        electrolyte_names, index=default_electrolyte_idx,
+        key=f"{key_prefix}_electrolyte",
+    )
+    if electrolyte_choice == "Custom":
+        ph = pc2.number_input(
+            "Electrolyte pH", min_value=0.0, max_value=14.0, value=default_ph,
+            step=0.1, key=f"{key_prefix}_ph_custom",
+        )
+    else:
+        ph = _ELECTROLYTE_PH_PRESETS[electrolyte_choice]
+        pc2.metric("pH", f"{ph:g}")
     st.caption(
-        "Fits E = a + b·log₁₀|i| over the linear (activation-controlled) "
-        "region of a polarization curve; **b** is the Tafel slope, reported "
-        "as its positive magnitude (mV/dec) per literature convention. This "
-        "tab has its own file upload and does not use the EIS/LSV data "
-        "loaded in the sidebar."
+        f"↪ E(RHE) = E(measured) + {e_ref:.3f} V + 0.0592 × {ph:g} = "
+        f"E(measured) + {(e_ref + tafel.NERNST_SLOPE_V_PER_PH * ph):.3f} V. "
+        "Electrolyte pH values above are literature-typical, not measured "
+        "for your specific sample — check them (or use 'Direct calibration "
+        "offset' instead) when precision matters."
+    )
+    return lambda pot: tafel.to_rhe(np.asarray(pot, dtype=float), e_ref, ph)
+
+
+def render_tafel_tab() -> None:
+    st.subheader("LSV analysis")
+    st.caption(
+        "Onset potential, benchmark overpotentials at fixed current "
+        "densities, and the Tafel slope of a polarization curve — fitting "
+        "E = a + b·log₁₀|i| over the linear (activation-controlled) region; "
+        "**b** is the Tafel slope, reported as its positive magnitude "
+        "(mV/dec) per literature convention. This tab has its own file "
+        "upload and does not use the EIS/LSV data loaded in the sidebar."
     )
 
     series = _tafel_data_loader()
@@ -1138,7 +1404,7 @@ def render_tafel_tab() -> None:
              "analysis are split by reaction type.",
     )
     font_size = top2.selectbox(
-        "Figure/table export font size (pt)", _TAFEL_FONT_SIZES, index=0,
+        "Figure/table export font size (pt)", _JOURNAL_FONT_SIZES, index=0,
         help="Font is fixed to Arial for publication-style export.",
     )
     vicinity_pct = top3.number_input(
@@ -1212,6 +1478,38 @@ def render_tafel_tab() -> None:
             "Values are automatically rescaled if you pick a different unit above."
         )
 
+    st.markdown("**Onset potential & benchmark current densities**")
+    st.caption(
+        "E_onset is where |current| first departs from the flat pre-onset "
+        "baseline (same detector the Tafel fit-range auto-start uses). The "
+        "benchmark values below read off the potential at one or more fixed "
+        "current densities (e.g. **j = 10 mA/cm²**, the standard OER/HER "
+        "activity benchmark; **j = 2 mA/cm²** is also common for lower-"
+        "current comparisons) — reported as an overpotential η = |E − E_eq| "
+        "for HER/HOR/OER/ORR/NO₃RR/N₂RR/CO₂RR (using each sample's own "
+        "equilibrium potential), or as the raw potential for reactions "
+        "without a single well-defined E_eq."
+    )
+    target_j_text = st.text_input(
+        f"Target current densities ({display_unit}), comma-separated",
+        value="10, 2", key="tafel_target_j",
+    )
+    target_js: list[float] = []
+    for tok in target_j_text.split(","):
+        tok = tok.strip()
+        if not tok:
+            continue
+        try:
+            target_js.append(float(tok))
+        except ValueError:
+            st.warning(f"Ignoring unparseable target current density {tok!r}.")
+    if not convert_density and not correction.is_density_unit(current_unit):
+        st.caption(
+            "↪ Current is not a density — these benchmarks compare across "
+            "samples most meaningfully when normalized by electrode area "
+            "('Convert ... to current density' above)."
+        )
+
     labels = [lbl for lbl, _ in series]
     chosen = st.multiselect(
         "Samples to combine (journal-style overlay)",
@@ -1222,40 +1520,7 @@ def render_tafel_tab() -> None:
         return
     chosen_series = [(lbl, d) for lbl, d in series if lbl in chosen]
 
-    st.markdown("**Reference electrode → RHE conversion**")
-    st.caption(
-        "E(RHE) = E(measured) + E°(reference vs NHE) + 0.0592 V·pH⁻¹ × pH. "
-        "All fitting, plotting, and the exported data below use the "
-        "RHE-converted potential."
-    )
-    already_rhe = st.checkbox(
-        "Input data is already reported vs RHE (skip conversion)",
-        value=False, key="tafel_already_rhe",
-    )
-    e_ref, ph = 0.0, 0.0
-    if not already_rhe:
-        rc1, rc2, rc3 = st.columns([2, 1, 1])
-        ref_names = list(tafel.REFERENCE_ELECTRODES) + ["Custom"]
-        ref_choice = rc1.selectbox(
-            "Reference electrode used for the input data", ref_names,
-            index=0, key="tafel_ref_electrode",
-        )
-        if ref_choice == "Custom":
-            e_ref = rc2.number_input(
-                "E° vs NHE (V)", value=0.000, step=0.001, format="%.3f",
-                key="tafel_ref_custom",
-            )
-        else:
-            e_ref = tafel.REFERENCE_ELECTRODES[ref_choice]
-            rc2.metric("E° vs NHE (V)", f"{e_ref:.3f}")
-        ph = rc3.number_input(
-            "Electrolyte pH", min_value=0.0, max_value=14.0, value=7.0,
-            step=0.1, key="tafel_ph",
-        )
-        st.caption(
-            f"↪ E(RHE) = E(measured) + {e_ref:.3f} V + 0.0592 × {ph:g} = "
-            f"E(measured) + {(e_ref + tafel.NERNST_SLOPE_V_PER_PH * ph):.3f} V"
-        )
+    to_rhe_fn = _render_rhe_conversion("tafel", default_ph=7.0)
 
     # A box-select drag on the Tafel plot below (key "tafel_plot_select")
     # lands here as a fresh selection event; apply it to the affected
@@ -1287,9 +1552,7 @@ def render_tafel_tab() -> None:
             if not mask.any():
                 st.warning(f"{lbl}: all currents are zero — skipped.")
                 continue
-            pot = d.potential[mask] if already_rhe else tafel.to_rhe(
-                d.potential[mask], e_ref, ph
-            )
+            pot = to_rhe_fn(d.potential[mask])
             cur_scaled = _rescale_current(d.current[mask], native_unit, current_unit)
             cur = cur_scaled / area_cm2 if convert_density else cur_scaled
             log_i = tafel.log_current(cur)
@@ -1303,11 +1566,20 @@ def render_tafel_tab() -> None:
                     sel_range = None
                 if sel_range is not None:
                     st.session_state[range_key] = sel_range
-            c0, cr, c1, c2 = st.columns([1.1, 0.9, 2.0, 0.5])
+            c0, cg, cr, c1, c2 = st.columns([1.0, 1.0, 0.8, 1.7, 0.5])
             display_name = c0.text_input(
                 "Legend name", value=lbl, key=f"tafel_name_{i}",
                 help="Shown in the plot legend; edit if the auto-detected "
                      "name isn't the one you want.",
+            )
+            replicate_group = cg.text_input(
+                "Replicate group", value=_default_replicate_group(lbl),
+                key=f"tafel_group_{i}",
+                help="Give two or more samples the same group name to treat "
+                     "them as repeat scans of the same underlying sample — "
+                     "their fitted values (Tafel slope, onset, η@j, …) are "
+                     "then also reported as a mean ± SD in the **Replicate "
+                     "statistics** section below.",
             )
             sample_reaction = cr.selectbox(
                 "Reaction", _TAFEL_REACTIONS,
@@ -1334,7 +1606,8 @@ def render_tafel_tab() -> None:
             )
             fits.append(dict(label=display_name or lbl, orig_label=lbl,
                              reaction=sample_reaction,
-                             potential=pot, log_i=log_i,
+                             replicate_group=replicate_group or (display_name or lbl),
+                             potential=pot, current=cur, log_i=log_i,
                              start=start, stop=stop, color=color))
 
     if not fits:
@@ -1358,7 +1631,7 @@ def render_tafel_tab() -> None:
         d = d_by_label.get(meta["orig_label"])
         if d is None:
             continue
-        pot_full = d.potential if already_rhe else tafel.to_rhe(d.potential, e_ref, ph)
+        pot_full = to_rhe_fn(d.potential)
         cur_full_scaled = _rescale_current(d.current, native_unit, current_unit)
         cur_full = cur_full_scaled / area_cm2 if convert_density else cur_full_scaled
         lsv_plotted[f"{meta['label']} — E vs RHE (V)"] = list(pot_full)
@@ -1511,8 +1784,9 @@ def render_tafel_tab() -> None:
     for f, r in results:
         slope_abs = abs(r.slope_mv_per_dec)
         ref = tafel.nearest_reference(slope_abs, f["reaction"])
-        rows.append({
+        row = {
             "Sample": f["label"],
+            "Replicate group": f["replicate_group"],
             "Reaction": f["reaction"],
             "Tafel slope (mV/dec)": round(slope_abs, 1),
             "R2": round(r.r_squared, 4),
@@ -1521,7 +1795,25 @@ def render_tafel_tab() -> None:
             "Nearest mechanistic benchmark": (
                 f"~{ref[0]:.0f} mV/dec ({ref[1]})" if ref else "—"
             ),
-        })
+        }
+        try:
+            row["E_onset (V vs RHE)"] = round(
+                tafel.onset_potential(f["potential"], f["current"]), 3
+            )
+        except ValueError:
+            row["E_onset (V vs RHE)"] = None
+        e_eq = tafel.REACTION_E_EQ_V_RHE.get(f["reaction"])
+        for target_j in target_js:
+            e_at_j = tafel.potential_at_current_density(
+                f["potential"], f["current"], target_j
+            )
+            label = (f"η @ j={target_j:g} (V)" if e_eq is not None
+                     else f"E @ j={target_j:g} (V vs RHE)")
+            row[label] = (
+                round(abs(e_at_j - e_eq) if e_eq is not None else e_at_j, 3)
+                if e_at_j is not None else None
+            )
+        rows.append(row)
     summary = pd.DataFrame(rows)
     st.markdown("**Results summary**")
     st.dataframe(summary, use_container_width=True, hide_index=True)
@@ -1533,14 +1825,6 @@ def render_tafel_tab() -> None:
         key="dl_tafel_summary",
     )
 
-    # Results table as a figure (Arial, publication-style). The exported
-    # canvas is sized from the table's own content: columns are widened in
-    # proportion to the longest string they hold (the mechanistic-benchmark
-    # column is far wider than "R2"), and the row height leaves room for the
-    # lines Plotly wraps text onto — otherwise long entries overlap and the
-    # last rows fall outside a fixed-size export.
-    cell_font = max(9.0, font_size * 0.4)
-    header_font = max(10.0, font_size * 0.45)
     # Render the numbers explicitly (the CSV above keeps the full-precision
     # floats); an intercept current is otherwise printed with a long tail of
     # zeros that blows the column width out.
@@ -1551,41 +1835,8 @@ def render_tafel_tab() -> None:
         for v in summary[intercept_col]
     ]
     display["R2"] = [f"{v:.4f}" for v in summary["R2"]]
-    str_cols = {c: display[c].astype(str) for c in display.columns}
-    widths = []
-    for c in display.columns:
-        longest = str_cols[c].str.len().max()
-        longest = int(longest) if pd.notna(longest) else 0
-        # +2 characters of breathing room so short entries aren't wrapped, and
-        # a cap so one long sentence can't squeeze every other column.
-        widths.append(min(max(len(str(c)), longest, 6) + 2, 46))
-    char_px = cell_font * 0.66
-    table_width = int(sum(widths) * char_px + 60)
-    # Worst-case wrapped lines in any cell of a row -> uniform row height.
-    max_wrap = max(
-        (int(np.ceil(len(v) / w)) for col, w in zip(display.columns, widths)
-         for v in str_cols[col]),
-        default=1,
-    )
-    row_h = int(cell_font * 1.5 * max(1, max_wrap)) + 8
-    table_fig = go.Figure(data=[go.Table(
-        columnwidth=widths,
-        header=dict(values=list(display.columns),
-                    font=dict(family="Arial", size=header_font),
-                    align="left", height=int(header_font * 1.6) + 10),
-        cells=dict(values=[str_cols[c] for c in display.columns],
-                   font=dict(family="Arial", size=cell_font), align="left",
-                   height=row_h),
-    )])
-    table_height = int(header_font * 1.6) + 20 + row_h * len(display) + 20
-    table_fig.update_layout(
-        template="plotly_white",  # never export with Streamlit's placeholder colours
-        margin=dict(l=10, r=10, t=10, b=10),
-        width=table_width, height=table_height,
-    )
-    figure_downloads(  # CSV of this table is the summary button above
-        table_fig, "tafel_results_table", key="png_tafel_table",
-        what="Results table", width=table_width, height=table_height,
+    _journal_table_figure(  # CSV of this table is the summary button above
+        display, font_size, "tafel_results_table", key="png_tafel_table",
     )
     st.caption(
         "ℹ️ On the RHE scale, 0 V is exactly the H⁺/H₂ equilibrium potential, "
@@ -1597,6 +1848,49 @@ def render_tafel_tab() -> None:
         "the potential as an overpotential (η = E_RHE − E_eq) before fitting "
         "if i₀ is what you need."
     )
+
+    if summary["Replicate group"].duplicated().any():
+        st.markdown("**Replicate statistics**")
+        st.caption(
+            "Samples sharing the same **Replicate group** name above (set in "
+            "the per-sample expander) are treated as repeat scans of one "
+            "underlying sample — each fitted value below is a mean ± SD "
+            "across that group's members (SD omitted for a group of one)."
+        )
+        group_col = "Replicate group"
+        exclude = {group_col, "Sample", "Reaction", "Nearest mechanistic benchmark"}
+        numeric_cols = [
+            c for c in summary.columns
+            if c not in exclude and pd.api.types.is_numeric_dtype(summary[c])
+        ]
+        rep_rows = []
+        for group_name, gdf in summary.groupby(group_col, sort=False):
+            rep_row = {
+                "Replicate group": group_name,
+                "Reaction": "/".join(dict.fromkeys(gdf["Reaction"])),  # order-preserving unique
+                "N replicates": len(gdf),
+            }
+            for c in numeric_cols:
+                vals = gdf[c].dropna().to_numpy(dtype=float)
+                if len(vals) == 0:
+                    rep_row[c] = None
+                elif len(vals) == 1:
+                    rep_row[c] = f"{vals[0]:.4g}"
+                else:
+                    rep_row[c] = f"{np.mean(vals):.4g} ± {np.std(vals, ddof=1):.4g}"
+            rep_rows.append(rep_row)
+        replicate_summary = pd.DataFrame(rep_rows)
+        st.dataframe(replicate_summary, use_container_width=True, hide_index=True)
+        st.download_button(
+            "⬇️ Download replicate statistics (CSV)",
+            data=replicate_summary.to_csv(index=False).encode("utf-8"),
+            file_name="tafel_replicate_statistics.csv", mime="text/csv",
+            key="dl_tafel_replicate_stats",
+        )
+        _journal_table_figure(
+            replicate_summary, font_size, "tafel_replicate_stats_table",
+            key="png_tafel_replicate_table", what="Replicate statistics table",
+        )
 
     st.markdown("**Analysis**")
     for rxn in distinct_reactions:
@@ -1610,13 +1904,936 @@ def render_tafel_tab() -> None:
 
 
 # --------------------------------------------------------------------------- #
+# Koutecky-Levich (K-L) analysis tab (independent data source)                #
+# --------------------------------------------------------------------------- #
+def render_kl_tab() -> None:
+    st.subheader("Koutecky–Levich (K-L) analysis")
+    st.caption(
+        "Classic multi-rotation-rate RDE analysis: at each of several fixed "
+        "potentials, 1/j vs 1/√ω (ω = 2π·rpm/60, the angular rotation rate) "
+        "is linear — Koutecký & Levich, *Zh. Fiz. Khim.* **1958**, *32*, "
+        "1565; see also Bard & Faulkner, *Electrochemical Methods*, 2nd ed., "
+        "Wiley, 2001, Ch. 9. The **intercept** gives the kinetic (mass-"
+        "transport-free) current density j_k, and the **slope** gives the "
+        "Levich constant B — hence the electron-transfer number n, once the "
+        "electrolyte's O₂ diffusion coefficient, kinematic viscosity, and "
+        "bulk concentration are known. This tab has its own file upload and "
+        "does not use data loaded elsewhere."
+    )
+
+    samples = _orr_data_loader(
+        key_prefix="kl",
+        file_help="Disk/working-electrode current file(s) for this sample "
+                  "— one file per rotation rate",
+    )
+    if not samples:
+        return
+
+    labels = [lbl for lbl, _ in samples]
+    active_label = st.selectbox(
+        "Active sample", labels, key="kl_active_sample",
+        help="K-L analysis is shown for one sample at a time; switch here "
+             "to compare catalysts.",
+    )
+    df = dict(samples)[active_label]
+
+    font_size = st.selectbox(
+        "Figure export font size (pt)", _JOURNAL_FONT_SIZES, index=0,
+        key="kl_font_size",
+        help="Font is fixed to Arial for publication-style export.",
+    )
+
+    def _style_axes(fig, xtitle, ytitle):
+        _journal_axes_style(fig, xtitle, ytitle, font_size)
+
+    st.markdown("**Current unit & electrode area**")
+    cur1, cur2, cur3 = st.columns(3)
+    convert_density = cur1.checkbox(
+        "Convert to current density (÷ area)", value=True,
+        key="kl_convert_density",
+        help="RDE current is usually reported as an absolute current (A, "
+             "mA, µA); enable to normalize by the electrode's geometric "
+             "area for a comparable current density.",
+    )
+    current_unit = cur2.selectbox(
+        "Current unit as uploaded", ["A"] + _ABS_CURRENT_UNITS, index=0,
+        key="kl_current_unit",
+    )
+    area_cm2 = cur3.number_input(
+        "Electrode area (cm²)", min_value=1e-4, value=0.196, step=0.001,
+        format="%.4f", key="kl_area_cm2",
+        help="0.196 cm² is the standard 5 mm-diameter RDE glassy-carbon disk.",
+    ) if convert_density else None
+    display_unit = f"{current_unit}/cm²" if convert_density else current_unit
+
+    to_rhe_fn = _render_rhe_conversion("kl", default_ph=13.0)
+
+    st.markdown("**Electrolyte O₂ transport parameters** (for n via the Levich constant)")
+    st.caption(
+        "Approximate literature values (25 °C) — check against your own "
+        "electrolyte/temperature when precision matters; see Bard & "
+        "Faulkner, *Electrochemical Methods*, 2nd ed., Table 9.3.1, and refs. "
+        "therein."
+    )
+    ec1, ec2 = st.columns([1.4, 2])
+    preset_names = list(orr.ELECTROLYTE_PRESETS) + ["Custom"]
+    preset_choice = ec1.selectbox(
+        "Electrolyte", preset_names, index=0, key="kl_electrolyte_preset",
+    )
+    if preset_choice == "Custom":
+        cc1, cc2, cc3 = ec2.columns(3)
+        diff_coeff = cc1.number_input(
+            "D(O₂) (cm²/s)", min_value=1e-7, value=1.9e-5, step=1e-6,
+            format="%.2e", key="kl_D",
+        )
+        viscosity = cc2.number_input(
+            "Viscosity ν (cm²/s)", min_value=1e-4, value=1.0e-2, step=1e-4,
+            format="%.2e", key="kl_nu",
+        )
+        bulk_c = cc3.number_input(
+            "Bulk O₂ conc. C (mol/cm³)", min_value=1e-9, value=1.2e-6,
+            step=1e-8, format="%.2e", key="kl_C",
+        )
+    else:
+        diff_coeff, viscosity, bulk_c = orr.ELECTROLYTE_PRESETS[preset_choice]
+        ec2.caption(
+            f"D = {diff_coeff:.3g} cm²/s · ν = {viscosity:.3g} cm²/s · "
+            f"C = {bulk_c:.3g} mol/cm³"
+        )
+
+    pot_rhe = to_rhe_fn(df["potential"].to_numpy(dtype=float))
+    disk = df["disk_current"].to_numpy(dtype=float)
+    disk = disk / area_cm2 if convert_density else disk
+    rpm_arr = df["rpm"].to_numpy(dtype=float)
+    rpm_values = sorted(set(rpm_arr.tolist()))
+    if len(rpm_values) < 3:
+        st.error(
+            f"{active_label}: only {len(rpm_values)} rotation rate(s) loaded "
+            "— Koutecky-Levich needs at least 3 for a meaningful fit."
+        )
+        return
+
+    st.markdown(f"**RDE curves — {active_label}**")
+    fig_rde = go.Figure()
+    curves: dict[float, tuple[np.ndarray, np.ndarray]] = {}
+    for i, rv in enumerate(rpm_values):
+        m = np.isclose(rpm_arr, rv)
+        order = np.argsort(pot_rhe[m])
+        p, j = pot_rhe[m][order], disk[m][order]
+        curves[rv] = (p, j)
+        fig_rde.add_trace(go.Scatter(
+            x=p, y=j, mode="lines", name=f"{rv:g} rpm",
+            line=dict(color=_PALETTE[i % len(_PALETTE)], width=2.5),
+        ))
+    _style_axes(fig_rde, "Potential vs RHE / V", f"Disk current ({display_unit})")
+    st.plotly_chart(fig_rde, use_container_width=True)
+    rde_cols = {}
+    for rv, (p, j) in curves.items():
+        rde_cols[f"{rv:g}rpm — Potential vs RHE (V)"] = list(p)
+        rde_cols[f"{rv:g}rpm — Disk current ({display_unit})"] = list(j)
+    figure_downloads(
+        fig_rde, f"kl_rde_curves_{active_label}", key="png_kl_rde",
+        what="RDE curves", data=_padded_frame(rde_cols),
+    )
+
+    lo = max(p.min() for p, _ in curves.values())
+    hi = min(p.max() for p, _ in curves.values())
+    if lo >= hi:
+        st.error(
+            f"{active_label}: rotation-rate curves don't share a common "
+            "potential range to analyze."
+        )
+        return
+
+    st.markdown("**Koutecky–Levich plot**")
+    n_points = st.number_input(
+        "Number of analysis potentials (evenly spaced across the range all "
+        "rotation rates share)",
+        min_value=1, max_value=15, value=5, step=1, key="kl_n_points",
+    )
+    analysis_pots = np.linspace(lo, hi, int(n_points))
+
+    kl_rows = []
+    fig_kl = go.Figure()
+    kl_data: dict[str, list] = {}
+    for idx, ap in enumerate(analysis_pots):
+        omegas_rpm, invj = [], []
+        for rv in rpm_values:
+            p, j = curves[rv]
+            jval = float(np.interp(ap, p, j))
+            if jval == 0 or not np.isfinite(jval):
+                continue
+            omegas_rpm.append(rv)
+            invj.append(1.0 / jval)
+        if len(omegas_rpm) < 3:
+            continue
+        try:
+            fit = orr.fit_koutecky_levich(omegas_rpm, 1.0 / np.array(invj))
+        except ValueError:
+            continue
+        n_val = orr.levich_slope_to_n(fit.slope, diff_coeff, viscosity, bulk_c)
+        color = _PALETTE[idx % len(_PALETTE)]
+        x = 1.0 / np.sqrt(orr.angular_velocity(omegas_rpm))
+        y = np.array(invj)
+        fig_kl.add_trace(go.Scatter(
+            x=x, y=y, mode="markers", name=f"{ap:.3f} V",
+            marker=dict(color=color, size=9),
+        ))
+        xline = np.array([float(np.min(x)), float(np.max(x))])
+        yline = fit.slope * xline + fit.intercept
+        fig_kl.add_trace(go.Scatter(
+            x=xline, y=yline, mode="lines", showlegend=False,
+            line=dict(color=_darken(color), width=2.5, dash="dot"),
+        ))
+        kl_data[f"{ap:.3f}V — 1/sqrt(omega)"] = list(x)
+        kl_data[f"{ap:.3f}V — 1/j"] = list(y)
+        kl_rows.append({
+            "Potential (V vs RHE)": round(float(ap), 3),
+            "KL slope": float(fit.slope),
+            "R²": round(fit.r_squared, 4),
+            # Reported as its positive magnitude (0-4), matching literature
+            # convention -- the sign otherwise just tracks the disk current's
+            # own recorded sign (negative for a cathodic/reduction sweep).
+            "n (Levich)": round(abs(n_val), 2) if n_val is not None else None,
+            f"j_k ({display_unit})": (
+                round(fit.kinetic_current_density, 4)
+                if fit.kinetic_current_density is not None else None
+            ),
+            "Rotation rates used": fit.n_rotation_rates,
+        })
+
+    if not kl_rows:
+        st.warning(
+            "Not enough overlapping rotation-rate data to fit any analysis "
+            "potential — try fewer/different points, or check the uploaded "
+            "files share a common potential range."
+        )
+        return
+
+    _style_axes(fig_kl, "1 / √ω (s¹ᐟ²/rad¹ᐟ²)", f"1 / j ({display_unit}⁻¹)")
+    st.plotly_chart(fig_kl, use_container_width=True)
+    figure_downloads(
+        fig_kl, f"kl_plot_{active_label}", key="png_kl_plot",
+        what="Koutecky–Levich plot", data=_padded_frame(kl_data),
+    )
+
+    kl_summary = pd.DataFrame(kl_rows)
+    st.markdown("**Results summary**")
+    st.dataframe(kl_summary, use_container_width=True, hide_index=True)
+    st.download_button(
+        "⬇️ Download K-L summary (CSV)",
+        data=kl_summary.to_csv(index=False).encode("utf-8"),
+        file_name=f"kl_summary_{active_label}.csv", mime="text/csv",
+        key="dl_kl_summary",
+    )
+    kl_display = kl_summary.copy()
+    kl_display["KL slope"] = [f"{v:.3e}" for v in kl_summary["KL slope"]]
+    _journal_table_figure(  # CSV of this table is the summary button above
+        kl_display, font_size, f"kl_results_table_{active_label}",
+        key="png_kl_table",
+    )
+
+
+# --------------------------------------------------------------------------- #
+# ORR / RRDE analysis tab (independent data source)                          #
+# --------------------------------------------------------------------------- #
+_RPM_PATTERN = re.compile(r"(\d+(?:\.\d+)?)\s*rpm", re.IGNORECASE)
+_ORR_POT_HINTS = ("potential", "voltage", "e ", "e(", "ewe", "e/v", "e vs")
+
+
+def _guess_rpm_from_filename(name: str) -> float | None:
+    """Parse a rotation rate from an instrument-exported filename, e.g.
+    ``Disk Current vs Disk Potential (1600 RPM).csv`` -> 1600.0."""
+    m = _RPM_PATTERN.search(name)
+    return float(m.group(1)) if m else None
+
+
+def _guess_role_from_filename(name: str) -> str:
+    """Disk vs ring, guessed from filenames like the pattern above; ring is
+    checked first since a ring file's name usually also contains 'disk' (as
+    in '... vs Disk Potential')."""
+    return "Ring" if "ring" in name.lower() else "Disk"
+
+
+def _orr_numeric_columns(df: pd.DataFrame) -> tuple[pd.DataFrame, list]:
+    """Coerce every column to numeric and return (coerced_df, usable_columns)."""
+    coerced = df.apply(lambda s: pd.to_numeric(s, errors="coerce"))
+    cols = [c for c in coerced.columns if coerced[c].notna().any()]
+    return coerced, cols
+
+
+def _orr_read_file(up, key_prefix: str = "orr") -> pd.DataFrame | None:
+    """Read one uploaded file's raw table (no column interpretation yet)."""
+    try:
+        if up.name.lower().endswith((".xlsx", ".xls")):
+            sheets = data_io.list_sheets(io.BytesIO(up.getvalue()))
+            sheet = sheets[0]
+            if len(sheets) > 1:
+                sheet = st.selectbox(
+                    f"Sheet for {up.name}", sheets,
+                    key=f"{key_prefix}_sheet_{up.name}",
+                )
+            return data_io.read_table(io.BytesIO(up.getvalue()), sheet=sheet)
+        return data_io.read_table(io.BytesIO(up.getvalue()), sheet=None)
+    except Exception as exc:
+        st.warning(f"{up.name}: {exc}")
+        return None
+
+
+def _orr_merge_entries(
+    entries: list[tuple[np.ndarray, np.ndarray | None, np.ndarray | None, float]],
+    sample_name: str,
+) -> pd.DataFrame | None:
+    """Merge a sample's ``(potential, disk_current_or_None,
+    ring_current_or_None, rpm)`` entries into one tidy table: columns
+    ``potential``, ``disk_current``, ``ring_current`` (if any rpm has ring
+    data), ``rpm``. A compiled-workbook entry already carries both
+    electrodes; raw per-electrode entries are paired up by matching rotation
+    rate (disk and ring share the instrument's own potential grid, recorded
+    simultaneously) — interpolating the ring onto the disk's grid if the two
+    don't already match exactly."""
+    by_rpm: dict[float, dict[str, tuple[np.ndarray, np.ndarray]]] = {}
+    for pot, disk, ring, rpm_val in entries:
+        slot = by_rpm.setdefault(rpm_val, {})
+        if disk is not None:
+            slot["disk"] = (pot, disk)
+        if ring is not None:
+            slot["ring"] = (pot, ring)
+
+    frames = []
+    for rpm_val, slot in sorted(by_rpm.items()):
+        if "disk" not in slot:
+            st.warning(f"{sample_name}: no Disk data at {rpm_val:g} rpm — skipped.")
+            continue
+        pot_d, cur_d = slot["disk"]
+        frame = pd.DataFrame({
+            "potential": pot_d, "disk_current": cur_d, "rpm": rpm_val,
+        })
+        if "ring" in slot:
+            pot_r, cur_r = slot["ring"]
+            if len(pot_r) == len(pot_d) and np.allclose(pot_r, pot_d, atol=1e-6):
+                frame["ring_current"] = cur_r
+            elif len(pot_r) >= 2:
+                order = np.argsort(pot_r)
+                frame["ring_current"] = np.interp(pot_d, pot_r[order], cur_r[order])
+        frames.append(frame)
+    return pd.concat(frames, ignore_index=True) if frames else None
+
+
+def _orr_table_to_entry(
+    coerced: pd.DataFrame, cols: list, filename: str, rpm_val: float,
+    role: str | None = None,
+) -> tuple[np.ndarray, np.ndarray | None, np.ndarray | None, float] | None:
+    """Turn one already-numeric-coerced table into an ``(potential, disk,
+    ring, rpm)`` entry. With 4+ numeric columns, treats it as a compiled
+    Potential/Disk/Potential/Ring workbook (``role`` ignored); with exactly 2,
+    treats it as one electrode's raw Potential/Current file, using ``role``
+    if given or else guessing from ``filename``."""
+    lowered = {c: str(c).strip().lower() for c in cols}
+    pot_col = next(
+        (c for c, name in lowered.items() if any(h in name for h in _ORR_POT_HINTS)),
+        cols[0],
+    )
+    if len(cols) >= 4:
+        others = [c for c in cols if c != pot_col]
+        disk_col, ring_pot_col, ring_col = others[0], others[1], others[2]
+        pot = coerced[pot_col].to_numpy(dtype=float)
+        disk = coerced[disk_col].to_numpy(dtype=float)
+        pot_r = coerced[ring_pot_col].to_numpy(dtype=float)
+        ring = coerced[ring_col].to_numpy(dtype=float)
+        mask = np.isfinite(pot) & np.isfinite(disk)
+        pot, disk = pot[mask], disk[mask]
+        mask_r = np.isfinite(pot_r) & np.isfinite(ring)
+        pot_r, ring = pot_r[mask_r], ring[mask_r]
+        if len(pot_r) == len(pot) and np.allclose(pot_r, pot, atol=1e-6):
+            ring_aligned = ring
+        elif len(pot_r) >= 2:
+            order = np.argsort(pot_r)
+            ring_aligned = np.interp(pot, pot_r[order], ring[order])
+        else:
+            ring_aligned = None
+        return pot, disk, ring_aligned, rpm_val
+
+    cur_col = next((c for c in cols if c != pot_col), cols[-1])
+    pot = coerced[pot_col].to_numpy(dtype=float)
+    cur = coerced[cur_col].to_numpy(dtype=float)
+    mask = np.isfinite(pot) & np.isfinite(cur)
+    pot, cur = pot[mask], cur[mask]
+    resolved_role = role or _guess_role_from_filename(filename)
+    return (pot, cur, None, rpm_val) if resolved_role == "Disk" else (pot, None, cur, rpm_val)
+
+
+def _orr_extract_zip_samples(
+    upload, key_prefix: str = "orr",
+) -> list[tuple[str, pd.DataFrame]]:
+    """Batch-load RRDE files from a ZIP of a data folder (or several sample
+    folders zipped together) — for pasting in a whole export at once instead
+    of picking files one by one. Files are grouped into one sample per
+    top-level folder inside the zip (files at the zip's own root all become
+    one sample, named after the zip); role (disk/ring) and rotation rate are
+    guessed entirely from filenames, the same way real RDE/RRDE software
+    names its exports (e.g. ``Disk Current vs Disk Potential (1600
+    RPM).csv``) — there is no per-file tagging UI here, since a batch upload
+    may contain many files; use the per-sample uploaders above instead if a
+    file needs correcting by hand.
+    """
+    try:
+        zf = zipfile.ZipFile(io.BytesIO(upload.getvalue()))
+    except zipfile.BadZipFile:
+        st.error(f"{upload.name}: not a valid .zip file.")
+        return []
+    total = sum(info.file_size for info in zf.infolist())
+    if total > data_io.MAX_UNCOMPRESSED_BYTES:
+        st.error(
+            f"{upload.name}: zip expands too large; rejected as a possible "
+            "decompression bomb."
+        )
+        return []
+
+    members = [
+        m for m in zf.namelist()
+        if m.lower().endswith((".csv", ".txt", ".xlsx", ".xls"))
+        and "__MACOSX" not in m and not m.rsplit("/", 1)[-1].startswith(".")
+    ]
+    if not members:
+        st.warning(f"{upload.name}: no CSV/Excel files found inside.")
+        return []
+
+    default_sample = upload.name.rsplit(".", 1)[0]
+    grouped: dict[str, list] = {}
+    skipped = 0
+    for member in members:
+        parts = member.replace("\\", "/").split("/")
+        sample_name = parts[0] if len(parts) > 1 else default_sample
+        filename = parts[-1]
+        try:
+            raw_bytes = zf.read(member)
+        except Exception:
+            skipped += 1
+            continue
+        try:
+            if filename.lower().endswith((".xlsx", ".xls")):
+                sheets = data_io.list_sheets(io.BytesIO(raw_bytes))
+                df = data_io.read_table(io.BytesIO(raw_bytes), sheet=sheets[0])
+            else:
+                df = data_io.read_table(io.BytesIO(raw_bytes), sheet=None)
+        except Exception:
+            skipped += 1
+            continue
+        coerced, cols = _orr_numeric_columns(df)
+        if len(cols) < 2:
+            skipped += 1
+            continue
+        rpm_val = _guess_rpm_from_filename(filename) or 1600.0
+        entry = _orr_table_to_entry(coerced, cols, filename, rpm_val)
+        if entry is None:
+            skipped += 1
+            continue
+        grouped.setdefault(sample_name, []).append(entry)
+
+    if skipped:
+        st.caption(
+            f"↪ {skipped} file(s) inside the zip were skipped (unreadable or "
+            "not enough numeric columns)."
+        )
+
+    samples = []
+    for sample_name, entries in grouped.items():
+        df = _orr_merge_entries(entries, sample_name)
+        if df is not None:
+            samples.append((sample_name, df))
+    return samples
+
+
+def _orr_data_loader(
+    key_prefix: str = "orr",
+    file_help: str = "Disk/ring current file(s) for this sample",
+) -> list[tuple[str, pd.DataFrame]]:
+    """File uploader local to the calling tab — independent of the other
+    tabs. Two ways to load data, usable together:
+
+    - **Per-sample uploaders**, one file (or several) at a time, with
+      per-file role/rpm tagging you can correct by hand.
+    - **A ZIP of a whole data folder**, for batch-loading many samples/
+      rotation rates at once (see :func:`_orr_extract_zip_samples`) — role
+      and rpm are guessed purely from filenames, with no per-file UI.
+
+    Each upload is one of two layouts, auto-detected by column count:
+
+    - **Raw per-electrode files** (2 numeric columns: Potential, Current) —
+      the layout most RDE/RRDE instrument software exports as one small file
+      per rotation rate *and* electrode, e.g. ``Disk Current vs Disk
+      Potential (1600 RPM).csv`` / ``Ring Current vs ...``. Rotation rate and
+      disk/ring role are guessed from the filename and can be corrected.
+    - **Compiled workbooks** (4+ numeric columns: Potential, Disk current,
+      Potential, Ring current, already paired for one rotation rate) — only
+      a rotation-rate tag is needed.
+
+    Returns a list of ``(sample_name, dataframe)``, each dataframe having
+    columns ``potential``, ``disk_current``, ``ring_current`` (if present),
+    ``rpm``.
+    """
+    st.markdown(
+        "**Data source** (independent of the other tabs) — for each sample, "
+        "upload its current files: either raw per-electrode files (one file "
+        "per rotation rate and electrode, just Potential + Current — the "
+        "layout most RDE/RRDE software exports) *or* a compiled workbook "
+        "with Potential/Disk-current/Potential/Ring-current already paired "
+        "for one rotation rate. Rotation rate and disk/ring role are guessed "
+        "from the filename and can be corrected below."
+    )
+
+    samples: list[tuple[str, pd.DataFrame]] = []
+
+    with st.expander("📦 Batch upload — a ZIP of a whole data folder"):
+        st.caption(
+            "For many samples/rotation rates at once: zip your data folder "
+            "(one subfolder per sample, containing its Disk/Ring files — "
+            "extra nesting inside a sample's subfolder is fine) and upload "
+            "it here. Role and rotation rate are read from filenames "
+            "automatically, same as the per-sample uploaders below, but "
+            "with no per-file correction UI — use those below instead for "
+            "any file that needs fixing by hand."
+        )
+        zip_up = st.file_uploader(
+            "ZIP file", type=["zip"], key=f"{key_prefix}_zip",
+        )
+        if zip_up is not None:
+            zip_samples = _orr_extract_zip_samples(zip_up, key_prefix=key_prefix)
+            if zip_samples:
+                st.success(
+                    f"Loaded {len(zip_samples)} sample(s) from {zip_up.name}: "
+                    + ", ".join(lbl for lbl, _ in zip_samples)
+                )
+            samples.extend(zip_samples)
+
+    n_samples = st.number_input(
+        "Number of additional samples to load individually", min_value=0,
+        max_value=8, value=(0 if samples else 1), step=1,
+        key=f"{key_prefix}_n_samples",
+    )
+
+    for i in range(int(n_samples)):
+        with st.expander(f"Sample {i + 1} — files", expanded=(i == 0 and not samples)):
+            sample_name = st.text_input(
+                "Sample name", value=f"Sample {i + 1}", key=f"{key_prefix}_sample_name_{i}"
+            )
+            ups = st.file_uploader(
+                file_help,
+                type=["csv", "txt", "xlsx", "xls"], accept_multiple_files=True,
+                key=f"{key_prefix}_files_{i}",
+            )
+            if not ups:
+                st.caption("No files uploaded for this sample yet.")
+                continue
+
+            entries = []  # (potential, disk_current, ring_current_or_None, rpm)
+            for j, up in enumerate(ups):
+                raw = _orr_read_file(up, key_prefix=key_prefix)
+                if raw is None:
+                    continue
+                coerced, cols = _orr_numeric_columns(raw)
+                if len(cols) < 2:
+                    st.warning(f"{up.name}: fewer than 2 numeric columns, skipped.")
+                    continue
+                rpm_guess = _guess_rpm_from_filename(up.name) or 1600.0
+
+                if len(cols) >= 4:
+                    fc1, fc2 = st.columns([3, 1])
+                    fc1.caption(f"{up.name} — compiled (Potential/Disk/Potential/Ring)")
+                    rpm_val = fc2.number_input(
+                        "rpm", min_value=1.0, value=float(rpm_guess), step=100.0,
+                        key=f"{key_prefix}_rpm_{i}_{j}", label_visibility="collapsed",
+                    )
+                    entry = _orr_table_to_entry(coerced, cols, up.name, rpm_val)
+                else:
+                    fc1, fc2, fc3 = st.columns([2.2, 1, 1])
+                    fc1.caption(up.name)
+                    role_default = _guess_role_from_filename(up.name)
+                    role = fc2.selectbox(
+                        "Role", ["Disk", "Ring"],
+                        index=0 if role_default == "Disk" else 1,
+                        key=f"{key_prefix}_role_{i}_{j}", label_visibility="collapsed",
+                    )
+                    rpm_val = fc3.number_input(
+                        "rpm", min_value=1.0, value=float(rpm_guess), step=100.0,
+                        key=f"{key_prefix}_rpm_{i}_{j}", label_visibility="collapsed",
+                    )
+                    entry = _orr_table_to_entry(coerced, cols, up.name, rpm_val, role=role)
+                if entry is not None:
+                    entries.append(entry)
+            if not entries:
+                continue
+            df = _orr_merge_entries(entries, sample_name)
+            if df is not None:
+                samples.append((sample_name, df))
+    return samples
+
+
+def render_orr_tab() -> None:
+    st.subheader("ORR / RRDE analysis")
+    st.caption(
+        "At one rotation rate (conventionally 1600 rpm): onset potential, "
+        "half-wave potential E½ (the steepest point of the disk curve), and "
+        "— after removing the mass-transport contribution — the Tafel "
+        "slope; plus, when ring current is available, the electron-transfer "
+        "number **n** and peroxide yield **%H₂O₂**, with no multi-rotation-"
+        "rate fit required. When a sample has several rotation rates, its "
+        "disk/ring response is also compared across them. This tab has its "
+        "own file upload and does not use data loaded elsewhere."
+    )
+
+    samples = _orr_data_loader()
+    if not samples:
+        return
+
+    labels = [lbl for lbl, _ in samples]
+    chosen = st.multiselect("Samples to compare", labels, default=labels, key="orr_chosen")
+    if not chosen:
+        st.info("Select at least one sample to plot.")
+        return
+    chosen_samples = {lbl: df for lbl, df in samples if lbl in chosen}
+
+    font_size = st.selectbox(
+        "Figure export font size (pt)", _JOURNAL_FONT_SIZES, index=0,
+        key="orr_font_size",
+        help="Font is fixed to Arial for publication-style export.",
+    )
+
+    st.markdown("**Current unit, electrode area & collection efficiency**")
+    cur1, cur2, cur3, cur4 = st.columns(4)
+    convert_density = cur1.checkbox(
+        "Convert to current density (÷ area)", value=True,
+        key="orr_convert_density",
+        help="RRDE current is usually reported as an absolute current (A, "
+             "mA, µA); enable to normalize by the electrode's geometric "
+             "area for a comparable current density.",
+    )
+    current_unit = cur2.selectbox(
+        "Current unit as uploaded", ["A"] + _ABS_CURRENT_UNITS, index=0,
+        key="orr_current_unit",
+    )
+    area_cm2 = cur3.number_input(
+        "Electrode area (cm²)", min_value=1e-4, value=0.196, step=0.001,
+        format="%.4f", key="orr_area_cm2",
+        help="0.196 cm² is the standard 5 mm-diameter RRDE glassy-carbon disk.",
+    ) if convert_density else None
+    display_unit = f"{current_unit}/cm²" if convert_density else current_unit
+    collection_efficiency = cur4.number_input(
+        "Ring collection efficiency N", min_value=0.01, max_value=1.0,
+        value=0.37, step=0.01, format="%.2f", key="orr_collection_efficiency",
+        help="From the RRDE electrode's own calibration (e.g. a "
+             "ferri/ferrocyanide test); 0.37 is the common Pine 5 mm "
+             "Pt-ring/glassy-carbon-disk default. Only used where ring "
+             "current is available.",
+    )
+
+    to_rhe_fn = _render_rhe_conversion("orr", default_ph=13.0)
+
+    # Prepare each sample's full (all-rotation-rate) data once: RHE
+    # potential, disk/ring current density, and its own set of available
+    # rpm values -- reused by every plot below.
+    prepared = {}
+    all_rpms: set[float] = set()
+    for lbl, df in chosen_samples.items():
+        pot_rhe = to_rhe_fn(df["potential"].to_numpy(dtype=float))
+        disk = df["disk_current"].to_numpy(dtype=float)
+        disk = disk / area_cm2 if convert_density else disk
+        has_ring = "ring_current" in df.columns
+        ring = None
+        if has_ring:
+            ring = df["ring_current"].to_numpy(dtype=float)
+            ring = ring / area_cm2 if convert_density else ring
+        rpm_arr = df["rpm"].to_numpy(dtype=float)
+        rpm_values = sorted(set(rpm_arr.tolist()))
+        all_rpms.update(rpm_values)
+        prepared[lbl] = dict(
+            potential=pot_rhe, disk=disk, ring=ring, has_ring=has_ring,
+            rpm=rpm_arr, rpm_values=rpm_values,
+        )
+
+    if not all_rpms:
+        st.error("No rotation-rate data found.")
+        return
+    rpm_options = sorted(all_rpms)
+    default_rpm = (
+        1600.0 if 1600.0 in rpm_options
+        else min(rpm_options, key=lambda v: abs(v - 1600.0))
+    )
+    primary_rpm = st.selectbox(
+        "Primary rotation rate — used for the disk curve, Tafel fit, n and "
+        "%H₂O₂ below",
+        rpm_options, index=rpm_options.index(default_rpm),
+        format_func=lambda v: f"{v:g} rpm", key="orr_primary_rpm",
+    )
+
+    # For each sample, slice out the rotation rate nearest the chosen
+    # primary rpm (a sample need not have that exact value).
+    slices = {}
+    for lbl in chosen:
+        p = prepared[lbl]
+        sample_rpm = min(p["rpm_values"], key=lambda v: abs(v - primary_rpm))
+        idx = np.flatnonzero(np.isclose(p["rpm"], sample_rpm))
+        if len(idx) < 5:
+            st.warning(f"{lbl}: fewer than 5 points at {sample_rpm:g} rpm — skipped.")
+            continue
+        if abs(sample_rpm - primary_rpm) > 1e-6:
+            st.caption(
+                f"↪ {lbl} has no {primary_rpm:g} rpm data — using its nearest "
+                f"available rotation rate, {sample_rpm:g} rpm, instead."
+            )
+        slices[lbl] = dict(
+            rpm=sample_rpm, potential=p["potential"][idx], disk=p["disk"][idx],
+            ring=(p["ring"][idx] if p["has_ring"] else None), has_ring=p["has_ring"],
+        )
+    if not slices:
+        return
+
+    palette_for = {lbl: _PALETTE[i % len(_PALETTE)] for i, lbl in enumerate(chosen)}
+
+    def _style_axes(fig, xtitle, ytitle, yrange=None):
+        _journal_axes_style(fig, xtitle, ytitle, font_size, yrange=yrange)
+
+    # ---- Disk polarization curve, all chosen samples overlaid ------------
+    st.markdown(f"**Disk polarization curve @ ~{primary_rpm:g} rpm**")
+    fig_disk = go.Figure()
+    for lbl, s in slices.items():
+        fig_disk.add_trace(go.Scatter(
+            x=s["potential"], y=s["disk"], mode="lines", name=lbl,
+            line=dict(color=palette_for[lbl], width=3),
+        ))
+    _style_axes(fig_disk, "Potential vs RHE / V", f"Disk current ({display_unit})")
+    st.plotly_chart(fig_disk, use_container_width=True)
+    disk_data = _padded_frame({
+        **{f"{lbl} — Potential vs RHE (V)": list(s["potential"]) for lbl, s in slices.items()},
+        **{f"{lbl} — Disk current ({display_unit})": list(s["disk"]) for lbl, s in slices.items()},
+    })
+    figure_downloads(
+        fig_disk, f"orr_disk_curve_{int(primary_rpm)}rpm", key="png_orr_disk",
+        what="Disk curve", data=disk_data,
+    )
+
+    # ---- Per-sample onset / E1/2 / Tafel ----------------------------------
+    st.markdown("**Onset, half-wave potential & Tafel slope**")
+    st.caption(
+        "Each sample gets its own Tafel fit-range slider — auto-started "
+        "near the kinetic (low-overpotential) region of its mass-transport-"
+        "corrected current."
+    )
+    results_rows = []
+    for lbl, s in slices.items():
+        try:
+            onset_res = orr.onset_and_half_wave(s["potential"], s["disk"])
+        except ValueError as exc:
+            st.warning(f"{lbl}: could not locate onset/E½ ({exc}).")
+            continue
+        row = {
+            "Sample": lbl, "Rotation rate (rpm)": s["rpm"],
+            "E_onset (V vs RHE)": round(onset_res.onset_potential, 3),
+            "E_half-wave (V vs RHE)": round(onset_res.half_wave_potential, 3),
+            f"j_limiting ({display_unit})": round(onset_res.limiting_current, 4),
+        }
+
+        jk = orr.mass_transport_corrected_current(s["disk"], onset_res.limiting_current)
+        valid = np.isfinite(jk) & (jk != 0)
+        tafel_result = None
+        if valid.sum() >= 5:
+            pot_tafel = s["potential"][valid]
+            log_jk = tafel.log_current(jk[valid])
+            a0, a1 = tafel.auto_tafel_range(pot_tafel, log_jk, current=jk[valid])
+            range_key = f"orr_tafel_range_{lbl}"
+            slider_kwargs = ({} if range_key in st.session_state
+                             else {"value": (int(a0), int(a1))})
+            start, stop = st.slider(
+                f"{lbl} — Tafel fit range (index)", 0, len(pot_tafel),
+                key=range_key, **slider_kwargs,
+            )
+            try:
+                tafel_result = tafel.fit_tafel(pot_tafel, log_jk, start, stop)
+            except ValueError as exc:
+                st.warning(f"{lbl}: Tafel fit failed ({exc}).")
+            if tafel_result is not None:
+                row["Tafel slope (mV/dec)"] = round(abs(tafel_result.slope_mv_per_dec), 1)
+                row["Tafel R²"] = round(tafel_result.r_squared, 4)
+
+        if s["has_ring"]:
+            n_arr = orr.electron_number(s["disk"], s["ring"], collection_efficiency)
+            pct_arr = orr.peroxide_percent(s["disk"], s["ring"], collection_efficiency)
+            order = np.argsort(s["potential"])
+            row["n @ E½"] = round(float(np.interp(
+                onset_res.half_wave_potential, s["potential"][order], n_arr[order]
+            )), 2)
+            row["%H₂O₂ @ E½"] = round(float(np.interp(
+                onset_res.half_wave_potential, s["potential"][order], pct_arr[order]
+            )), 1)
+
+        results_rows.append(row)
+        s["onset"] = onset_res
+        s["tafel"] = tafel_result
+        s["jk"] = jk
+        s["jk_valid"] = valid
+
+    if results_rows:
+        summary_df = pd.DataFrame(results_rows)
+        st.dataframe(summary_df, use_container_width=True, hide_index=True)
+        st.download_button(
+            "⬇️ Download ORR summary (CSV)",
+            data=summary_df.to_csv(index=False).encode("utf-8"),
+            file_name=f"orr_summary_{int(primary_rpm)}rpm.csv", mime="text/csv",
+            key="dl_orr_summary",
+        )
+        _journal_table_figure(  # CSV of this table is the summary button above
+            summary_df, font_size, f"orr_results_table_{int(primary_rpm)}rpm",
+            key="png_orr_table",
+        )
+
+    # ---- Tafel plot, all chosen samples overlaid --------------------------
+    tafel_samples = {lbl: s for lbl, s in slices.items() if s.get("tafel") is not None}
+    if tafel_samples:
+        st.markdown("**Tafel plot (mass-transport corrected)**")
+        fig_tafel = go.Figure()
+        for lbl, s in tafel_samples.items():
+            color = palette_for[lbl]
+            valid = s["jk_valid"]
+            pot_tafel = s["potential"][valid]
+            log_jk = tafel.log_current(s["jk"][valid])
+            r = s["tafel"]
+            start, stop = r.fit_slice
+            fig_tafel.add_trace(go.Scatter(
+                x=log_jk, y=pot_tafel, mode="markers", name=lbl,
+                marker=dict(size=8, color=color, opacity=0.5),
+            ))
+            xs = log_jk[start:stop]
+            xline = np.array([float(np.min(xs)), float(np.max(xs))])
+            yline = r.slope_v_per_dec * xline + r.intercept_v
+            slope_abs = abs(r.slope_mv_per_dec)
+            fit_color = _darken(color)
+            fig_tafel.add_trace(go.Scatter(
+                x=xline, y=yline, mode="lines", showlegend=False,
+                name=f"{lbl} fit, {slope_abs:.0f} mV/dec",
+                line=dict(color=fit_color, width=3, dash="dot"),
+            ))
+            xmid, ymid = float(np.mean(xline)), float(np.mean(yline))
+            fig_tafel.add_annotation(
+                x=xmid, y=ymid, text=f"{slope_abs:.0f} mV/dec", showarrow=False,
+                yshift=14,
+                font=dict(family="Arial", color=fit_color, size=round(font_size * 0.6)),
+            )
+        _style_axes(fig_tafel, f"log₁₀ |j_k| ({display_unit})", "Potential vs RHE / V")
+        st.plotly_chart(fig_tafel, use_container_width=True)
+        figure_downloads(
+            fig_tafel, f"orr_tafel_{int(primary_rpm)}rpm", key="png_orr_tafel",
+            what="Tafel plot",
+            data=_padded_frame({
+                **{f"{lbl} — log10|jk|": list(tafel.log_current(s["jk"][s["jk_valid"]]))
+                   for lbl, s in tafel_samples.items()},
+                **{f"{lbl} — Potential vs RHE (V)": list(s["potential"][s["jk_valid"]])
+                   for lbl, s in tafel_samples.items()},
+            }),
+        )
+
+    # ---- n & %H2O2 vs potential, all chosen samples overlaid --------------
+    ring_samples = {lbl: s for lbl, s in slices.items() if s["has_ring"]}
+    if ring_samples:
+        st.markdown(f"**Peroxide yield & electron number @ ~{primary_rpm:g} rpm**")
+        fig_ho2, fig_n = go.Figure(), go.Figure()
+        ho2_data, n_data = {}, {}
+        for lbl, s in ring_samples.items():
+            color = palette_for[lbl]
+            n_arr = orr.electron_number(s["disk"], s["ring"], collection_efficiency)
+            pct_arr = orr.peroxide_percent(s["disk"], s["ring"], collection_efficiency)
+            fig_ho2.add_trace(go.Scatter(
+                x=s["potential"], y=pct_arr, mode="lines", name=lbl,
+                line=dict(color=color, width=3),
+            ))
+            fig_n.add_trace(go.Scatter(
+                x=s["potential"], y=n_arr, mode="lines", name=lbl,
+                line=dict(color=color, width=3),
+            ))
+            ho2_data[f"{lbl} — Potential vs RHE (V)"] = list(s["potential"])
+            ho2_data[f"{lbl} — %H2O2"] = list(pct_arr)
+            n_data[f"{lbl} — Potential vs RHE (V)"] = list(s["potential"])
+            n_data[f"{lbl} — n"] = list(n_arr)
+
+        _style_axes(fig_ho2, "Potential vs RHE / V", "%H₂O₂", yrange=[0, 100])
+        _style_axes(fig_n, "Potential vs RHE / V", "n", yrange=[0, 4])
+
+        pc1, pc2 = st.columns(2)
+        with pc1:
+            st.plotly_chart(fig_ho2, use_container_width=True)
+            figure_downloads(
+                fig_ho2, f"orr_ho2_{int(primary_rpm)}rpm", key="png_orr_ho2",
+                what="%H₂O₂ plot", data=_padded_frame(ho2_data),
+            )
+        with pc2:
+            st.plotly_chart(fig_n, use_container_width=True)
+            figure_downloads(
+                fig_n, f"orr_n_{int(primary_rpm)}rpm", key="png_orr_n",
+                what="n plot", data=_padded_frame(n_data),
+            )
+
+    # ---- Rotation-rate comparison, one sample, ring/disk merged axes -----
+    multi_rpm_labels = [lbl for lbl in chosen if len(prepared[lbl]["rpm_values"]) > 1]
+    if multi_rpm_labels:
+        st.markdown("**Rotation-rate comparison (single sample)**")
+        rrde_label = st.selectbox(
+            "Sample", multi_rpm_labels, key="orr_rrde_sample",
+            help="Every rotation rate this sample has, ring and disk current "
+                 "sharing one potential axis — ring reads above zero, disk "
+                 "below, so the pair reads as one merged figure (as in a "
+                 "typical published RRDE overlay).",
+        )
+        p = prepared[rrde_label]
+        fig_rrde = go.Figure()
+        for i, rv in enumerate(p["rpm_values"]):
+            m = np.isclose(p["rpm"], rv)
+            color = _PALETTE[i % len(_PALETTE)]
+            if p["has_ring"]:
+                fig_rrde.add_trace(go.Scatter(
+                    x=p["potential"][m], y=p["ring"][m], mode="lines",
+                    name=f"{rv:g} rpm", legendgroup=f"{rv:g}",
+                    line=dict(color=color, width=2.5),
+                ))
+            fig_rrde.add_trace(go.Scatter(
+                x=p["potential"][m], y=p["disk"][m], mode="lines",
+                name=f"{rv:g} rpm", legendgroup=f"{rv:g}",
+                showlegend=not p["has_ring"],
+                line=dict(color=color, width=2.5),
+            ))
+        if p["has_ring"]:
+            fig_rrde.add_annotation(
+                xref="paper", yref="paper", x=0.98, y=0.95, showarrow=False,
+                text="ring", font=dict(family="Arial", size=round(font_size * 0.7)),
+            )
+            fig_rrde.add_annotation(
+                xref="paper", yref="paper", x=0.98, y=0.05, showarrow=False,
+                text="disk", font=dict(family="Arial", size=round(font_size * 0.7)),
+            )
+            fig_rrde.add_hline(y=0, line_color="black", line_width=1)
+        _style_axes(fig_rrde, "Potential vs RHE / V", f"Current ({display_unit})")
+        fig_rrde.update_layout(height=560)
+        st.plotly_chart(fig_rrde, use_container_width=True)
+        rrde_cols: dict[str, list] = {}
+        for rv in p["rpm_values"]:
+            m = np.isclose(p["rpm"], rv)
+            rrde_cols[f"{rv:g}rpm — Potential vs RHE (V)"] = list(p["potential"][m])
+            rrde_cols[f"{rv:g}rpm — Disk current ({display_unit})"] = list(p["disk"][m])
+            if p["has_ring"]:
+                rrde_cols[f"{rv:g}rpm — Ring current ({display_unit})"] = list(p["ring"][m])
+        figure_downloads(
+            fig_rrde, f"orr_rrde_multirpm_{rrde_label}", key="png_orr_rrde",
+            what="RRDE multi-rpm plot", data=_padded_frame(rrde_cols),
+        )
+
+
+# --------------------------------------------------------------------------- #
 # Main                                                                         #
 # --------------------------------------------------------------------------- #
 def main():
     if not require_access():
         st.stop()
 
-    st.title("⚡ LSV analysis-iR compensation, Tafel slope anlaysis")
+    st.title(f"⚡ {APP_NAME}")
     st.caption(
         "EIS fitting → Ru extraction → LSV ohmic-drop correction, plus "
         "independent Tafel-slope analysis"
@@ -1624,8 +2841,9 @@ def main():
 
     eis_list, lsv_list, label = sidebar_data_loader()
 
-    tab_eis, tab_lsv, tab_tafel = st.tabs(
-        ["📈 EIS / Ru Analysis", "🔬 LSV iR Correction", "📐 Tafel Slope Analysis"]
+    tab_eis, tab_lsv, tab_tafel, tab_kl, tab_orr = st.tabs(
+        ["📈 EIS / Ru Analysis", "🔬 LSV iR Correction", "📐 LSV Analysis",
+         "📉 K-L Analysis", "⚛️ ORR / RRDE Analysis"]
     )
 
     if eis_list and lsv_list:
@@ -1675,10 +2893,16 @@ def main():
     with tab_tafel:
         render_tafel_tab()
 
+    with tab_kl:
+        render_kl_tab()
+
+    with tab_orr:
+        render_orr_tab()
+
     render_citation()
     st.divider()
     st.caption(
-        f"LSV analysis-iR compensation, Tafel slope anlaysis v1.1.0 · please "
+        f"{APP_NAME} v1.1.0 · please "
         f"cite if used ([repository]({REPO_URL})). See **Cite this app** in "
         "the sidebar."
     )

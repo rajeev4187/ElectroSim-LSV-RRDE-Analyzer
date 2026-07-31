@@ -83,10 +83,15 @@ class TafelResult:
     @property
     def exchange_current(self) -> float | None:
         """Current at potential = 0 (extrapolated). See module docstring for
-        when this is physically the exchange current i0."""
+        when this is physically the exchange current i0. ``None`` for a flat
+        (near-zero-slope) fit, where the extrapolation is undefined/unstable
+        and the exponent would overflow a float."""
         if self.slope_v_per_dec == 0:
             return None
-        return float(10.0 ** (-self.intercept_v / self.slope_v_per_dec))
+        exponent = -self.intercept_v / self.slope_v_per_dec
+        if abs(exponent) > 300:  # 10**308 ~ float64 max; stay well clear
+            return None
+        return float(10.0 ** exponent)
 
 
 def log_current(current: np.ndarray) -> np.ndarray:
@@ -175,6 +180,60 @@ def _onset_index(current: np.ndarray, baseline_frac: float,
                     level + 1e-12)
     crossings = np.flatnonzero(current[baseline_n:] >= threshold)
     return int(crossings[0]) + baseline_n if len(crossings) else None
+
+
+# --------------------------------------------------------------------------- #
+# Onset potential & fixed-current-density benchmarks (HER/OER convention)     #
+# --------------------------------------------------------------------------- #
+# Equilibrium potential (V vs RHE) of common reactions, for converting a
+# potential read off a curve into an overpotential eta = |E - E_eq|. HER/HOR
+# share 0 V exactly (the RHE scale's own reference point); OER/ORR share
+# 1.23 V (standard water oxidation/reduction potential). The others are
+# approximate and product-dependent (see the app's own caption for caveats);
+# reactions without a well-defined single E_eq are omitted, and callers
+# should report the raw potential instead of an overpotential for those.
+REACTION_E_EQ_V_RHE: dict[str, float] = {
+    "HER": 0.0,
+    "HOR": 0.0,
+    "OER": 1.23,
+    "ORR": 1.23,
+    "NO₃RR": 0.69,   # -> NH3, approximate
+    "N₂RR": 0.09,    # -> NH3, approximate
+    "CO₂RR": -0.10,  # product-dependent, approximate
+}
+
+
+def onset_potential(potential: np.ndarray, current: np.ndarray,
+                    baseline_frac: float = 0.1,
+                    onset_multiplier: float = 4.0) -> float:
+    """Potential at which ``|current|`` first departs from the flat
+    pre-onset baseline — see :func:`_onset_index`. ``potential``/``current``
+    should be in the sweep's own recorded order (not sorted)."""
+    pot = np.asarray(potential, dtype=float)
+    cur = np.asarray(current, dtype=float)
+    idx = _onset_index(np.abs(cur), baseline_frac, onset_multiplier)
+    if idx is None:
+        raise ValueError("No clear onset found (current never departs from baseline).")
+    return float(pot[idx])
+
+
+def potential_at_current_density(potential: np.ndarray, current_density: np.ndarray,
+                                 target_j: float) -> float | None:
+    """Potential at which ``|current_density|`` first reaches ``target_j``
+    (same units as ``current_density``), by linear interpolation between the
+    two bracketing points. ``None`` if the sweep never reaches ``target_j``.
+    """
+    pot = np.asarray(potential, dtype=float)
+    j = np.abs(np.asarray(current_density, dtype=float))
+    idx = np.flatnonzero(j >= target_j)
+    if len(idx) == 0:
+        return None
+    i = int(idx[0])
+    if i == 0:
+        return float(pot[0])
+    x0, x1, y0, y1 = pot[i - 1], pot[i], j[i - 1], j[i]
+    frac = 0.0 if y1 == y0 else (target_j - y0) / (y1 - y0)
+    return float(x0 + frac * (x1 - x0))
 
 
 def auto_tafel_range(potential: np.ndarray, log_i: np.ndarray,

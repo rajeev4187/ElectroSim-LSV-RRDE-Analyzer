@@ -214,6 +214,14 @@ def load_eis_datasets(path: str | Path, sheet: str | int | None = 0) -> list[EIS
     return out
 
 
+def read_table(path: str | Path, sheet: str | int | None = None) -> pd.DataFrame:
+    """Read a raw table (CSV or one Excel sheet) with the same safety guards
+    (zip-bomb / row-column caps) as the fixed-shape loaders above, for
+    callers that need arbitrary column layouts (e.g. user-driven column
+    mapping) rather than a hardcoded x/y pair."""
+    return _read_table(path, sheet)
+
+
 def load_lsv_datasets(path: str | Path, sheet: str | int | None = 1) -> list[LSVData]:
     """Load one or more LSV datasets (one per ``Potential, Current`` pair)."""
     df = _read_table(path, sheet)
