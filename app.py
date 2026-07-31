@@ -1093,12 +1093,18 @@ def _journal_axes_style(fig, xtitle: str, ytitle: str, font_size: int,
     positions = {
         "top-left": dict(x=0.02, y=0.98, xanchor="left", yanchor="top"),
         "bottom-left": dict(x=0.02, y=0.02, xanchor="left", yanchor="bottom"),
+        # Outside the plot area entirely (to the right) — for plots whose
+        # data can occupy any corner (e.g. many K-L analysis-potential
+        # entries), where an inside-corner legend would otherwise sit on
+        # top of the traces instead of beside them.
+        "outside-right": dict(x=1.02, y=1, xanchor="left", yanchor="top"),
     }
+    right_margin = 170 if legend_position == "outside-right" else 10
     fig.update_layout(
         template="plotly_white", height=height, font=axis_font,
         legend=dict(**positions[legend_position], font=small_font,
                     bgcolor="rgba(255,255,255,0.7)"),
-        margin=dict(l=10, r=10, t=20, b=10),
+        margin=dict(l=10, r=right_margin, t=20, b=10),
     )
     fig.update_xaxes(
         title=dict(text=xtitle, font=axis_font), tickfont=axis_font,
@@ -2191,6 +2197,13 @@ def render_tafel_tab() -> None:
 # --------------------------------------------------------------------------- #
 # Koutecky-Levich (K-L) analysis tab (independent data source)                #
 # --------------------------------------------------------------------------- #
+# The K-L fit must run in A/cm² (the units the 0.62 Levich prefactor is
+# defined for), but the plot is conventionally shown in mA/cm². Since
+# 1/j_[cm²/mA] = (1/j_[cm²/A]) / 1000, this divides the plotted/exported
+# 1/j only -- never the fit that n is derived from.
+_KL_PLOT_J_SCALE = 1000.0
+
+
 def render_kl_tab() -> None:
     st.subheader("Koutecky–Levich (K-L) analysis")
     st.caption(
@@ -2228,44 +2241,57 @@ def render_kl_tab() -> None:
         help="Font is fixed to Arial for publication-style export.",
     )
 
-    def _style_axes(fig, xtitle, ytitle):
-        _journal_axes_style(fig, xtitle, ytitle, font_size)
+    def _style_axes(fig, xtitle, ytitle, legend_position="top-left"):
+        _journal_axes_style(fig, xtitle, ytitle, font_size, legend_position=legend_position)
 
     st.markdown("**Current unit & electrode area**")
-    cur1, cur2, cur3, cur4 = st.columns(4)
-    convert_density = cur1.checkbox(
-        "Convert to current density (÷ area)", value=True,
-        key="kl_convert_density",
-        help="RDE current is usually reported as an absolute current (A, "
-             "mA, µA); enable to normalize by the electrode's geometric "
-             "area for a comparable current density.",
-    )
+    # The uploaded column may hold either an absolute current (the usual RDE
+    # export) or an already-normalised current density. Offering both here
+    # matters for more than labelling: an already-per-area column must NOT be
+    # divided by the electrode area again, and n comes out wrong by exactly
+    # that factor if it is.
+    kl_unit_options = _ABS_CURRENT_UNITS + _DENSITY_CURRENT_UNITS
     _kl_unit_default = (
-        _ABS_CURRENT_UNITS.index(unit_hint) if unit_hint in _ABS_CURRENT_UNITS
-        else _ABS_CURRENT_UNITS.index("A")
+        kl_unit_options.index(unit_hint) if unit_hint in kl_unit_options
+        else kl_unit_options.index("A")
     )
-    current_unit = cur2.selectbox(
-        "Current unit as uploaded", _ABS_CURRENT_UNITS, index=_kl_unit_default,
+    cur1, cur2, cur3 = st.columns([1.3, 1.3, 1])
+    current_unit = cur1.selectbox(
+        "Current unit as uploaded", kl_unit_options, index=_kl_unit_default,
         key="kl_current_unit",
         help="Auto-detected from the file's column header when recognisable "
-             "(RDE exports are often in A) — override if it's wrong.",
+             "(RDE exports are often in A) — override if it's wrong. Pick a "
+             "per-area unit (e.g. mA/cm²) if the file already holds a "
+             "current density, so it isn't divided by the area a second time.",
     )
-    desired_unit = cur3.selectbox(
-        "Desired current unit", _ABS_CURRENT_UNITS,
-        index=_ABS_CURRENT_UNITS.index(current_unit), key="kl_desired_unit",
-        help="Values are rescaled from 'as uploaded' to this unit before "
-             "any density conversion below.",
+    uploaded_is_density = correction.is_density_unit(current_unit)
+    desired_unit = cur2.selectbox(
+        "Desired current unit (for the RDE plot)",
+        _DENSITY_CURRENT_UNITS if uploaded_is_density else _ABS_CURRENT_UNITS,
+        index=(_DENSITY_CURRENT_UNITS if uploaded_is_density
+               else _ABS_CURRENT_UNITS).index(current_unit),
+        key="kl_desired_unit",
+        help="Display unit for the RDE curves below. The Koutecky-Levich "
+             "fit and n always use A/cm² internally regardless of this.",
     )
-    area_cm2 = cur4.number_input(
+    area_cm2 = cur3.number_input(
         "Electrode area (cm²)", min_value=1e-4, value=0.196, step=0.001,
         format="%.4f", key="kl_area_cm2",
-        help="0.196 cm² is the standard 5 mm-diameter RDE glassy-carbon disk.",
-    ) if convert_density else None
-    display_unit = f"{desired_unit}/cm²" if convert_density else desired_unit
+        disabled=uploaded_is_density,
+        help="0.196 cm² is the standard 5 mm-diameter RDE glassy-carbon disk. "
+             "Used to convert the uploaded absolute current into the A/cm² "
+             "current density the Koutecky-Levich fit and n require. Not "
+             "needed (and disabled) when the upload is already a density.",
+    )
+    display_unit = desired_unit if uploaded_is_density else f"{desired_unit}/cm²"
     if unit_hint:
         st.caption(f"ℹ️ Detected current unit from the column header: **{unit_hint}**.")
 
-    to_rhe_fn = _render_rhe_conversion("kl", default_ph=13.0)
+    to_rhe_fn = _render_rhe_conversion(
+        "kl", default_ph=13.0,
+        default_ref_electrode="Hg/HgO, 1 M NaOH", default_electrolyte="0.1 M KOH",
+        default_mode="Reference electrode + electrolyte pH",
+    )
 
     st.markdown("**Electrolyte O₂ transport parameters** (for n via the Levich constant)")
     st.caption(
@@ -2301,10 +2327,26 @@ def render_kl_tab() -> None:
         )
 
     pot_rhe = to_rhe_fn(df["potential"].to_numpy(dtype=float))
-    disk = _rescale_current(
-        df["disk_current"].to_numpy(dtype=float), current_unit, desired_unit
-    )
-    disk = disk / area_cm2 if convert_density else disk
+    disk_raw = df["disk_current"].to_numpy(dtype=float)
+    # Display series, in whatever unit the RDE plot is set to. An upload that
+    # is already a density is only rescaled between per-area units; an
+    # absolute upload is rescaled then divided by the electrode area.
+    disk = _rescale_current(disk_raw, current_unit, desired_unit)
+    if not uploaded_is_density:
+        disk = disk / area_cm2
+    # The Koutecky-Levich slope -> n conversion (B = 0.62 F D^(2/3) nu^(-1/6) C)
+    # is only valid when j is a true current density in A/cm^2 -- the units
+    # the standard/literature F, D, nu, C values are given in. Using whatever
+    # unit the RDE-curve plot happens to display (e.g. mA/cm^2) throws n off
+    # by orders of magnitude, so the fit/n calculation always builds its own
+    # A/cm^2 array regardless of the display settings above. Critically, an
+    # already-per-area upload converts straight to A/cm^2 and must NOT be
+    # divided by the area again -- doing so scaled n by 1/area (~5x for a
+    # standard 0.196 cm^2 tip) on top of any unit-prefix error.
+    if uploaded_is_density:
+        disk_a_cm2 = _rescale_current(disk_raw, current_unit, "A/cm²")
+    else:
+        disk_a_cm2 = _rescale_current(disk_raw, current_unit, "A") / area_cm2
     rpm_arr = df["rpm"].to_numpy(dtype=float)
     rpm_values = sorted(set(rpm_arr.tolist()))
     if len(rpm_values) < 3:
@@ -2315,18 +2357,29 @@ def render_kl_tab() -> None:
         return
 
     st.markdown(f"**RDE curves — {active_label}**")
+    rde_x_range, rde_y_range = _range_controls(
+        "kl_rde", "Potential (V)", f"Disk current ({display_unit})",
+        float(np.min(pot_rhe)), float(np.max(pot_rhe)),
+        float(np.min(disk)), float(np.max(disk)),
+    )
     fig_rde = go.Figure()
     curves: dict[float, tuple[np.ndarray, np.ndarray]] = {}
+    curves_a_cm2: dict[float, tuple[np.ndarray, np.ndarray]] = {}
     for i, rv in enumerate(rpm_values):
         m = np.isclose(rpm_arr, rv)
         order = np.argsort(pot_rhe[m])
         p, j = pot_rhe[m][order], disk[m][order]
         curves[rv] = (p, j)
+        curves_a_cm2[rv] = (p, disk_a_cm2[m][order])
         fig_rde.add_trace(go.Scatter(
             x=p, y=j, mode="lines", name=f"{rv:g} rpm",
             line=dict(color=_PALETTE[i % len(_PALETTE)], width=2.5),
         ))
     _style_axes(fig_rde, "Potential vs RHE / V", f"Disk current ({display_unit})")
+    if rde_x_range is not None:
+        fig_rde.update_xaxes(range=rde_x_range)
+    if rde_y_range is not None:
+        fig_rde.update_yaxes(range=rde_y_range)
     st.plotly_chart(fig_rde, use_container_width=True, config=_PLOTLY_EDIT_CONFIG)
     rde_cols = {}
     for rv, (p, j) in curves.items():
@@ -2347,47 +2400,96 @@ def render_kl_tab() -> None:
         return
 
     st.markdown("**Koutecky–Levich plot**")
-    n_points = st.number_input(
-        "Number of analysis potentials (evenly spaced across the range all "
-        "rotation rates share)",
+    st.caption(
+        f"All {len(rpm_values)} rotation rates overlap only over "
+        f"**{lo:.3f} – {hi:.3f} V vs RHE**, so the analysis window below is "
+        "clamped to that; the ORR-active default (0.3–0.8 V) is trimmed "
+        "wherever it falls outside. To reach further, extend the sweep range "
+        "of the rotation rate that limits it."
+    )
+    kc1, kc2, kc3 = st.columns([1, 1, 1.6])
+    kl_pot_lo = kc1.number_input(
+        "Analysis window min (V vs RHE)", value=round(max(lo, 0.3), 3),
+        step=0.05, format="%.2f", key="kl_pot_lo",
+        help="Defaults to the ORR kinetically-active regime (~0.3-0.8 V vs "
+             "RHE) intersected with the potential range all rotation rates "
+             "share — outside that window the disk current is either "
+             "capacitive-only (near OCP) or fully mass-transport-limited, "
+             "neither of which is meaningful for a K-L fit.",
+    )
+    kl_pot_hi = kc2.number_input(
+        "Analysis window max (V vs RHE)", value=round(min(hi, 0.8), 3),
+        step=0.05, format="%.2f", key="kl_pot_hi",
+    )
+    n_points = kc3.number_input(
+        "Number of analysis potentials (evenly spaced across the window)",
         min_value=1, max_value=15, value=5, step=1, key="kl_n_points",
     )
-    analysis_pots = np.linspace(lo, hi, int(n_points))
+    pot_window_lo, pot_window_hi = max(lo, kl_pot_lo), min(hi, kl_pot_hi)
+    if pot_window_lo >= pot_window_hi:
+        st.error(
+            f"{active_label}: the analysis window doesn't overlap the "
+            f"potential range all rotation rates share ({lo:.3f}-{hi:.3f} V "
+            "vs RHE) — widen it above."
+        )
+        return
+    analysis_pots = np.linspace(pot_window_lo, pot_window_hi, int(n_points))
+    st.caption(
+        f"↪ n below assumes the uploaded disk current is in **{current_unit}** "
+        f"and the electrode area is **{area_cm2:g} cm²** (both set above) — "
+        "double-check those first if n still looks off, since n is very "
+        "sensitive to both."
+    )
 
     kl_rows = []
+    kl_diagnostics: list[dict] = []
     fig_kl = go.Figure()
     kl_data: dict[str, list] = {}
+    n_out_of_range = False
     for idx, ap in enumerate(analysis_pots):
-        omegas_rpm, invj = [], []
+        omegas_rpm, j_at_pot = [], []
         for rv in rpm_values:
-            p, j = curves[rv]
+            # Always the A/cm^2 series -- see the note above disk_a_cm2:
+            # the Levich slope -> n conversion is only correct in these units.
+            p, j = curves_a_cm2[rv]
             jval = float(np.interp(ap, p, j))
             if jval == 0 or not np.isfinite(jval):
                 continue
             omegas_rpm.append(rv)
-            invj.append(1.0 / jval)
+            j_at_pot.append(jval)
         if len(omegas_rpm) < 3:
             continue
+        invj = 1.0 / np.array(j_at_pot)
         try:
-            fit = orr.fit_koutecky_levich(omegas_rpm, 1.0 / np.array(invj))
+            fit = orr.fit_koutecky_levich(omegas_rpm, np.array(j_at_pot))
         except ValueError:
             continue
         n_val = orr.levich_slope_to_n(fit.slope, diff_coeff, viscosity, bulk_c)
+        if n_val is not None and not (-0.5 <= n_val <= 4.5):
+            n_out_of_range = True
         color = _PALETTE[idx % len(_PALETTE)]
+        # x = omega^-1/2 with omega = 2*pi*rpm/60 in rad/s -- the units the
+        # 0.62 Levich prefactor is defined for (the alternative 0.201 form
+        # takes rpm directly; 0.62*sqrt(2*pi/60) = 0.201 reconciles them).
         x = 1.0 / np.sqrt(orr.angular_velocity(omegas_rpm))
-        y = np.array(invj)
+        # The fit itself stays in A/cm^2 (required by the 0.62 prefactor);
+        # only the plotted/exported y is rescaled to the mA/cm^2 convention
+        # the ORR literature usually shows. 1/j_[mA/cm2] = (1/j_[A/cm2])/1000,
+        # so both the points and the fitted line scale by the same factor and
+        # the line still overlays the points exactly.
+        y = invj / _KL_PLOT_J_SCALE
         fig_kl.add_trace(go.Scatter(
             x=x, y=y, mode="markers", name=f"{ap:.3f} V",
             marker=dict(color=color, size=9),
         ))
         xline = np.array([float(np.min(x)), float(np.max(x))])
-        yline = fit.slope * xline + fit.intercept
+        yline = (fit.slope * xline + fit.intercept) / _KL_PLOT_J_SCALE
         fig_kl.add_trace(go.Scatter(
             x=xline, y=yline, mode="lines", showlegend=False,
             line=dict(color=_darken(color), width=2.5, dash="dot"),
         ))
-        kl_data[f"{ap:.3f}V — 1/sqrt(omega)"] = list(x)
-        kl_data[f"{ap:.3f}V — 1/j"] = list(y)
+        kl_data[f"{ap:.3f}V — omega^-1/2 (rad^-1/2 s^1/2)"] = list(x)
+        kl_data[f"{ap:.3f}V — 1/j (cm²/mA)"] = list(y)
         kl_rows.append({
             "Potential (V vs RHE)": round(float(ap), 3),
             "KL slope": float(fit.slope),
@@ -2395,13 +2497,67 @@ def render_kl_tab() -> None:
             # Reported as its positive magnitude (0-4), matching literature
             # convention -- the sign otherwise just tracks the disk current's
             # own recorded sign (negative for a cathodic/reduction sweep).
-            "n (Levich)": round(abs(n_val), 2) if n_val is not None else None,
-            f"j_k ({display_unit})": (
-                round(fit.kinetic_current_density, 4)
+            "n — electron transfer no. (Levich)": (
+                round(abs(n_val), 2) if n_val is not None else None
+            ),
+            "j_k (mA/cm²)": (
+                round(fit.kinetic_current_density * _KL_PLOT_J_SCALE, 4)
                 if fit.kinetic_current_density is not None else None
             ),
-            "Rotation rates used": fit.n_rotation_rates,
+            "Rotation rates used (rpm)": ", ".join(f"{rv:g}" for rv in omegas_rpm),
         })
+        # Measured |j| beside the ideal 4-electron Levich value at the same
+        # rotation rate. Their ratio *is* n/4, so a row that reads e.g.
+        # "2.8 vs 5.7" immediately explains an n of ~2 without any further
+        # digging: the fit is faithfully reporting the current it was given.
+        b_4e_row = (0.62 * 4 * orr.FARADAY_C_PER_MOL * diff_coeff ** (2 / 3)
+                    * viscosity ** (-1 / 6) * bulk_c)
+        ideal_4e = [
+            b_4e_row * np.sqrt(orr.angular_velocity(rv)) * _KL_PLOT_J_SCALE
+            for rv in omegas_rpm
+        ]
+        measured = [abs(v) * _KL_PLOT_J_SCALE for v in j_at_pot]
+        kl_diagnostics.append({
+            "E (V vs RHE)": round(float(ap), 3),
+            "measured |j| (mA/cm²)": ", ".join(f"{v:.3g}" for v in measured),
+            "ideal 4e⁻ |j| (mA/cm²)": ", ".join(f"{v:.3g}" for v in ideal_4e),
+            "measured / ideal": ", ".join(
+                f"{m / i:.2f}" if i else "—" for m, i in zip(measured, ideal_4e)
+            ),
+            "n (raw, unrounded)": f"{n_val:.4f}" if n_val is not None else "—",
+        })
+
+    if n_out_of_range:
+        st.warning(
+            "One or more analysis potentials gave n well outside the "
+            "physically meaningful 0-4 range for O₂ reduction — double-"
+            "check the electrode area and electrolyte O₂ transport "
+            "parameters above (n is very sensitive to both). Open the "
+            "diagnostics below to see the intermediate values."
+        )
+
+    if kl_diagnostics:
+        # Expected 4-electron limiting current density at 1600 rpm for the
+        # transport parameters in use -- the quickest sanity check there is:
+        # if the measured |j| is nowhere near it, the problem is upstream of
+        # the fit (wrong units, wrong area, or wrong electrolyte preset).
+        b_4e = (0.62 * 4 * orr.FARADAY_C_PER_MOL * diff_coeff ** (2 / 3)
+                * viscosity ** (-1 / 6) * bulk_c)
+        jlim_4e_ma = b_4e * np.sqrt(orr.angular_velocity(1600.0)) * _KL_PLOT_J_SCALE
+        with st.expander("🔬 n diagnostics — intermediate values behind each fit"):
+            st.caption(
+                f"Inputs in use: current read as **{current_unit}**"
+                + ("" if uploaded_is_density else f", area **{area_cm2:g} cm²**")
+                + f" · D = {diff_coeff:.3g} cm²/s · ν = {viscosity:.3g} cm²/s "
+                f"· C = {bulk_c:.3g} mol/cm³. For a 4-electron ORR under these "
+                f"conditions |j_lim| at 1600 rpm should be ≈ **{jlim_4e_ma:.2f} "
+                "mA/cm²** — if your measured |j| at 1600 rpm is far from that, "
+                "the mismatch is in the data/units or the transport "
+                "parameters, not the fit itself."
+            )
+            st.dataframe(
+                pd.DataFrame(kl_diagnostics), use_container_width=True, hide_index=True,
+            )
 
     if not kl_rows:
         st.warning(
@@ -2411,8 +2567,19 @@ def render_kl_tab() -> None:
         )
         return
 
-    _style_axes(fig_kl, "1 / √ω (s¹ᐟ²/rad¹ᐟ²)", f"1 / j ({display_unit}⁻¹)")
+    _style_axes(
+        fig_kl, "ω<sup>−1/2</sup> (rad<sup>−1/2</sup> s<sup>1/2</sup>)",
+        "j<sup>−1</sup> (cm² mA<sup>−1</sup>)",
+        legend_position="outside-right",
+    )
     st.plotly_chart(fig_kl, use_container_width=True, config=_PLOTLY_EDIT_CONFIG)
+    st.caption(
+        "Koutecký–Levich: 1/j = 1/j_k + 1/(B·ω^½), with "
+        "B = 0.62·n·F·D^(2/3)·ν^(−1/6)·C and ω = 2π·rpm/60 (rad/s). "
+        "Slope = 1/B (gives n), intercept = 1/j_k. Plotted in **cm²/mA** by "
+        "the usual convention; the fit behind n runs in A/cm², which the "
+        "0.62 prefactor requires."
+    )
     figure_downloads(
         fig_kl, f"kl_plot_{active_label}", key="png_kl_plot",
         what="Koutecky–Levich plot", data=_padded_frame(kl_data),
