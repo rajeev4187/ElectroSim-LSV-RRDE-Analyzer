@@ -154,14 +154,19 @@ def _export_figure(fig):
 def _export_size(fig, width: int | None, height: int | None) -> tuple[int, int]:
     """Pixel size for a static export.
 
-    Defaults to the figure's own layout height when it sets one — a table
-    sizes itself by row count, so forcing the same fixed height on every
-    figure (as this used to) simply cut the last rows off.
+    Square by default (the common preference for journal figures): width
+    matches height unless the figure (or caller) pins its own width — e.g.
+    a table (sized by column count) or a deliberately multi-panel figure
+    (the merged Ring/Disk plot) that already sets both dimensions itself.
+    Height defaults to the figure's own layout height when it sets one — a
+    table sizes itself by row count, so forcing the same fixed height on
+    every figure (as this used to) simply cut the last rows off.
     """
-    if width is None:
-        width = 1100
     if height is None:
         height = int(getattr(fig.layout, "height", None) or 520)
+    if width is None:
+        layout_width = getattr(fig.layout, "width", None)
+        width = int(layout_width) if layout_width else height
     return int(width), max(int(height), 200)
 
 
@@ -582,7 +587,7 @@ def render_eis_tab(eis_d, eis_list, sel, ru_unit: str = "Ω",
             )
         _journal_axes_style(fig, f"Z′ / {disp_unit}", f"−Z″ / {disp_unit}", font_size)
         fig.update_yaxes(scaleanchor="x", scaleratio=1)  # equal aspect -> true circle
-        st.plotly_chart(fig, use_container_width=True)
+        st.plotly_chart(fig, use_container_width=True, config=_PLOTLY_EDIT_CONFIG)
         nyquist_data = _padded_frame({
             f"Z′ ({disp_unit})": zr,
             f"−Z″ ({disp_unit})": np.abs(zi),
@@ -873,13 +878,12 @@ def render_lsv_tab(lsv_d, ru: float | None, current_unit: str = "mA",
             legend=dict(orientation="h", yanchor="top", y=-0.18,
                         xanchor="center", x=0.5,
                         font=dict(family="Arial", size=max(11, round(font_size * 0.55))),
-                        bgcolor="rgba(255,255,255,0.7)", bordercolor="black",
-                        borderwidth=1),
+                        bgcolor="rgba(255,255,255,0.7)"),
             margin=dict(l=10, r=10, t=60, b=90),
         )
         fig.update_xaxes(**_BOX_AXIS_STYLE)
         fig.update_yaxes(**_BOX_AXIS_STYLE)
-        st.plotly_chart(fig, use_container_width=True)
+        st.plotly_chart(fig, use_container_width=True, config=_PLOTLY_EDIT_CONFIG)
         fac_png = "-".join(str(int(r.factor_percent)) for r in results)
         plotted = {
             "Potential raw (V)": lsv_d.potential,
@@ -1025,8 +1029,57 @@ _JOURNAL_FONT_SIZES = [28, 36]
 _BOX_AXIS_STYLE = dict(
     showgrid=False, zeroline=False,
     showline=True, linewidth=1.5, linecolor="black", mirror=True,
-    ticks="outside",
+    ticks="outside", nticks=5,
 )
+# Every journal-style plot uses this so its legend and any text annotations
+# (slope labels, etc.) can be dragged to a better spot before export.
+_PLOTLY_EDIT_CONFIG = {
+    "edits": {"legendPosition": True, "annotationPosition": True},
+    "displaylogo": False,
+}
+
+
+def _range_controls(
+    key_prefix: str, x_label: str, y_label: str | None,
+    x_lo: float, x_hi: float, y_lo: float | None = None, y_hi: float | None = None,
+    x_step: float = 0.05, y_step: float = 0.5,
+) -> tuple[list | None, list | None]:
+    """Render an optional axis-range expander shared by every LSV/ORR plot.
+
+    A pure *view* control: it never filters the underlying data or traces,
+    only sets the plotted axis range via ``fig.update_xaxes``/
+    ``update_yaxes(range=...)`` — so the full dataset is always in the
+    figure (and its CSV/full-precision export), and widening the range (or
+    unchecking the box) always recovers everything, including outside the
+    default scientifically-typical window shown here. Pass ``y_label=None``
+    to omit the Y-axis controls (e.g. a plot whose Y-axis is already fixed,
+    like %H2O2/n). Returns ``(x_range, y_range)``, each ``None`` unless the
+    user opts in (or the axis is omitted)."""
+    x_range: list | None = None
+    y_range: list | None = None
+    with st.expander(f"🔧 {x_label}" + (f" / {y_label}" if y_label else "")
+                     + " range (view only — data is never cut)"):
+        if st.checkbox("Set axis limits manually", key=f"{key_prefix}_range_toggle"):
+            cx1, cx2 = st.columns(2)
+            xmin = cx1.number_input(f"{x_label} min", value=round(x_lo, 3),
+                                    step=x_step, format="%.3f", key=f"{key_prefix}_xmin")
+            xmax = cx2.number_input(f"{x_label} max", value=round(x_hi, 3),
+                                    step=x_step, format="%.3f", key=f"{key_prefix}_xmax")
+            if xmax > xmin:
+                x_range = [xmin, xmax]
+            else:
+                st.caption(f"{x_label}: max must exceed min; using auto range.")
+            if y_label is not None:
+                cy1, cy2 = st.columns(2)
+                ymin = cy1.number_input(f"{y_label} min", value=round(y_lo, 3),
+                                        step=y_step, format="%.3f", key=f"{key_prefix}_ymin")
+                ymax = cy2.number_input(f"{y_label} max", value=round(y_hi, 3),
+                                        step=y_step, format="%.3f", key=f"{key_prefix}_ymax")
+                if ymax > ymin:
+                    y_range = [ymin, ymax]
+                else:
+                    st.caption(f"{y_label}: max must exceed min; using auto range.")
+    return x_range, y_range
 
 
 def _journal_axes_style(fig, xtitle: str, ytitle: str, font_size: int,
@@ -1044,8 +1097,7 @@ def _journal_axes_style(fig, xtitle: str, ytitle: str, font_size: int,
     fig.update_layout(
         template="plotly_white", height=height, font=axis_font,
         legend=dict(**positions[legend_position], font=small_font,
-                    bgcolor="rgba(255,255,255,0.7)", bordercolor="black",
-                    borderwidth=1),
+                    bgcolor="rgba(255,255,255,0.7)"),
         margin=dict(l=10, r=10, t=20, b=10),
     )
     fig.update_xaxes(
@@ -1146,12 +1198,22 @@ _REPLICATE_SUFFIX = re.compile(r"\s*\(\d+\)$")
 
 def _default_replicate_group(label: str) -> str:
     """Guess a replicate-group name from a sample label by stripping a
-    trailing ``" (2)"``/``" (3)``/… — the exact suffix the data loader's own
-    de-duplication adds when the same base file/column name is uploaded more
-    than once (see ``_dedup`` in ``_tafel_data_loader``), which is exactly
-    the common case of uploading several repeat scans of one sample."""
+    trailing ``" (2)"``/``" (3)``/… — the exact suffix ``_dedup_label`` adds
+    when the same base file/column/folder name is loaded more than once,
+    which is exactly the common case of uploading several repeat scans of
+    one sample."""
     stripped = _REPLICATE_SUFFIX.sub("", label).strip()
     return stripped or label
+
+
+def _dedup_label(label: str, seen: dict[str, int]) -> str:
+    """Disambiguate a repeated label as ``"name"``, ``"name (2)"``, … — used
+    by every LSV-tab upload path (individual files and ZIP batch upload) so
+    labels collide the same way regardless of source, and so
+    ``_default_replicate_group`` can strip the suffix back off to
+    auto-group repeat runs of one sample."""
+    seen[label] = seen.get(label, 0) + 1
+    return label if seen[label] == 1 else f"{label} ({seen[label]})"
 
 
 def _selection_signature(points: list) -> tuple:
@@ -1187,20 +1249,114 @@ def _selection_range_for_sample(points: list, orig_label: str,
     return int(idx.min()), int(idx.max()) + 1
 
 
+def _tafel_extract_zip_samples(
+    upload, seen_labels: dict[str, int]
+) -> list[tuple[str, "data_io.LSVData"]]:
+    """Batch-load LSV runs from a ZIP of a data folder — for pulling in many
+    repeat runs/samples at once instead of picking files one by one. Each
+    file becomes one run; files sharing a top-level subfolder are labelled
+    ``"name"``, ``"name (2)"``, … via :func:`_dedup_label` — the same
+    suffix a manually re-uploaded duplicate gets — so they land in the same
+    **Replicate group** by default and error bars across them fall out of
+    the existing replicate-statistics machinery with no extra tagging.
+    Files at the zip's own root all become runs of one sample, named after
+    the zip."""
+    try:
+        zf = zipfile.ZipFile(io.BytesIO(upload.getvalue()))
+    except zipfile.BadZipFile:
+        st.error(f"{upload.name}: not a valid .zip file.")
+        return []
+    total = sum(info.file_size for info in zf.infolist())
+    if total > data_io.MAX_UNCOMPRESSED_BYTES:
+        st.error(
+            f"{upload.name}: zip expands too large; rejected as a possible "
+            "decompression bomb."
+        )
+        return []
+
+    members = [
+        m for m in zf.namelist()
+        if m.lower().endswith((".csv", ".txt", ".xlsx", ".xls"))
+        and "__MACOSX" not in m and not m.rsplit("/", 1)[-1].startswith(".")
+    ]
+    if not members:
+        st.warning(f"{upload.name}: no CSV/Excel files found inside.")
+        return []
+
+    default_sample = upload.name.rsplit(".", 1)[0]
+    series: list[tuple[str, "data_io.LSVData"]] = []
+    skipped = 0
+    for member in sorted(members):
+        parts = member.replace("\\", "/").split("/")
+        sample_name = parts[0] if len(parts) > 1 else default_sample
+        filename = parts[-1]
+        try:
+            raw_bytes = zf.read(member)
+        except Exception:
+            skipped += 1
+            continue
+        try:
+            if filename.lower().endswith((".xlsx", ".xls")):
+                sheets = data_io.list_sheets(io.BytesIO(raw_bytes))
+                ds = data_io.load_lsv_datasets(io.BytesIO(raw_bytes), sheet=sheets[0])
+            else:
+                ds = data_io.load_lsv_datasets(io.BytesIO(raw_bytes), sheet=None)
+        except Exception:
+            skipped += 1
+            continue
+        for d in ds:
+            label = f"{sample_name} · {d.label}" if len(ds) > 1 else sample_name
+            series.append((_dedup_label(label, seen_labels), d))
+
+    if skipped:
+        st.caption(
+            f"↪ {skipped} file(s) inside the zip were skipped (unreadable or "
+            "not a Potential/Current pair)."
+        )
+    return series
+
+
 def _tafel_data_loader() -> list[tuple[str, "data_io.LSVData"]]:
     """File uploader local to the Tafel tab — independent of the main sidebar
-    EIS/LSV loader. Multiple files (different samples/lots) may be uploaded
-    at once; each becomes one or more labelled series so several samples can
-    be combined into one journal-style overlay. Returns a flat list of
-    ``(label, LSVData)``."""
+    EIS/LSV loader. Multiple files (different samples/lots/repeat runs) may
+    be uploaded at once, either individually or batched via a ZIP of a data
+    folder; each becomes one or more labelled series so several samples (and
+    repeat scans of the same sample) can be combined into one journal-style
+    overlay. Returns a flat list of ``(label, LSVData)``."""
     st.markdown(
         "**Data source** (independent of the EIS/LSV loader above) — upload "
-        "one or more files, one per sample; they can be combined into a "
-        "single overlay plot below."
+        "one or more files, one per sample/run; they can be combined into a "
+        "single overlay plot below, or batch-loaded from a ZIP to pull in "
+        "many runs/samples at once (handy for extracting overpotential "
+        "error bars across repeat scans and across samples)."
     )
+
+    series: list[tuple[str, "data_io.LSVData"]] = []
+    seen_labels: dict[str, int] = {}
+
+    with st.expander("📦 Batch upload — a ZIP of a whole data folder"):
+        st.caption(
+            "Zip your data folder (one subfolder per sample, containing its "
+            "repeat-run files — extra nesting inside a sample's subfolder "
+            "is fine) and upload it here. Files sharing a subfolder are "
+            "auto-tagged '(2)', '(3)', … the same way a manually re-"
+            "uploaded duplicate is, so they land in the same **Replicate "
+            "group** below by default. Files at the zip's own root all "
+            "become runs of one sample, named after the zip."
+        )
+        zip_up = st.file_uploader("ZIP file", type=["zip"], key="tafel_zip")
+        if zip_up is not None:
+            zip_series = _tafel_extract_zip_samples(zip_up, seen_labels)
+            if zip_series:
+                st.success(
+                    f"Loaded {len(zip_series)} run(s) from {zip_up.name}: "
+                    + ", ".join(lbl for lbl, _ in zip_series)
+                )
+            series.extend(zip_series)
+
     source = st.radio(
-        "Choose input",
-        ["Upload Excel workbook(s)", "Upload CSV file(s)"],
+        "Additionally upload individual files",
+        ["Excel workbook(s)", "CSV file(s)", "None"],
         horizontal=True,
         key="tafel_source",
         help="Columns: Potential, Current (or current density). Several "
@@ -1208,63 +1364,54 @@ def _tafel_data_loader() -> list[tuple[str, "data_io.LSVData"]]:
              "repeated column pairs.",
     )
 
-    def _dedup(label: str, seen: dict[str, int]) -> str:
-        seen[label] = seen.get(label, 0) + 1
-        return label if seen[label] == 1 else f"{label} ({seen[label]})"
-
-    series: list[tuple[str, "data_io.LSVData"]] = []
-    seen_labels: dict[str, int] = {}
     try:
-        if source == "Upload Excel workbook(s)":
+        if source == "Excel workbook(s)":
             ups = st.file_uploader(
                 "Excel (.xlsx)", type=["xlsx", "xls"], key="tafel_xlsx",
                 accept_multiple_files=True,
             )
-            if not ups:
-                st.info("⬆️ Upload one or more workbooks to begin.")
-                return []
-            first_sheets = data_io.list_sheets(io.BytesIO(ups[0].getvalue()))
-            sheet = st.selectbox(
-                "Sheet (applied to every uploaded workbook)",
-                first_sheets, index=0, key="tafel_sheet",
+            if ups:
+                first_sheets = data_io.list_sheets(io.BytesIO(ups[0].getvalue()))
+                sheet = st.selectbox(
+                    "Sheet (applied to every uploaded workbook)",
+                    first_sheets, index=0, key="tafel_sheet",
+                )
+                for up in ups:
+                    base = up.name.rsplit(".", 1)[0]
+                    try:
+                        sheets_here = data_io.list_sheets(io.BytesIO(up.getvalue()))
+                        use_sheet = sheet if sheet in sheets_here else sheets_here[0]
+                        ds = data_io.load_lsv_datasets(
+                            io.BytesIO(up.getvalue()), sheet=use_sheet
+                        )
+                    except Exception as exc:
+                        st.warning(f"{up.name}: {exc}")
+                        continue
+                    for d in ds:
+                        label = f"{base} · {d.label}" if len(ds) > 1 else base
+                        series.append((_dedup_label(label, seen_labels), d))
+        elif source == "CSV file(s)":
+            ups = st.file_uploader(
+                "CSV (Potential, Current)", type=["csv", "txt"], key="tafel_csv",
+                accept_multiple_files=True,
             )
-            for up in ups:
-                base = up.name.rsplit(".", 1)[0]
-                try:
-                    sheets_here = data_io.list_sheets(io.BytesIO(up.getvalue()))
-                    use_sheet = sheet if sheet in sheets_here else sheets_here[0]
-                    ds = data_io.load_lsv_datasets(
-                        io.BytesIO(up.getvalue()), sheet=use_sheet
-                    )
-                except Exception as exc:
-                    st.warning(f"{up.name}: {exc}")
-                    continue
-                for d in ds:
-                    label = f"{base} · {d.label}" if len(ds) > 1 else base
-                    series.append((_dedup(label, seen_labels), d))
-            return series
-
-        ups = st.file_uploader(
-            "CSV (Potential, Current)", type=["csv", "txt"], key="tafel_csv",
-            accept_multiple_files=True,
-        )
-        if not ups:
-            st.info("⬆️ Upload one or more CSV files to begin.")
-            return []
-        for up in ups:
-            base = up.name.rsplit(".", 1)[0]
-            try:
-                ds = data_io.load_lsv_datasets(io.BytesIO(up.getvalue()), sheet=None)
-            except Exception as exc:
-                st.warning(f"{up.name}: {exc}")
-                continue
-            for d in ds:
-                label = f"{base} · {d.label}" if len(ds) > 1 else base
-                series.append((_dedup(label, seen_labels), d))
-        return series
+            if ups:
+                for up in ups:
+                    base = up.name.rsplit(".", 1)[0]
+                    try:
+                        ds = data_io.load_lsv_datasets(io.BytesIO(up.getvalue()), sheet=None)
+                    except Exception as exc:
+                        st.warning(f"{up.name}: {exc}")
+                        continue
+                    for d in ds:
+                        label = f"{base} · {d.label}" if len(ds) > 1 else base
+                        series.append((_dedup_label(label, seen_labels), d))
     except Exception as exc:
         st.error(f"Could not load data: {exc}")
-        return []
+
+    if not series:
+        st.info("⬆️ Upload one or more files, or a ZIP of a data folder, to begin.")
+    return series
 
 
 # Literature-typical pH for common supporting electrolytes, for the RHE
@@ -1285,7 +1432,14 @@ _ELECTROLYTE_PH_PRESETS: dict[str, float] = {
 }
 
 
-def _render_rhe_conversion(key_prefix: str, default_ph: float = 13.0):
+_RHE_MODES = ["Already vs RHE", "Reference electrode + electrolyte pH",
+              "Direct calibration offset"]
+
+
+def _render_rhe_conversion(key_prefix: str, default_ph: float = 13.0,
+                           default_ref_electrode: str | None = None,
+                           default_electrolyte: str | None = None,
+                           default_mode: str = "Already vs RHE"):
     """Render the "convert to RHE" controls shared by the LSV/K-L/ORR tabs.
 
     Three ways to get there, picked with a radio button:
@@ -1305,10 +1459,10 @@ def _render_rhe_conversion(key_prefix: str, default_ph: float = 13.0):
     Returns a callable ``to_rhe(potential_array) -> ndarray``.
     """
     st.markdown("**Reference electrode → RHE conversion**")
+    mode_idx = _RHE_MODES.index(default_mode) if default_mode in _RHE_MODES else 0
     mode = st.radio(
         "How should potentials be converted to the RHE scale?",
-        ["Already vs RHE", "Reference electrode + electrolyte pH",
-         "Direct calibration offset"],
+        _RHE_MODES, index=mode_idx,
         key=f"{key_prefix}_rhe_mode", horizontal=True,
         help="Use 'Direct calibration offset' if you've measured your "
              "reference electrode against an RHE in your own electrolyte "
@@ -1337,9 +1491,11 @@ def _render_rhe_conversion(key_prefix: str, default_ph: float = 13.0):
 
     rc1, rc2 = st.columns([2, 1])
     ref_names = list(tafel.REFERENCE_ELECTRODES) + ["Custom"]
+    ref_idx = (ref_names.index(default_ref_electrode)
+               if default_ref_electrode in ref_names else 0)
     ref_choice = rc1.selectbox(
         "Reference electrode used for the input data", ref_names,
-        index=0, key=f"{key_prefix}_ref_electrode",
+        index=ref_idx, key=f"{key_prefix}_ref_electrode",
     )
     if ref_choice == "Custom":
         e_ref = rc2.number_input(
@@ -1352,7 +1508,10 @@ def _render_rhe_conversion(key_prefix: str, default_ph: float = 13.0):
 
     pc1, pc2 = st.columns([2, 1])
     electrolyte_names = list(_ELECTROLYTE_PH_PRESETS) + ["Custom"]
-    default_electrolyte_idx = 0
+    default_electrolyte_idx = (
+        electrolyte_names.index(default_electrolyte)
+        if default_electrolyte in electrolyte_names else 0
+    )
     electrolyte_choice = pc1.selectbox(
         "Electrolyte (sets a literature-typical pH — pick Custom to enter "
         "your own or a measured value)",
@@ -1540,6 +1699,12 @@ def render_tafel_tab() -> None:
     if apply_selection:
         st.session_state["_tafel_last_selection_sig"] = sel_sig
 
+    # Reserved now, filled in further down (after the fit-range sliders
+    # below have run and `fits` exists) — this keeps the Original LSV plot
+    # visually above the sliders while the sliders themselves render closer
+    # to the Tafel plot they actually control.
+    lsv_plot_slot = st.container()
+
     fits = []
     with st.expander(
         "🔧 Per-sample Tafel fit range & line color — auto-detected starting "
@@ -1557,7 +1722,18 @@ def render_tafel_tab() -> None:
             cur = cur_scaled / area_cm2 if convert_density else cur_scaled
             log_i = tafel.log_current(cur)
             n = len(pot)
-            a0, a1 = tafel.auto_tafel_range(pot, log_i, current=cur)
+            # Read this sample's reaction choice (if the widget below has
+            # rendered before, on a prior run) so the auto-detected default
+            # range can be capped to a sensible overpotential for that
+            # reaction — falls back to the tab's default reaction the first
+            # time a sample is seen, before its own selectbox exists yet.
+            reaction_for_range = st.session_state.get(
+                f"tafel_reaction_{i}", default_reaction
+            )
+            e_eq_for_range = tafel.REACTION_E_EQ_V_RHE.get(reaction_for_range)
+            a0, a1 = tafel.auto_tafel_range(
+                pot, log_i, current=cur, e_eq=e_eq_for_range
+            )
             range_key = f"tafel_range_{i}"
             if apply_selection:
                 try:
@@ -1623,48 +1799,72 @@ def render_tafel_tab() -> None:
 
     # Original LSV (linear-scale polarization curve), before the log-current
     # Tafel transform — shown for context alongside the derived Tafel plot.
-    st.markdown("**Original LSV (polarization curve)**")
-    d_by_label = {lbl: d for lbl, d in chosen_series}
-    lsv_fig = go.Figure()
-    lsv_plotted: dict[str, list] = {}
-    for meta in fits:
-        d = d_by_label.get(meta["orig_label"])
-        if d is None:
-            continue
-        pot_full = to_rhe_fn(d.potential)
-        cur_full_scaled = _rescale_current(d.current, native_unit, current_unit)
-        cur_full = cur_full_scaled / area_cm2 if convert_density else cur_full_scaled
-        lsv_plotted[f"{meta['label']} — E vs RHE (V)"] = list(pot_full)
-        lsv_plotted[f"{meta['label']} — current ({display_unit})"] = list(cur_full)
-        lsv_fig.add_trace(go.Scatter(
-            x=pot_full, y=cur_full, mode="lines", name=meta["label"],
-            legendgroup=meta["reaction"],
-            line=dict(color=meta["color"], width=3),
-        ))
-    lsv_fig.update_layout(
-        title=dict(text="Original LSV", font=dict(family="Arial", size=font_size)),
-        template="plotly_white", height=460, font=axis_font,
-        legend=dict(x=0.02, y=0.98, xanchor="left", yanchor="top", font=small_font,
-                    bgcolor="rgba(255,255,255,0.7)", bordercolor="black", borderwidth=1,
-                    tracegroupgap=18),
-        margin=dict(l=10, r=10, t=60, b=10),
-    )
-    lsv_fig.update_xaxes(
-        title=dict(text="Potential vs RHE / V", font=dict(family="Arial", size=font_size)),
-        tickfont=dict(family="Arial", size=font_size), **_BOX_AXIS_STYLE,
-    )
-    lsv_fig.update_yaxes(
-        title=dict(text=f"Current ({display_unit})", font=dict(family="Arial", size=font_size)),
-        tickfont=dict(family="Arial", size=font_size), **_BOX_AXIS_STYLE,
-    )
-    st.plotly_chart(
-        lsv_fig, use_container_width=True,
-        config={"edits": {"legendPosition": True}, "displaylogo": False},
-    )
-    figure_downloads(
-        lsv_fig, "original_lsv_plot", key="png_lsv_original",
-        what="LSV plot", data=_padded_frame(lsv_plotted),
-    )
+    # Rendered into the placeholder reserved above the fit-range sliders, so
+    # it stays visually first even though it needs `fits` (built by those
+    # sliders) to know each sample's chosen color/label/reaction.
+    with lsv_plot_slot:
+        st.markdown("**Original LSV (polarization curve)**")
+        d_by_label = {lbl: d for lbl, d in chosen_series}
+
+        # Data extent across all chosen samples — default for the optional
+        # manual potential/current range below (view-only; never cuts data
+        # — see :func:`_range_controls`). Note this covers HER's typically
+        # very negative potentials (well below -0.8 V vs RHE) fine, since
+        # the range is read straight off the real data extent with no
+        # artificial floor.
+        all_pot_full = np.concatenate([to_rhe_fn(d.potential) for d in d_by_label.values()])
+        all_cur_full = np.concatenate([
+            _rescale_current(d.current, native_unit, current_unit) for d in d_by_label.values()
+        ])
+        if convert_density:
+            all_cur_full = all_cur_full / area_cm2
+        lsv_x_lo, lsv_x_hi = float(np.min(all_pot_full)), float(np.max(all_pot_full))
+        lsv_y_lo, lsv_y_hi = float(np.min(all_cur_full)), float(np.max(all_cur_full))
+        lsv_x_range, lsv_y_range = _range_controls(
+            "lsv_orig", "Potential (V)", f"Current ({display_unit})",
+            lsv_x_lo, lsv_x_hi, lsv_y_lo, lsv_y_hi,
+        )
+
+        lsv_fig = go.Figure()
+        lsv_plotted: dict[str, list] = {}
+        for meta in fits:
+            d = d_by_label.get(meta["orig_label"])
+            if d is None:
+                continue
+            pot_full = to_rhe_fn(d.potential)
+            cur_full_scaled = _rescale_current(d.current, native_unit, current_unit)
+            cur_full = cur_full_scaled / area_cm2 if convert_density else cur_full_scaled
+            lsv_plotted[f"{meta['label']} — E vs RHE (V)"] = list(pot_full)
+            lsv_plotted[f"{meta['label']} — current ({display_unit})"] = list(cur_full)
+            lsv_fig.add_trace(go.Scatter(
+                x=pot_full, y=cur_full, mode="lines", name=meta["label"],
+                legendgroup=meta["reaction"],
+                line=dict(color=meta["color"], width=3),
+            ))
+        lsv_fig.update_layout(
+            title=dict(text="Original LSV", font=dict(family="Arial", size=font_size)),
+            template="plotly_white", height=460, font=axis_font,
+            legend=dict(x=0.02, y=0.98, xanchor="left", yanchor="top", font=small_font,
+                        bgcolor="rgba(255,255,255,0.7)", tracegroupgap=18),
+            margin=dict(l=10, r=10, t=60, b=10),
+        )
+        lsv_fig.update_xaxes(
+            title=dict(text="Potential vs RHE / V", font=dict(family="Arial", size=font_size)),
+            tickfont=dict(family="Arial", size=font_size), **_BOX_AXIS_STYLE,
+        )
+        lsv_fig.update_yaxes(
+            title=dict(text=f"Current ({display_unit})", font=dict(family="Arial", size=font_size)),
+            tickfont=dict(family="Arial", size=font_size), **_BOX_AXIS_STYLE,
+        )
+        if lsv_x_range is not None:
+            lsv_fig.update_xaxes(range=lsv_x_range)
+        if lsv_y_range is not None:
+            lsv_fig.update_yaxes(range=lsv_y_range)
+        st.plotly_chart(lsv_fig, use_container_width=True, config=_PLOTLY_EDIT_CONFIG)
+        figure_downloads(
+            lsv_fig, "original_lsv_plot", key="png_lsv_original",
+            what="LSV plot", data=_padded_frame(lsv_plotted),
+        )
 
     results = []
     for f in fits:
@@ -1678,39 +1878,64 @@ def render_tafel_tab() -> None:
         return
 
     st.markdown("**Tafel plot**")
-    st.caption(
-        f"Showing only the data within {vicinity_pct:g}% of each sample's "
-        "fit-region width around its selected linear range (adjust above "
-        "or widen the fit range in the expander if the plot looks too tight)."
-    )
     distinct_reactions = []
     for f, _ in results:
         if f["reaction"] not in distinct_reactions:
             distinct_reactions.append(f["reaction"])
     multi_reaction = len(distinct_reactions) > 1
 
-    fig = go.Figure()
-    tafel_plotted: dict[str, list] = {}
-    for f, r in results:
-        color = f["color"]
+    # vicinity_pct's window around each sample's fit region — used only as
+    # the *default view*, never to drop points from the trace, so nothing
+    # keeps the data itself from being there (the CSV export below, and the
+    # plot once the range is widened, always cover every point).
+    view_x_los, view_x_his, view_y_los, view_y_his = [], [], [], []
+    for f, _ in results:
         start, stop = f["start"], f["stop"]
         n_pts = len(f["log_i"])
         margin = int(round((stop - start) * vicinity_pct / 100.0))
         v0, v1 = max(0, start - margin), min(n_pts, stop + margin)
+        if v1 > v0:
+            view_x_los.append(float(np.min(f["log_i"][v0:v1])))
+            view_x_his.append(float(np.max(f["log_i"][v0:v1])))
+            view_y_los.append(float(np.min(f["potential"][v0:v1])))
+            view_y_his.append(float(np.max(f["potential"][v0:v1])))
+    default_x_lo = min(view_x_los) if view_x_los else 0.0
+    default_x_hi = max(view_x_his) if view_x_his else 1.0
+    default_y_lo = min(view_y_los) if view_y_los else -0.8
+    default_y_hi = max(view_y_his) if view_y_his else 0.8
+    st.caption(
+        f"Default view: within {vicinity_pct:g}% of each sample's fit-region "
+        "width around its selected linear range (adjust the % above, or the "
+        "range below — e.g. HER data commonly needs potentials well below "
+        "-0.8 V vs RHE). No data is ever dropped from the plot or its "
+        "export, only the visible window changes."
+    )
+    tafel_x_range, tafel_y_range = _range_controls(
+        "tafel_plot", "log|i| (X)", "Potential vs RHE / V (Y)",
+        default_x_lo, default_x_hi, default_y_lo, default_y_hi,
+    )
+    if tafel_x_range is None:
+        tafel_x_range = [default_x_lo, default_x_hi]
+    if tafel_y_range is None:
+        tafel_y_range = [default_y_lo, default_y_hi]
+
+    fig = go.Figure()
+    tafel_plotted: dict[str, list] = {}
+    for f, r in results:
+        color = f["color"]
+        n_pts = len(f["log_i"])
         grp = f["reaction"]
-        # Same slices that are drawn, so the CSV reproduces the plot exactly:
-        # the shown points, then the two endpoints of the fitted line.
-        tafel_plotted[f"{f['label']} — log10|i| ({display_unit})"] = \
-            list(f["log_i"][v0:v1])
-        tafel_plotted[f"{f['label']} — E vs RHE (V)"] = \
-            list(f["potential"][v0:v1])
+        # Full per-sample data in the trace — the range controls above set
+        # the default/adjustable *view*, not which points are plotted.
+        tafel_plotted[f"{f['label']} — log10|i| ({display_unit})"] = list(f["log_i"])
+        tafel_plotted[f"{f['label']} — E vs RHE (V)"] = list(f["potential"])
         fig.add_trace(go.Scatter(
-            x=f["log_i"][v0:v1], y=f["potential"][v0:v1], mode="lines+markers",
+            x=f["log_i"], y=f["potential"], mode="lines+markers",
             name=f["label"],
             legendgroup=grp,
             marker=dict(size=10, color=color, opacity=0.55),
             line=dict(color=color, width=1),
-            customdata=[f["orig_label"]] * (v1 - v0),
+            customdata=[f["orig_label"]] * n_pts,
         ))
         xs = f["log_i"][f["start"]:f["stop"]]
         xline = np.array([float(np.min(xs)), float(np.max(xs))])
@@ -1745,21 +1970,23 @@ def render_tafel_tab() -> None:
         height=560,
         font=axis_font,  # baseline (inherited by legend/annotations unless overridden)
         legend=dict(x=0.02, y=0.98, xanchor="left", yanchor="top", font=small_font,
-                    bgcolor="rgba(255,255,255,0.7)", bordercolor="black", borderwidth=1,
-                    tracegroupgap=18),
+                    bgcolor="rgba(255,255,255,0.7)", tracegroupgap=18),
         margin=dict(l=10, r=10, t=60, b=10),
         dragmode="select",
     )
     # Axis titles/ticks are the "axes" text: always the full 28/36 pt Arial.
-    # A sparse tick count (~4-5) keeps a publication-style plot uncluttered.
+    # A sparse tick count (~4-5, via _BOX_AXIS_STYLE) keeps a publication-
+    # style plot uncluttered.
     fig.update_xaxes(
         title=dict(text=f"log₁₀ |Current| ({display_unit})",
                    font=dict(family="Arial", size=font_size)),
-        tickfont=dict(family="Arial", size=font_size), nticks=5, **_BOX_AXIS_STYLE,
+        tickfont=dict(family="Arial", size=font_size), range=tafel_x_range,
+        **_BOX_AXIS_STYLE,
     )
     fig.update_yaxes(
         title=dict(text="Potential vs RHE / V", font=dict(family="Arial", size=font_size)),
-        tickfont=dict(family="Arial", size=font_size), nticks=5, **_BOX_AXIS_STYLE,
+        tickfont=dict(family="Arial", size=font_size), range=tafel_y_range,
+        **_BOX_AXIS_STYLE,
     )
     st.caption(
         "🖱️ Drag a box around a sample's linear region to set its fit range "
@@ -1770,10 +1997,7 @@ def render_tafel_tab() -> None:
     st.plotly_chart(
         fig, use_container_width=True, key="tafel_plot_select",
         on_select="rerun", selection_mode=["box"],
-        config={
-            "edits": {"annotationPosition": True, "legendPosition": True},
-            "displaylogo": False,
-        },
+        config=_PLOTLY_EDIT_CONFIG,
     )
     figure_downloads(
         fig, "tafel_combined_plot", key="png_tafel", what="Tafel plot",
@@ -1892,6 +2116,67 @@ def render_tafel_tab() -> None:
             key="png_tafel_replicate_table", what="Replicate statistics table",
         )
 
+    if len(results) >= 2 and target_js:
+        st.markdown("**Benchmark overpotential comparison**")
+        st.caption(
+            "One bar per replicate group — its mean across repeat runs, "
+            "with an error bar of ±1 SD where more than one run shares "
+            "that group — at each benchmark current density configured "
+            "above (e.g. j = 10 and 2 " + display_unit + ")."
+        )
+        for target_j in target_js:
+            target_cols = [c for c in summary.columns if f"j={target_j:g}" in c]
+            if not target_cols:
+                continue
+            # Different samples may fall under different label conventions
+            # (η vs raw E, depending on whether their reaction has a defined
+            # E_eq) — merge onto one column, since exactly one is populated
+            # per row.
+            values = summary[target_cols[0]].copy()
+            for c in target_cols[1:]:
+                values = values.combine_first(summary[c])
+            bar_df = pd.DataFrame({
+                "Replicate group": summary["Replicate group"], "value": values,
+            }).dropna(subset=["value"])
+            if bar_df.empty:
+                continue
+            grouped = bar_df.groupby("Replicate group", sort=False)["value"]
+            means = grouped.mean()
+            stds = grouped.std(ddof=1).fillna(0.0)
+            ylabel = target_cols[0] if len(target_cols) == 1 else f"Value @ j={target_j:g}"
+            bar_colors = [_PALETTE[i % len(_PALETTE)] for i in range(len(means))]
+            fig_bar = go.Figure(go.Bar(
+                x=list(means.index), y=means.to_numpy(),
+                error_y=dict(type="data", array=stds.to_numpy(), visible=True),
+                marker=dict(color=bar_colors),
+            ))
+            fig_bar.update_layout(
+                title=dict(text=f"Benchmark @ j = {target_j:g} {display_unit}",
+                           font=dict(family="Arial", size=font_size)),
+                template="plotly_white", height=420,
+                font=dict(family="Arial", size=font_size),
+                margin=dict(l=10, r=10, t=60, b=10),
+            )
+            fig_bar.update_xaxes(
+                title=dict(text="Replicate group", font=dict(family="Arial", size=font_size)),
+                tickfont=dict(family="Arial", size=font_size), **_BOX_AXIS_STYLE,
+            )
+            fig_bar.update_yaxes(
+                title=dict(text=ylabel, font=dict(family="Arial", size=font_size)),
+                tickfont=dict(family="Arial", size=font_size), **_BOX_AXIS_STYLE,
+            )
+            st.plotly_chart(fig_bar, use_container_width=True, config=_PLOTLY_EDIT_CONFIG)
+            figure_downloads(
+                fig_bar, f"overpotential_bar_j{target_j:g}",
+                key=f"png_tafel_bar_{target_j:g}",
+                what=f"Benchmark overpotential bar chart @ j={target_j:g}",
+                data=_padded_frame({
+                    "Replicate group": list(means.index),
+                    "Mean": list(means.to_numpy()),
+                    "SD": list(stds.to_numpy()),
+                }),
+            )
+
     st.markdown("**Analysis**")
     for rxn in distinct_reactions:
         entries = [
@@ -1921,7 +2206,7 @@ def render_kl_tab() -> None:
         "does not use data loaded elsewhere."
     )
 
-    samples = _orr_data_loader(
+    samples, unit_hint = _orr_data_loader(
         key_prefix="kl",
         file_help="Disk/working-electrode current file(s) for this sample "
                   "— one file per rotation rate",
@@ -1947,7 +2232,7 @@ def render_kl_tab() -> None:
         _journal_axes_style(fig, xtitle, ytitle, font_size)
 
     st.markdown("**Current unit & electrode area**")
-    cur1, cur2, cur3 = st.columns(3)
+    cur1, cur2, cur3, cur4 = st.columns(4)
     convert_density = cur1.checkbox(
         "Convert to current density (÷ area)", value=True,
         key="kl_convert_density",
@@ -1955,16 +2240,30 @@ def render_kl_tab() -> None:
              "mA, µA); enable to normalize by the electrode's geometric "
              "area for a comparable current density.",
     )
-    current_unit = cur2.selectbox(
-        "Current unit as uploaded", ["A"] + _ABS_CURRENT_UNITS, index=0,
-        key="kl_current_unit",
+    _kl_unit_default = (
+        _ABS_CURRENT_UNITS.index(unit_hint) if unit_hint in _ABS_CURRENT_UNITS
+        else _ABS_CURRENT_UNITS.index("A")
     )
-    area_cm2 = cur3.number_input(
+    current_unit = cur2.selectbox(
+        "Current unit as uploaded", _ABS_CURRENT_UNITS, index=_kl_unit_default,
+        key="kl_current_unit",
+        help="Auto-detected from the file's column header when recognisable "
+             "(RDE exports are often in A) — override if it's wrong.",
+    )
+    desired_unit = cur3.selectbox(
+        "Desired current unit", _ABS_CURRENT_UNITS,
+        index=_ABS_CURRENT_UNITS.index(current_unit), key="kl_desired_unit",
+        help="Values are rescaled from 'as uploaded' to this unit before "
+             "any density conversion below.",
+    )
+    area_cm2 = cur4.number_input(
         "Electrode area (cm²)", min_value=1e-4, value=0.196, step=0.001,
         format="%.4f", key="kl_area_cm2",
         help="0.196 cm² is the standard 5 mm-diameter RDE glassy-carbon disk.",
     ) if convert_density else None
-    display_unit = f"{current_unit}/cm²" if convert_density else current_unit
+    display_unit = f"{desired_unit}/cm²" if convert_density else desired_unit
+    if unit_hint:
+        st.caption(f"ℹ️ Detected current unit from the column header: **{unit_hint}**.")
 
     to_rhe_fn = _render_rhe_conversion("kl", default_ph=13.0)
 
@@ -2002,7 +2301,9 @@ def render_kl_tab() -> None:
         )
 
     pot_rhe = to_rhe_fn(df["potential"].to_numpy(dtype=float))
-    disk = df["disk_current"].to_numpy(dtype=float)
+    disk = _rescale_current(
+        df["disk_current"].to_numpy(dtype=float), current_unit, desired_unit
+    )
     disk = disk / area_cm2 if convert_density else disk
     rpm_arr = df["rpm"].to_numpy(dtype=float)
     rpm_values = sorted(set(rpm_arr.tolist()))
@@ -2026,7 +2327,7 @@ def render_kl_tab() -> None:
             line=dict(color=_PALETTE[i % len(_PALETTE)], width=2.5),
         ))
     _style_axes(fig_rde, "Potential vs RHE / V", f"Disk current ({display_unit})")
-    st.plotly_chart(fig_rde, use_container_width=True)
+    st.plotly_chart(fig_rde, use_container_width=True, config=_PLOTLY_EDIT_CONFIG)
     rde_cols = {}
     for rv, (p, j) in curves.items():
         rde_cols[f"{rv:g}rpm — Potential vs RHE (V)"] = list(p)
@@ -2111,7 +2412,7 @@ def render_kl_tab() -> None:
         return
 
     _style_axes(fig_kl, "1 / √ω (s¹ᐟ²/rad¹ᐟ²)", f"1 / j ({display_unit}⁻¹)")
-    st.plotly_chart(fig_kl, use_container_width=True)
+    st.plotly_chart(fig_kl, use_container_width=True, config=_PLOTLY_EDIT_CONFIG)
     figure_downloads(
         fig_kl, f"kl_plot_{active_label}", key="png_kl_plot",
         what="Koutecky–Levich plot", data=_padded_frame(kl_data),
@@ -2160,6 +2461,26 @@ def _orr_numeric_columns(df: pd.DataFrame) -> tuple[pd.DataFrame, list]:
     coerced = df.apply(lambda s: pd.to_numeric(s, errors="coerce"))
     cols = [c for c in coerced.columns if coerced[c].notna().any()]
     return coerced, cols
+
+
+def _guess_current_unit_from_cols(cols: list) -> str | None:
+    """Guess a current unit (e.g. ``"mA"``, ``"A/cm²"``) from raw column
+    headers — the same header-sniffing :func:`_detect_units` does for the
+    Tafel tab's column labels — so the K-L/ORR "Current unit as uploaded"
+    picker can default to what the file actually says instead of always
+    assuming A."""
+    lowered = {c: str(c).strip().lower() for c in cols}
+    pot_col = next(
+        (c for c, name in lowered.items() if any(h in name for h in _ORR_POT_HINTS)),
+        None,
+    )
+    for c in cols:
+        if c == pot_col:
+            continue
+        unit = _detect_units("", str(c))[0]
+        if unit:
+            return unit
+    return None
 
 
 def _orr_read_file(up, key_prefix: str = "orr") -> pd.DataFrame | None:
@@ -2265,7 +2586,7 @@ def _orr_table_to_entry(
 
 def _orr_extract_zip_samples(
     upload, key_prefix: str = "orr",
-) -> list[tuple[str, pd.DataFrame]]:
+) -> tuple[list[tuple[str, pd.DataFrame]], str | None]:
     """Batch-load RRDE files from a ZIP of a data folder (or several sample
     folders zipped together) — for pasting in a whole export at once instead
     of picking files one by one. Files are grouped into one sample per
@@ -2275,20 +2596,23 @@ def _orr_extract_zip_samples(
     names its exports (e.g. ``Disk Current vs Disk Potential (1600
     RPM).csv``) — there is no per-file tagging UI here, since a batch upload
     may contain many files; use the per-sample uploaders above instead if a
-    file needs correcting by hand.
+    file needs correcting by hand. Also returns a current-unit guess sniffed
+    from the first readable file's column headers (see
+    :func:`_guess_current_unit_from_cols`), or ``None`` if nothing recognisable
+    was found.
     """
     try:
         zf = zipfile.ZipFile(io.BytesIO(upload.getvalue()))
     except zipfile.BadZipFile:
         st.error(f"{upload.name}: not a valid .zip file.")
-        return []
+        return [], None
     total = sum(info.file_size for info in zf.infolist())
     if total > data_io.MAX_UNCOMPRESSED_BYTES:
         st.error(
             f"{upload.name}: zip expands too large; rejected as a possible "
             "decompression bomb."
         )
-        return []
+        return [], None
 
     members = [
         m for m in zf.namelist()
@@ -2297,11 +2621,12 @@ def _orr_extract_zip_samples(
     ]
     if not members:
         st.warning(f"{upload.name}: no CSV/Excel files found inside.")
-        return []
+        return [], None
 
     default_sample = upload.name.rsplit(".", 1)[0]
     grouped: dict[str, list] = {}
     skipped = 0
+    unit_hint = None
     for member in members:
         parts = member.replace("\\", "/").split("/")
         sample_name = parts[0] if len(parts) > 1 else default_sample
@@ -2324,6 +2649,8 @@ def _orr_extract_zip_samples(
         if len(cols) < 2:
             skipped += 1
             continue
+        if unit_hint is None:
+            unit_hint = _guess_current_unit_from_cols(cols)
         rpm_val = _guess_rpm_from_filename(filename) or 1600.0
         entry = _orr_table_to_entry(coerced, cols, filename, rpm_val)
         if entry is None:
@@ -2342,13 +2669,13 @@ def _orr_extract_zip_samples(
         df = _orr_merge_entries(entries, sample_name)
         if df is not None:
             samples.append((sample_name, df))
-    return samples
+    return samples, unit_hint
 
 
 def _orr_data_loader(
     key_prefix: str = "orr",
     file_help: str = "Disk/ring current file(s) for this sample",
-) -> list[tuple[str, pd.DataFrame]]:
+) -> tuple[list[tuple[str, pd.DataFrame]], str | None]:
     """File uploader local to the calling tab — independent of the other
     tabs. Two ways to load data, usable together:
 
@@ -2371,7 +2698,8 @@ def _orr_data_loader(
 
     Returns a list of ``(sample_name, dataframe)``, each dataframe having
     columns ``potential``, ``disk_current``, ``ring_current`` (if present),
-    ``rpm``.
+    ``rpm``, plus a current-unit guess sniffed from the first file's column
+    headers (see :func:`_guess_current_unit_from_cols`), or ``None``.
     """
     st.markdown(
         "**Data source** (independent of the other tabs) — for each sample, "
@@ -2384,6 +2712,7 @@ def _orr_data_loader(
     )
 
     samples: list[tuple[str, pd.DataFrame]] = []
+    unit_hint: str | None = None
 
     with st.expander("📦 Batch upload — a ZIP of a whole data folder"):
         st.caption(
@@ -2399,13 +2728,15 @@ def _orr_data_loader(
             "ZIP file", type=["zip"], key=f"{key_prefix}_zip",
         )
         if zip_up is not None:
-            zip_samples = _orr_extract_zip_samples(zip_up, key_prefix=key_prefix)
+            zip_samples, zip_unit_hint = _orr_extract_zip_samples(zip_up, key_prefix=key_prefix)
             if zip_samples:
                 st.success(
                     f"Loaded {len(zip_samples)} sample(s) from {zip_up.name}: "
                     + ", ".join(lbl for lbl, _ in zip_samples)
                 )
             samples.extend(zip_samples)
+            if unit_hint is None:
+                unit_hint = zip_unit_hint
 
     n_samples = st.number_input(
         "Number of additional samples to load individually", min_value=0,
@@ -2436,6 +2767,8 @@ def _orr_data_loader(
                 if len(cols) < 2:
                     st.warning(f"{up.name}: fewer than 2 numeric columns, skipped.")
                     continue
+                if unit_hint is None:
+                    unit_hint = _guess_current_unit_from_cols(cols)
                 rpm_guess = _guess_rpm_from_filename(up.name) or 1600.0
 
                 if len(cols) >= 4:
@@ -2467,7 +2800,7 @@ def _orr_data_loader(
             df = _orr_merge_entries(entries, sample_name)
             if df is not None:
                 samples.append((sample_name, df))
-    return samples
+    return samples, unit_hint
 
 
 def render_orr_tab() -> None:
@@ -2483,7 +2816,7 @@ def render_orr_tab() -> None:
         "own file upload and does not use data loaded elsewhere."
     )
 
-    samples = _orr_data_loader()
+    samples, unit_hint = _orr_data_loader()
     if not samples:
         return
 
@@ -2501,7 +2834,7 @@ def render_orr_tab() -> None:
     )
 
     st.markdown("**Current unit, electrode area & collection efficiency**")
-    cur1, cur2, cur3, cur4 = st.columns(4)
+    cur1, cur2, cur3, cur4, cur5 = st.columns(5)
     convert_density = cur1.checkbox(
         "Convert to current density (÷ area)", value=True,
         key="orr_convert_density",
@@ -2509,17 +2842,29 @@ def render_orr_tab() -> None:
              "mA, µA); enable to normalize by the electrode's geometric "
              "area for a comparable current density.",
     )
-    current_unit = cur2.selectbox(
-        "Current unit as uploaded", ["A"] + _ABS_CURRENT_UNITS, index=0,
-        key="orr_current_unit",
+    _orr_unit_default = (
+        _ABS_CURRENT_UNITS.index(unit_hint) if unit_hint in _ABS_CURRENT_UNITS
+        else _ABS_CURRENT_UNITS.index("A")
     )
-    area_cm2 = cur3.number_input(
+    current_unit = cur2.selectbox(
+        "Current unit as uploaded", _ABS_CURRENT_UNITS, index=_orr_unit_default,
+        key="orr_current_unit",
+        help="Auto-detected from the file's column header when recognisable "
+             "(RRDE exports are often in A) — override if it's wrong.",
+    )
+    desired_unit = cur3.selectbox(
+        "Desired current unit", _ABS_CURRENT_UNITS,
+        index=_ABS_CURRENT_UNITS.index(current_unit), key="orr_desired_unit",
+        help="Values are rescaled from 'as uploaded' to this unit before "
+             "any density conversion below.",
+    )
+    area_cm2 = cur4.number_input(
         "Electrode area (cm²)", min_value=1e-4, value=0.196, step=0.001,
         format="%.4f", key="orr_area_cm2",
         help="0.196 cm² is the standard 5 mm-diameter RRDE glassy-carbon disk.",
     ) if convert_density else None
-    display_unit = f"{current_unit}/cm²" if convert_density else current_unit
-    collection_efficiency = cur4.number_input(
+    display_unit = f"{desired_unit}/cm²" if convert_density else desired_unit
+    collection_efficiency = cur5.number_input(
         "Ring collection efficiency N", min_value=0.01, max_value=1.0,
         value=0.37, step=0.01, format="%.2f", key="orr_collection_efficiency",
         help="From the RRDE electrode's own calibration (e.g. a "
@@ -2527,8 +2872,14 @@ def render_orr_tab() -> None:
              "Pt-ring/glassy-carbon-disk default. Only used where ring "
              "current is available.",
     )
+    if unit_hint:
+        st.caption(f"ℹ️ Detected current unit from the column header: **{unit_hint}**.")
 
-    to_rhe_fn = _render_rhe_conversion("orr", default_ph=13.0)
+    to_rhe_fn = _render_rhe_conversion(
+        "orr", default_ph=13.0,
+        default_ref_electrode="Hg/HgO, 1 M NaOH", default_electrolyte="0.1 M KOH",
+        default_mode="Reference electrode + electrolyte pH",
+    )
 
     # Prepare each sample's full (all-rotation-rate) data once: RHE
     # potential, disk/ring current density, and its own set of available
@@ -2537,12 +2888,16 @@ def render_orr_tab() -> None:
     all_rpms: set[float] = set()
     for lbl, df in chosen_samples.items():
         pot_rhe = to_rhe_fn(df["potential"].to_numpy(dtype=float))
-        disk = df["disk_current"].to_numpy(dtype=float)
+        disk = _rescale_current(
+            df["disk_current"].to_numpy(dtype=float), current_unit, desired_unit
+        )
         disk = disk / area_cm2 if convert_density else disk
         has_ring = "ring_current" in df.columns
         ring = None
         if has_ring:
-            ring = df["ring_current"].to_numpy(dtype=float)
+            ring = _rescale_current(
+                df["ring_current"].to_numpy(dtype=float), current_unit, desired_unit
+            )
             ring = ring / area_cm2 if convert_density else ring
         rpm_arr = df["rpm"].to_numpy(dtype=float)
         rpm_values = sorted(set(rpm_arr.tolist()))
@@ -2594,23 +2949,170 @@ def render_orr_tab() -> None:
     def _style_axes(fig, xtitle, ytitle, yrange=None):
         _journal_axes_style(fig, xtitle, ytitle, font_size, yrange=yrange)
 
-    # ---- Disk polarization curve, all chosen samples overlaid ------------
-    st.markdown(f"**Disk polarization curve @ ~{primary_rpm:g} rpm**")
-    fig_disk = go.Figure()
-    for lbl, s in slices.items():
-        fig_disk.add_trace(go.Scatter(
-            x=s["potential"], y=s["disk"], mode="lines", name=lbl,
-            line=dict(color=palette_for[lbl], width=3),
-        ))
-    _style_axes(fig_disk, "Potential vs RHE / V", f"Disk current ({display_unit})")
-    st.plotly_chart(fig_disk, use_container_width=True)
-    disk_data = _padded_frame({
-        **{f"{lbl} — Potential vs RHE (V)": list(s["potential"]) for lbl, s in slices.items()},
-        **{f"{lbl} — Disk current ({display_unit})": list(s["disk"]) for lbl, s in slices.items()},
-    })
+    def _zero_anchored_range(values: np.ndarray) -> list:
+        """Default Y range anchored at 0, extending only in the direction
+        the data actually goes (e.g. disk current runs negative/cathodic,
+        ring current runs positive/anodic) — matches the standard RRDE
+        convention instead of Plotly's own auto-range, which pads both
+        ends around the data's min/max and generally won't include 0."""
+        vmax, vmin = float(np.max(values)), float(np.min(values))
+        if abs(vmax) >= abs(vmin):
+            return [0.0, vmax * 1.05 if vmax > 0 else vmax * 0.95]
+        return [vmin * 1.05 if vmin < 0 else vmin * 0.95, 0.0]
+
+    # ---- Disk (& ring) polarization curve, all chosen samples overlaid ---
+    has_any_ring = any(s["has_ring"] for s in slices.values())
+    title = "Disk & ring polarization curves" if has_any_ring else "Disk polarization curve"
+    st.markdown(f"**{title} @ ~{primary_rpm:g} rpm**")
+    all_pot_disk = np.concatenate([s["potential"] for s in slices.values()])
+    all_disk_cur = np.concatenate([s["disk"] for s in slices.values()])
+    disk_data: dict[str, list] = {}
+    ring_y_range = None
+    if has_any_ring:
+        # X (potential) range applies to both panels — they share one axis.
+        # Disk/ring current each keep their own independent Y range control
+        # below, since the two are usually very different magnitudes.
+        disk_x_range, _ = _range_controls(
+            "orr_disk", "Potential (V)", None,
+            float(np.min(all_pot_disk)), float(np.max(all_pot_disk)),
+        )
+        all_ring_cur = np.concatenate([s["ring"] for s in slices.values() if s["has_ring"]])
+        _, ring_y_range = _range_controls(
+            "orr_ring_y", "Potential (V)", f"Ring current ({display_unit})",
+            float(np.min(all_pot_disk)), float(np.max(all_pot_disk)),
+            float(np.min(all_ring_cur)), float(np.max(all_ring_cur)),
+        )
+        _, disk_y_range = _range_controls(
+            "orr_disk_y", "Potential (V)", f"Disk current ({display_unit})",
+            float(np.min(all_pot_disk)), float(np.max(all_pot_disk)),
+            float(np.min(all_disk_cur)), float(np.max(all_disk_cur)),
+        )
+        # Ring on top, disk below — separate sub-plots (not one shared-axis
+        # overlay), each with its own Y scale, merged into one figure on a
+        # shared X axis (explicitly matched, not just visually adjacent) so
+        # panning/zooming one keeps both in sync. Tight spacing so the two
+        # panels read as one merged figure (the seam-line thickness itself
+        # is fixed below by disabling just one side's mirror, not by
+        # widening the gap).
+        fig_disk = make_subplots(
+            rows=2, cols=1, shared_xaxes=True, vertical_spacing=0.025,
+            subplot_titles=("Ring", "Disk"),
+        )
+        for lbl, s in slices.items():
+            color = palette_for[lbl]
+            if s["has_ring"]:
+                fig_disk.add_trace(go.Scatter(
+                    x=s["potential"], y=s["ring"], mode="lines", name=lbl,
+                    legendgroup=lbl, line=dict(color=color, width=3),
+                ), row=1, col=1)
+                disk_data[f"{lbl} — Ring current ({display_unit})"] = list(s["ring"])
+            fig_disk.add_trace(go.Scatter(
+                x=s["potential"], y=s["disk"], mode="lines", name=lbl,
+                legendgroup=lbl, showlegend=not s["has_ring"],
+                line=dict(color=color, width=3),
+            ), row=2, col=1)
+            disk_data[f"{lbl} — Potential vs RHE (V)"] = list(s["potential"])
+            disk_data[f"{lbl} — Disk current ({display_unit})"] = list(s["disk"])
+        axis_font_disk = dict(family="Arial", size=font_size)
+        # Room for the tick numbers (which can run wide at the 36 pt export
+        # size, e.g. "-10.000") plus the rotated title beyond them — a fixed
+        # margin sized for the worst case, since automargin was what caused
+        # the right border to clip when the legend was dragged inside the
+        # plot (see note below).
+        left_margin = 160 + (font_size - 28) * 4
+        fig_disk.update_layout(
+            template="plotly_white", height=680, width=930, font=axis_font_disk,
+            margin=dict(l=left_margin, r=40),
+        )
+        fig_disk.update_xaxes(
+            title=dict(text="Potential vs RHE / V", font=axis_font_disk),
+            tickfont=axis_font_disk, row=2, col=1,
+        )
+        # One common Y-axis title spanning both rows (no separate "Ring"/
+        # "Disk" tag on the axis itself — that distinction is already in
+        # the subplot titles and legend) — added as a single rotated
+        # annotation rather than per-row titles, which also keeps both
+        # rows' plot areas the same width (a real per-row title can throw
+        # off automargin sizing between rows and misalign the shared X axis).
+        # The fixed left margin above is sized generously for the 28/36 pt
+        # export font instead of using automargin — automargin recomputes
+        # the plot domain on every client-side relayout (e.g. dragging the
+        # legend inside the plot), which was clipping the right-hand
+        # mirrored border when it fired.
+        fig_disk.add_annotation(
+            x=0, y=0.5, xref="paper", yref="paper",
+            xanchor="center", yanchor="middle", textangle=-90,
+            text=f"Current density ({display_unit})", showarrow=False,
+            font=axis_font_disk, xshift=-(left_margin - 30),
+        )
+        fig_disk.update_yaxes(tickfont=axis_font_disk, row=1, col=1)
+        fig_disk.update_yaxes(tickfont=axis_font_disk, row=2, col=1)
+        fig_disk.update_xaxes(**_BOX_AXIS_STYLE)
+        fig_disk.update_yaxes(**_BOX_AXIS_STYLE)
+        # An x-axis line is always drawn on its own (bottom) side, and
+        # _BOX_AXIS_STYLE's mirror=True adds the opposite (top) side too —
+        # so at the seam there are naturally two lines: row 1's own bottom
+        # line, and row 2's *mirrored* top line sitting right against it,
+        # which read as one over-thick line. Turning off just row 2's
+        # mirror leaves exactly one normal-thickness line at the seam
+        # (row 1's), while row 1's own mirror still closes the box on the
+        # outer top edge and row 2's own bottom line closes it on the
+        # outer bottom edge.
+        fig_disk.update_xaxes(mirror=False, row=2, col=1)
+        # Explicitly force both rows' X axes to the same range together
+        # (belt-and-braces on top of shared_xaxes) so they're never just
+        # visually similar but a genuinely single, merged X axis.
+        fig_disk.update_xaxes(matches="x")
+        if disk_x_range is not None:
+            fig_disk.update_xaxes(range=disk_x_range)
+        final_ring_range = (
+            ring_y_range if ring_y_range is not None else _zero_anchored_range(all_ring_cur)
+        )
+        final_disk_range = (
+            disk_y_range if disk_y_range is not None else _zero_anchored_range(all_disk_cur)
+        )
+        fig_disk.update_yaxes(range=final_ring_range, row=1, col=1)
+        fig_disk.update_yaxes(range=final_disk_range, row=2, col=1)
+        # Both ranges are zero-anchored, so "0" sits right at the seam on
+        # both axes and would otherwise be printed twice, one on top of the
+        # other. Keep it only on the disk (bottom) axis — the one right
+        # next to the shared X-axis labels — and drop it from ring's ticks.
+        ring_span = abs(final_ring_range[1] - final_ring_range[0])
+        ring_ticks = [
+            t for t in np.linspace(final_ring_range[0], final_ring_range[1], 5)
+            if not np.isclose(t, 0, atol=max(ring_span, 1e-9) * 1e-6)
+        ]
+        fig_disk.update_yaxes(tickvals=ring_ticks, tickformat=".2~f", row=1, col=1)
+    else:
+        disk_x_range, disk_y_range = _range_controls(
+            "orr_disk", "Potential (V)", f"Disk current ({display_unit})",
+            float(np.min(all_pot_disk)), float(np.max(all_pot_disk)),
+            float(np.min(all_disk_cur)), float(np.max(all_disk_cur)),
+        )
+        fig_disk = go.Figure()
+        for lbl, s in slices.items():
+            fig_disk.add_trace(go.Scatter(
+                x=s["potential"], y=s["disk"], mode="lines", name=lbl,
+                line=dict(color=palette_for[lbl], width=3),
+            ))
+            disk_data[f"{lbl} — Potential vs RHE (V)"] = list(s["potential"])
+            disk_data[f"{lbl} — Disk current ({display_unit})"] = list(s["disk"])
+        _style_axes(fig_disk, "Potential vs RHE / V", f"Disk current ({display_unit})")
+        if disk_x_range is not None:
+            fig_disk.update_xaxes(range=disk_x_range)
+        fig_disk.update_yaxes(
+            range=disk_y_range if disk_y_range is not None else _zero_anchored_range(all_disk_cur)
+        )
+    # The merged ring/disk figure sets its own (narrower, journal-style)
+    # width above — stretching it to the full container width was what
+    # left too little room for the rotated axis title against the tick
+    # numbers at larger export font sizes.
+    st.plotly_chart(
+        fig_disk, use_container_width=not has_any_ring, config=_PLOTLY_EDIT_CONFIG
+    )
     figure_downloads(
         fig_disk, f"orr_disk_curve_{int(primary_rpm)}rpm", key="png_orr_disk",
-        what="Disk curve", data=disk_data,
+        what=title, data=_padded_frame(disk_data),
     )
 
     # ---- Per-sample onset / E1/2 / Tafel ----------------------------------
@@ -2620,10 +3122,35 @@ def render_orr_tab() -> None:
         "near the kinetic (low-overpotential) region of its mass-transport-"
         "corrected current."
     )
+    ehw_method = "steepest"
+    ehw1, ehw2 = st.columns(2)
+    ehw_lo = ehw1.number_input(
+        "E½ search window min (V vs RHE)", value=0.4, step=0.05, format="%.2f",
+        key="orr_ehw_lo",
+        help="E1/2 is picked as the steepest point of the disk curve "
+             "(max |dI/dE|) within this window — scientifically typical "
+             "for ORR (~0.4-0.8 V vs RHE, non-precious-metal to good Pt-"
+             "group catalysts) — rather than anywhere past onset, which can "
+             "otherwise lock onto a sharp artifact right at onset itself. "
+             "Widen if your catalyst's E1/2 genuinely falls outside this "
+             "range.",
+    )
+    ehw_hi = ehw2.number_input(
+        "E½ search window max (V vs RHE)", value=0.8, step=0.05, format="%.2f",
+        key="orr_ehw_hi",
+    )
     results_rows = []
+    tafel_slider_specs = []  # (lbl, range_key, default_range, n_pts) — sliders
+    # actually render further down, right above the Tafel plot they control
+    # (see below); here we only need each one's *current* value (from
+    # session_state, same as what the slider will show once it renders), so
+    # the table below and this loop's Tafel fit stay in sync with it.
     for lbl, s in slices.items():
         try:
-            onset_res = orr.onset_and_half_wave(s["potential"], s["disk"])
+            onset_res = orr.onset_and_half_wave(
+                s["potential"], s["disk"], half_wave_search_range=(ehw_lo, ehw_hi),
+                method=ehw_method,
+            )
         except ValueError as exc:
             st.warning(f"{lbl}: could not locate onset/E½ ({exc}).")
             continue
@@ -2640,14 +3167,14 @@ def render_orr_tab() -> None:
         if valid.sum() >= 5:
             pot_tafel = s["potential"][valid]
             log_jk = tafel.log_current(jk[valid])
-            a0, a1 = tafel.auto_tafel_range(pot_tafel, log_jk, current=jk[valid])
-            range_key = f"orr_tafel_range_{lbl}"
-            slider_kwargs = ({} if range_key in st.session_state
-                             else {"value": (int(a0), int(a1))})
-            start, stop = st.slider(
-                f"{lbl} — Tafel fit range (index)", 0, len(pot_tafel),
-                key=range_key, **slider_kwargs,
+            a0, a1 = tafel.auto_tafel_range(
+                pot_tafel, log_jk, current=jk[valid],
+                e_eq=tafel.REACTION_E_EQ_V_RHE.get("ORR"),
             )
+            range_key = f"orr_tafel_range_{lbl}"
+            default_range = (int(a0), int(a1))
+            start, stop = st.session_state.get(range_key, default_range)
+            tafel_slider_specs.append((lbl, range_key, default_range, len(pot_tafel)))
             try:
                 tafel_result = tafel.fit_tafel(pot_tafel, log_jk, start, stop)
             except ValueError as exc:
@@ -2672,6 +3199,64 @@ def render_orr_tab() -> None:
         s["tafel"] = tafel_result
         s["jk"] = jk
         s["jk_valid"] = valid
+        s["deriv_pot"], s["deriv"] = orr.half_wave_derivative(s["potential"], s["disk"])
+
+    onset_samples = {lbl: s for lbl, s in slices.items() if s.get("onset") is not None}
+    if onset_samples:
+        st.markdown("**E½ verification (dI/dE)**")
+        st.caption(
+            "The dashed vertical line is the E½ reported above (the "
+            "steepest point, i.e. max |dI/dE|, within the search window) — "
+            "it should sit at this curve's peak. Potential axis matches "
+            "whatever range you set on the disk & ring plot above."
+        )
+        fig_deriv = go.Figure()
+        deriv_data: dict[str, list] = {}
+        for lbl, s in onset_samples.items():
+            color = palette_for[lbl]
+            fig_deriv.add_trace(go.Scatter(
+                x=s["deriv_pot"], y=s["deriv"], mode="lines", name=lbl,
+                line=dict(color=color, width=2.5),
+            ))
+            e_half = s["onset"].half_wave_potential
+            # np.interp needs ascending x — deriv_pot may be descending
+            # (e.g. a cathodic ORR sweep), which would otherwise silently
+            # return a near-constant edge value regardless of e_half.
+            order = np.argsort(s["deriv_pot"])
+            deriv_at_half = float(np.interp(e_half, s["deriv_pot"][order], s["deriv"][order]))
+            fig_deriv.add_trace(go.Scatter(
+                x=[e_half], y=[deriv_at_half], mode="markers", showlegend=False,
+                marker=dict(size=11, color=_darken(color), symbol="circle"),
+            ))
+            fig_deriv.add_vline(
+                x=e_half, line=dict(color=_darken(color), width=1.5, dash="dash"),
+            )
+            deriv_data[f"{lbl} — Potential vs RHE (V)"] = list(s["deriv_pot"])
+            deriv_data[f"{lbl} — dI/dE"] = list(s["deriv"])
+        _style_axes(fig_deriv, "Potential vs RHE / V", f"dI/dE ({display_unit}/V)")
+        if disk_x_range is not None:
+            fig_deriv.update_xaxes(range=disk_x_range)
+        # Y range from the 1st-99th percentile (within the visible X window)
+        # rather than the strict min/max — a lone noise spike (differentiation
+        # amplifies noise a lot) can otherwise dominate the auto-range and
+        # squash the actual inflection peak down to where it's hard to see.
+        deriv_in_view = []
+        for s in onset_samples.values():
+            mask = (
+                (s["deriv_pot"] >= disk_x_range[0]) & (s["deriv_pot"] <= disk_x_range[1])
+                if disk_x_range is not None else np.ones_like(s["deriv_pot"], dtype=bool)
+            )
+            if mask.any():
+                deriv_in_view.append(s["deriv"][mask])
+        if deriv_in_view:
+            y_lo, y_hi = np.percentile(np.concatenate(deriv_in_view), [1, 99])
+            pad = (y_hi - y_lo) * 0.15 or abs(y_hi) * 0.15 or 1.0
+            fig_deriv.update_yaxes(range=[y_lo - pad, y_hi + pad])
+        st.plotly_chart(fig_deriv, use_container_width=True, config=_PLOTLY_EDIT_CONFIG)
+        figure_downloads(
+            fig_deriv, f"orr_derivative_{int(primary_rpm)}rpm", key="png_orr_deriv",
+            what="dI/dE derivative plot", data=_padded_frame(deriv_data),
+        )
 
     if results_rows:
         summary_df = pd.DataFrame(results_rows)
@@ -2687,10 +3272,34 @@ def render_orr_tab() -> None:
             key="png_orr_table",
         )
 
+    if tafel_slider_specs:
+        st.markdown(
+            "**Tafel fit range** (per sample — feeds the mass-transport-"
+            "corrected Tafel plot right below)"
+        )
+        for lbl, range_key, default_range, n_pts_tafel in tafel_slider_specs:
+            slider_kwargs = ({} if range_key in st.session_state
+                             else {"value": default_range})
+            st.slider(
+                f"{lbl} — Tafel fit range (index)", 0, n_pts_tafel,
+                key=range_key, **slider_kwargs,
+            )
+
     # ---- Tafel plot, all chosen samples overlaid --------------------------
     tafel_samples = {lbl: s for lbl, s in slices.items() if s.get("tafel") is not None}
     if tafel_samples:
         st.markdown("**Tafel plot (mass-transport corrected)**")
+        all_logjk = np.concatenate([
+            tafel.log_current(s["jk"][s["jk_valid"]]) for s in tafel_samples.values()
+        ])
+        all_pot_tafel = np.concatenate([
+            s["potential"][s["jk_valid"]] for s in tafel_samples.values()
+        ])
+        orr_tafel_x_range, orr_tafel_y_range = _range_controls(
+            "orr_tafel_plot", "log|j_k| (X)", "Potential vs RHE / V (Y)",
+            float(np.min(all_logjk)), float(np.max(all_logjk)),
+            float(np.min(all_pot_tafel)), float(np.max(all_pot_tafel)),
+        )
         fig_tafel = go.Figure()
         for lbl, s in tafel_samples.items():
             color = palette_for[lbl]
@@ -2720,7 +3329,11 @@ def render_orr_tab() -> None:
                 font=dict(family="Arial", color=fit_color, size=round(font_size * 0.6)),
             )
         _style_axes(fig_tafel, f"log₁₀ |j_k| ({display_unit})", "Potential vs RHE / V")
-        st.plotly_chart(fig_tafel, use_container_width=True)
+        if orr_tafel_x_range is not None:
+            fig_tafel.update_xaxes(range=orr_tafel_x_range)
+        if orr_tafel_y_range is not None:
+            fig_tafel.update_yaxes(range=orr_tafel_y_range)
+        st.plotly_chart(fig_tafel, use_container_width=True, config=_PLOTLY_EDIT_CONFIG)
         figure_downloads(
             fig_tafel, f"orr_tafel_{int(primary_rpm)}rpm", key="png_orr_tafel",
             what="Tafel plot",
@@ -2736,6 +3349,39 @@ def render_orr_tab() -> None:
     ring_samples = {lbl: s for lbl, s in slices.items() if s["has_ring"]}
     if ring_samples:
         st.markdown(f"**Peroxide yield & electron number @ ~{primary_rpm:g} rpm**")
+
+        # All data is always computed/plotted in full below — the range
+        # controls only set the plotted view (fig.update_xaxes(range=...)),
+        # never filter points, so widening/narrowing (or the CSV export,
+        # which always holds the full curve) recovers everything.
+        all_pot_ring = np.concatenate([s["potential"] for s in ring_samples.values()])
+        pot_lo, pot_hi = float(np.min(all_pot_ring)), float(np.max(all_pot_ring))
+        onset_vals = [
+            s["onset"].onset_potential for s in ring_samples.values() if s.get("onset")
+        ]
+        # Default view excludes potentials past each sample's own ORR onset
+        # (the flat, near-OCP region where disk current is ~0 and n/%H2O2
+        # are numerically noisy rather than physically meaningful) and is
+        # capped at 1 V vs RHE (O2/H2O equilibrium is 1.23 V; ring/disk
+        # response above ~1 V is background/capacitive, not O2 reduction) —
+        # both are just the starting view, freely widened below.
+        default_hi = min([*onset_vals, 1.0, pot_hi]) if onset_vals else min(1.0, pot_hi)
+        wc1, wc2 = st.columns(2)
+        ho2n_pmin = wc1.number_input(
+            "Potential view min (V vs RHE)", value=round(pot_lo, 3),
+            step=0.02, format="%.3f", key="orr_ho2n_pmin",
+        )
+        ho2n_pmax = wc2.number_input(
+            "Potential view max (V vs RHE)", value=round(default_hi, 3),
+            step=0.02, format="%.3f", key="orr_ho2n_pmax",
+        )
+        st.caption(
+            "↪ View range only — the underlying data (and its CSV export) "
+            "always keeps every point; this just sets what's visible. "
+            "Defaulted to exclude potentials past each sample's own onset — "
+            "widen or narrow to taste."
+        )
+
         fig_ho2, fig_n = go.Figure(), go.Figure()
         ho2_data, n_data = {}, {}
         for lbl, s in ring_samples.items():
@@ -2757,16 +3403,20 @@ def render_orr_tab() -> None:
 
         _style_axes(fig_ho2, "Potential vs RHE / V", "%H₂O₂", yrange=[0, 100])
         _style_axes(fig_n, "Potential vs RHE / V", "n", yrange=[0, 4])
+        fig_ho2.update_yaxes(tickvals=[0, 25, 50, 75, 100])
+        if ho2n_pmax > ho2n_pmin:
+            fig_ho2.update_xaxes(range=[ho2n_pmin, ho2n_pmax])
+            fig_n.update_xaxes(range=[ho2n_pmin, ho2n_pmax])
 
         pc1, pc2 = st.columns(2)
         with pc1:
-            st.plotly_chart(fig_ho2, use_container_width=True)
+            st.plotly_chart(fig_ho2, use_container_width=True, config=_PLOTLY_EDIT_CONFIG)
             figure_downloads(
                 fig_ho2, f"orr_ho2_{int(primary_rpm)}rpm", key="png_orr_ho2",
                 what="%H₂O₂ plot", data=_padded_frame(ho2_data),
             )
         with pc2:
-            st.plotly_chart(fig_n, use_container_width=True)
+            st.plotly_chart(fig_n, use_container_width=True, config=_PLOTLY_EDIT_CONFIG)
             figure_downloads(
                 fig_n, f"orr_n_{int(primary_rpm)}rpm", key="png_orr_n",
                 what="n plot", data=_padded_frame(n_data),
@@ -2812,7 +3462,18 @@ def render_orr_tab() -> None:
             fig_rrde.add_hline(y=0, line_color="black", line_width=1)
         _style_axes(fig_rrde, "Potential vs RHE / V", f"Current ({display_unit})")
         fig_rrde.update_layout(height=560)
-        st.plotly_chart(fig_rrde, use_container_width=True)
+        rrde_y_vals = [p["disk"]] + ([p["ring"]] if p["has_ring"] else [])
+        all_cur_rrde = np.concatenate(rrde_y_vals)
+        rrde_x_range, rrde_y_range = _range_controls(
+            "orr_rrde", "Potential (V)", f"Current ({display_unit})",
+            float(np.min(p["potential"])), float(np.max(p["potential"])),
+            float(np.min(all_cur_rrde)), float(np.max(all_cur_rrde)),
+        )
+        if rrde_x_range is not None:
+            fig_rrde.update_xaxes(range=rrde_x_range)
+        if rrde_y_range is not None:
+            fig_rrde.update_yaxes(range=rrde_y_range)
+        st.plotly_chart(fig_rrde, use_container_width=True, config=_PLOTLY_EDIT_CONFIG)
         rrde_cols: dict[str, list] = {}
         for rv in p["rpm_values"]:
             m = np.isclose(p["rpm"], rv)

@@ -108,7 +108,9 @@ def _r_squared(x: np.ndarray, y: np.ndarray, slope: float, intercept: float) -> 
 
 
 def _grow_from_onset(x: np.ndarray, y: np.ndarray, onset_idx: int,
-                     min_points: int, r2_threshold: float, patience: int) -> int:
+                     min_points: int, r2_threshold: float, patience: int,
+                     e_eq: float | None = None,
+                     max_overpotential: float | None = None) -> int:
     """Grow a fit window forward from ``onset_idx`` while it stays linear.
 
     Extends the window one point at a time and keeps the running best stop
@@ -116,6 +118,14 @@ def _grow_from_onset(x: np.ndarray, y: np.ndarray, onset_idx: int,
     consecutive points fail to meet it (this tolerates a little noise while
     still stopping once real curvature — e.g. the mass-transport plateau —
     sets in).
+
+    When ``e_eq`` and ``max_overpotential`` are both given, growth also stops
+    once the window reaches ``max_overpotential`` from ``e_eq`` (the
+    reaction's equilibrium potential) — a genuine activation-controlled
+    Tafel region rarely extends past a few hundred mV of overpotential, so
+    this keeps a reaction-appropriate default even when a wider window
+    still happens to pass the R^2 test (e.g. a long, accidentally-linear
+    mass-transport-limited stretch).
     """
     n = len(x)
     stop = min(onset_idx + min_points, n)
@@ -124,6 +134,10 @@ def _grow_from_onset(x: np.ndarray, y: np.ndarray, onset_idx: int,
     best_stop = stop
     bad_streak = 0
     for candidate_stop in range(stop, n + 1):
+        if (e_eq is not None and max_overpotential is not None
+                and candidate_stop > onset_idx
+                and abs(y[candidate_stop - 1] - e_eq) > max_overpotential):
+            break
         xs, ys = x[onset_idx:candidate_stop], y[onset_idx:candidate_stop]
         if len(xs) < 3 or np.ptp(xs) == 0:
             continue
@@ -241,7 +255,9 @@ def auto_tafel_range(potential: np.ndarray, log_i: np.ndarray,
                      baseline_frac: float = 0.1, onset_multiplier: float = 4.0,
                      r2_threshold: float = 0.99,
                      min_points: int = 5, patience: int = 4,
-                     min_frac: float = 0.2) -> tuple[int, int]:
+                     min_frac: float = 0.2,
+                     e_eq: float | None = None,
+                     max_overpotential: float = 0.35) -> tuple[int, int]:
     """Auto-detect the linear Tafel (kinetic) region.
 
     When ``current`` is supplied, the region is chosen the way it would be
@@ -254,6 +270,15 @@ def auto_tafel_range(potential: np.ndarray, log_i: np.ndarray,
     a Tafel region is picked scientifically, independent of reaction type
     (HER/OER/ORR): it is defined by the onset and the extent of linearity,
     not by the sign of the current.
+
+    ``e_eq`` (the reaction's equilibrium potential vs RHE — see
+    :data:`REACTION_E_EQ_V_RHE`) makes the growth reaction-aware: when
+    given, the window is also capped at ``max_overpotential`` (default
+    350 mV) of overpotential from ``e_eq``, since a genuine activation-
+    controlled Tafel region rarely extends further regardless of how
+    linear a wider window happens to score — this keeps the auto-detected
+    default anchored to the selected reaction rather than to the raw
+    current shape alone.
 
     Falls back to a coarse global best-R^2-times-width window search (the
     original heuristic) if ``current`` is omitted, if no clear onset is
@@ -270,7 +295,8 @@ def auto_tafel_range(potential: np.ndarray, log_i: np.ndarray,
         onset_idx = _onset_index(abs_i, baseline_frac, onset_multiplier)
         if onset_idx is not None:
             stop = _grow_from_onset(x, y, onset_idx, min_points,
-                                    r2_threshold, patience)
+                                    r2_threshold, patience,
+                                    e_eq=e_eq, max_overpotential=max_overpotential)
             if stop - onset_idx >= max(3, min_points):
                 return onset_idx, stop
 
