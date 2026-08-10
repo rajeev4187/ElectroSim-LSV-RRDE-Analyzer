@@ -26,7 +26,6 @@ from dataclasses import dataclass
 
 import numpy as np
 
-
 # --------------------------------------------------------------------------- #
 # Reference-electrode -> RHE conversion                                       #
 # --------------------------------------------------------------------------- #

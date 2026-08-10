@@ -17,7 +17,6 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
-
 # ---- safety limits for untrusted uploads -----------------------------------
 # A public deployment ingests arbitrary user files. These caps bound the work
 # done per upload so a crafted file cannot exhaust memory/CPU (denial of

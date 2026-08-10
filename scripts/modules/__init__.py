@@ -12,5 +12,5 @@ Public API
 
 from . import correction, data_io, eis, orr, tafel
 
-__all__ = ["data_io", "eis", "correction", "tafel", "orr"]
+__all__ = ["correction", "data_io", "eis", "orr", "tafel"]
 __version__ = "1.1.0"

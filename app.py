@@ -35,9 +35,9 @@ import zipfile
 import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
-from plotly.subplots import make_subplots
-from PIL import Image
 import streamlit as st
+from PIL import Image
+from plotly.subplots import make_subplots
 
 from scripts.modules import correction, data_io, eis, orr, tafel
 
@@ -185,7 +185,7 @@ def _render_tiff(export_fig, width: int, height: int) -> bytes:
 
 def figure_downloads(fig, stem: str, key: str, what: str = "figure",
                      width: int | None = None, height: int | None = None,
-                     data: "pd.DataFrame | None" = None) -> None:
+                     data: pd.DataFrame | None = None) -> None:
     """Render the download controls for one figure: TIFF, interactive HTML
     and (optionally) the plotted data as CSV.
 
@@ -260,7 +260,7 @@ def figure_downloads(fig, stem: str, key: str, what: str = "figure",
             )
 
 
-def _padded_frame(columns: "dict[str, list]") -> pd.DataFrame:
+def _padded_frame(columns: dict[str, list]) -> pd.DataFrame:
     """Build a DataFrame from unequal-length columns (each plotted series has
     its own point count), padding the short ones with blanks so the CSV keeps
     one column pair per series — the layout Origin/Excel expect."""
@@ -556,7 +556,7 @@ def render_eis_tab(eis_d, eis_list, sel, ru_unit: str = "Ω",
                 y=np.abs(zi),
                 mode="markers",
                 name="EIS data",
-                marker=dict(size=7, color="#1f77b4"),
+                marker={"size": 7, "color": "#1f77b4"},
             )
         )
         # Highlight the points selected for the fit.
@@ -566,14 +566,14 @@ def render_eis_tab(eis_d, eis_list, sel, ru_unit: str = "Ω",
                 y=np.abs(zi)[start:stop],
                 mode="markers",
                 name="Fitted arc",
-                marker=dict(size=10, color="#ff7f0e", symbol="circle-open", line=dict(width=2)),
+                marker={"size": 10, "color": "#ff7f0e", "symbol": "circle-open", "line": {"width": 2}},
             )
         )
         if ru_result is not None and ru_result.center is not None:
             cx, cy = eis.circle_path(ru_result.center, ru_result.radius)
             fig.add_trace(
                 go.Scatter(x=cx, y=cy, mode="lines", name="Fitted circle",
-                           line=dict(color="#2ca02c", dash="dash"))
+                           line={"color": "#2ca02c", "dash": "dash"})
             )
         ru_for_marker = ru_result.ru if ru_result else manual_ru_val
         if ru_for_marker is not None:
@@ -582,7 +582,7 @@ def render_eis_tab(eis_d, eis_list, sel, ru_unit: str = "Ω",
                     x=[ru_for_marker], y=[0], mode="markers+text",
                     name="Ru", text=[f"Ru={ru_for_marker:.2f} {disp_unit}"],
                     textposition="top center",
-                    marker=dict(size=13, color="red", symbol="x"),
+                    marker={"size": 13, "color": "red", "symbol": "x"},
                 )
             )
         _journal_axes_style(fig, f"Z′ / {disp_unit}", f"−Z″ / {disp_unit}", font_size)
@@ -815,14 +815,14 @@ def render_lsv_tab(lsv_d, ru: float | None, current_unit: str = "mA",
             fig.add_trace(
                 go.Scatter(x=lsv_d.potential, y=lsv_d.current, mode="lines",
                            name="Without iR comp (raw)",
-                           line=dict(color="#1f77b4", width=3))
+                           line={"color": "#1f77b4", "width": 3})
             )
             for i, r in enumerate(results):
                 fig.add_trace(
                     go.Scatter(
                         x=r.potential_corrected, y=lsv_d.current, mode="lines",
                         name=f"With iR comp {int(r.factor_percent)}%",
-                        line=dict(color=_PALETTE[i % len(_PALETTE)]),
+                        line={"color": _PALETTE[i % len(_PALETTE)]},
                     )
                 )
             fig.update_layout(
@@ -840,7 +840,7 @@ def render_lsv_tab(lsv_d, ru: float | None, current_unit: str = "mA",
             fig.add_trace(
                 go.Scatter(x=lsv_d.potential, y=lsv_d.current, mode="lines",
                            name="Without iR comp (raw)",
-                           line=dict(color="#1f77b4", width=3)),
+                           line={"color": "#1f77b4", "width": 3}),
                 row=1, col=1,
             )
             for i, r in enumerate(results):
@@ -848,7 +848,7 @@ def render_lsv_tab(lsv_d, ru: float | None, current_unit: str = "mA",
                     go.Scatter(
                         x=r.potential_corrected, y=lsv_d.current, mode="lines",
                         name=f"With iR comp {int(r.factor_percent)}%",
-                        line=dict(color=_PALETTE[i % len(_PALETTE)]),
+                        line={"color": _PALETTE[i % len(_PALETTE)]},
                     ),
                     row=1, col=2,
                 )
@@ -873,13 +873,13 @@ def render_lsv_tab(lsv_d, ru: float | None, current_unit: str = "mA",
         fig.update_layout(
             template="plotly_white",
             height=470,
-            font=dict(family="Arial", size=font_size),
-            title=dict(y=0.97, yanchor="top"),
-            legend=dict(orientation="h", yanchor="top", y=-0.18,
-                        xanchor="center", x=0.5,
-                        font=dict(family="Arial", size=max(11, round(font_size * 0.55))),
-                        bgcolor="rgba(255,255,255,0.7)"),
-            margin=dict(l=10, r=10, t=60, b=90),
+            font={"family": "Arial", "size": font_size},
+            title={"y": 0.97, "yanchor": "top"},
+            legend={"orientation": "h", "yanchor": "top", "y": -0.18,
+                        "xanchor": "center", "x": 0.5,
+                        "font": {"family": "Arial", "size": max(11, round(font_size * 0.55))},
+                        "bgcolor": "rgba(255,255,255,0.7)"},
+            margin={"l": 10, "r": 10, "t": 60, "b": 90},
         )
         fig.update_xaxes(**_BOX_AXIS_STYLE)
         fig.update_yaxes(**_BOX_AXIS_STYLE)
@@ -1026,11 +1026,11 @@ _TAFEL_REACTIONS = [
 # font size and a closed box border (mirrored axis lines) with no interior
 # gridlines.
 _JOURNAL_FONT_SIZES = [28, 36]
-_BOX_AXIS_STYLE = dict(
-    showgrid=False, zeroline=False,
-    showline=True, linewidth=1.5, linecolor="black", mirror=True,
-    ticks="outside", nticks=5,
-)
+_BOX_AXIS_STYLE = {
+    "showgrid": False, "zeroline": False,
+    "showline": True, "linewidth": 1.5, "linecolor": "black", "mirror": True,
+    "ticks": "outside", "nticks": 5,
+}
 # Every journal-style plot uses this so its legend and any text annotations
 # (slope labels, etc.) can be dragged to a better spot before export.
 _PLOTLY_EDIT_CONFIG = {
@@ -1088,30 +1088,30 @@ def _journal_axes_style(fig, xtitle: str, ytitle: str, font_size: int,
     """Apply the shared journal look (Arial, box-border axes, a legend box)
     to ``fig`` in place: ``plotly_white`` template, closed axis border, and a
     bordered legend positioned inside the plot area."""
-    axis_font = dict(family="Arial", size=font_size)
-    small_font = dict(family="Arial", size=max(11, round(font_size * 0.55)))
+    axis_font = {"family": "Arial", "size": font_size}
+    small_font = {"family": "Arial", "size": max(11, round(font_size * 0.55))}
     positions = {
-        "top-left": dict(x=0.02, y=0.98, xanchor="left", yanchor="top"),
-        "bottom-left": dict(x=0.02, y=0.02, xanchor="left", yanchor="bottom"),
+        "top-left": {"x": 0.02, "y": 0.98, "xanchor": "left", "yanchor": "top"},
+        "bottom-left": {"x": 0.02, "y": 0.02, "xanchor": "left", "yanchor": "bottom"},
         # Outside the plot area entirely (to the right) — for plots whose
         # data can occupy any corner (e.g. many K-L analysis-potential
         # entries), where an inside-corner legend would otherwise sit on
         # top of the traces instead of beside them.
-        "outside-right": dict(x=1.02, y=1, xanchor="left", yanchor="top"),
+        "outside-right": {"x": 1.02, "y": 1, "xanchor": "left", "yanchor": "top"},
     }
     right_margin = 170 if legend_position == "outside-right" else 10
     fig.update_layout(
         template="plotly_white", height=height, font=axis_font,
         legend=dict(**positions[legend_position], font=small_font,
                     bgcolor="rgba(255,255,255,0.7)"),
-        margin=dict(l=10, r=right_margin, t=20, b=10),
+        margin={"l": 10, "r": right_margin, "t": 20, "b": 10},
     )
     fig.update_xaxes(
-        title=dict(text=xtitle, font=axis_font), tickfont=axis_font,
+        title={"text": xtitle, "font": axis_font}, tickfont=axis_font,
         **_BOX_AXIS_STYLE,
     )
     fig.update_yaxes(
-        title=dict(text=ytitle, font=axis_font), tickfont=axis_font,
+        title={"text": ytitle, "font": axis_font}, tickfont=axis_font,
         range=yrange, **_BOX_AXIS_STYLE,
     )
 
@@ -1156,17 +1156,17 @@ def _journal_table_figure(display_df: pd.DataFrame, font_size: int, stem: str,
     row_h = int(cell_font * 1.5 * max(1, max_wrap)) + 8
     table_fig = go.Figure(data=[go.Table(
         columnwidth=widths,
-        header=dict(values=list(display_df.columns),
-                    font=dict(family="Arial", size=header_font),
-                    align="left", height=int(header_font * 1.6) + 10),
-        cells=dict(values=[str_cols[c] for c in display_df.columns],
-                   font=dict(family="Arial", size=cell_font), align="left",
-                   height=row_h),
+        header={"values": list(display_df.columns),
+                    "font": {"family": "Arial", "size": header_font},
+                    "align": "left", "height": int(header_font * 1.6) + 10},
+        cells={"values": [str_cols[c] for c in display_df.columns],
+                   "font": {"family": "Arial", "size": cell_font}, "align": "left",
+                   "height": row_h},
     )])
     table_height = int(header_font * 1.6) + 20 + row_h * len(display_df) + 20
     table_fig.update_layout(
         template="plotly_white",  # never export with Streamlit's placeholder colours
-        margin=dict(l=10, r=10, t=10, b=10),
+        margin={"l": 10, "r": 10, "t": 10, "b": 10},
         width=table_width, height=table_height,
     )
     figure_downloads(
@@ -1257,7 +1257,7 @@ def _selection_range_for_sample(points: list, orig_label: str,
 
 def _tafel_extract_zip_samples(
     upload, seen_labels: dict[str, int]
-) -> list[tuple[str, "data_io.LSVData"]]:
+) -> list[tuple[str, data_io.LSVData]]:
     """Batch-load LSV runs from a ZIP of a data folder — for pulling in many
     repeat runs/samples at once instead of picking files one by one. Each
     file becomes one run; files sharing a top-level subfolder are labelled
@@ -1290,7 +1290,7 @@ def _tafel_extract_zip_samples(
         return []
 
     default_sample = upload.name.rsplit(".", 1)[0]
-    series: list[tuple[str, "data_io.LSVData"]] = []
+    series: list[tuple[str, data_io.LSVData]] = []
     skipped = 0
     for member in sorted(members):
         parts = member.replace("\\", "/").split("/")
@@ -1322,7 +1322,7 @@ def _tafel_extract_zip_samples(
     return series
 
 
-def _tafel_data_loader() -> list[tuple[str, "data_io.LSVData"]]:
+def _tafel_data_loader() -> list[tuple[str, data_io.LSVData]]:
     """File uploader local to the Tafel tab — independent of the main sidebar
     EIS/LSV loader. Multiple files (different samples/lots/repeat runs) may
     be uploaded at once, either individually or batched via a ZIP of a data
@@ -1337,7 +1337,7 @@ def _tafel_data_loader() -> list[tuple[str, "data_io.LSVData"]]:
         "error bars across repeat scans and across samples)."
     )
 
-    series: list[tuple[str, "data_io.LSVData"]] = []
+    series: list[tuple[str, data_io.LSVData]] = []
     seen_labels: dict[str, int] = {}
 
     with st.expander("📦 Batch upload — a ZIP of a whole data folder"):
@@ -1786,11 +1786,11 @@ def render_tafel_tab() -> None:
             color = c2.color_picker(
                 "Color", value=_PALETTE[i % len(_PALETTE)], key=f"tafel_color_{i}"
             )
-            fits.append(dict(label=display_name or lbl, orig_label=lbl,
-                             reaction=sample_reaction,
-                             replicate_group=replicate_group or (display_name or lbl),
-                             potential=pot, current=cur, log_i=log_i,
-                             start=start, stop=stop, color=color))
+            fits.append({"label": display_name or lbl, "orig_label": lbl,
+                             "reaction": sample_reaction,
+                             "replicate_group": replicate_group or (display_name or lbl),
+                             "potential": pot, "current": cur, "log_i": log_i,
+                             "start": start, "stop": stop, "color": color})
 
     if not fits:
         st.error("No usable samples (all-zero current).")
@@ -1800,8 +1800,8 @@ def render_tafel_tab() -> None:
     # together in plot/legend order, enabling a split legend per reaction.
     fits.sort(key=lambda f: _TAFEL_REACTIONS.index(f["reaction"]))
 
-    axis_font = dict(family="Arial", size=font_size)
-    small_font = dict(family="Arial", size=max(12, round(font_size * 0.5)))
+    axis_font = {"family": "Arial", "size": font_size}
+    small_font = {"family": "Arial", "size": max(12, round(font_size * 0.5))}
 
     # Original LSV (linear-scale polarization curve), before the log-current
     # Tafel transform — shown for context alongside the derived Tafel plot.
@@ -1845,22 +1845,22 @@ def render_tafel_tab() -> None:
             lsv_fig.add_trace(go.Scatter(
                 x=pot_full, y=cur_full, mode="lines", name=meta["label"],
                 legendgroup=meta["reaction"],
-                line=dict(color=meta["color"], width=3),
+                line={"color": meta["color"], "width": 3},
             ))
         lsv_fig.update_layout(
-            title=dict(text="Original LSV", font=dict(family="Arial", size=font_size)),
+            title={"text": "Original LSV", "font": {"family": "Arial", "size": font_size}},
             template="plotly_white", height=460, font=axis_font,
-            legend=dict(x=0.02, y=0.98, xanchor="left", yanchor="top", font=small_font,
-                        bgcolor="rgba(255,255,255,0.7)", tracegroupgap=18),
-            margin=dict(l=10, r=10, t=60, b=10),
+            legend={"x": 0.02, "y": 0.98, "xanchor": "left", "yanchor": "top", "font": small_font,
+                        "bgcolor": "rgba(255,255,255,0.7)", "tracegroupgap": 18},
+            margin={"l": 10, "r": 10, "t": 60, "b": 10},
         )
         lsv_fig.update_xaxes(
-            title=dict(text="Potential vs RHE / V", font=dict(family="Arial", size=font_size)),
-            tickfont=dict(family="Arial", size=font_size), **_BOX_AXIS_STYLE,
+            title={"text": "Potential vs RHE / V", "font": {"family": "Arial", "size": font_size}},
+            tickfont={"family": "Arial", "size": font_size}, **_BOX_AXIS_STYLE,
         )
         lsv_fig.update_yaxes(
-            title=dict(text=f"Current ({display_unit})", font=dict(family="Arial", size=font_size)),
-            tickfont=dict(family="Arial", size=font_size), **_BOX_AXIS_STYLE,
+            title={"text": f"Current ({display_unit})", "font": {"family": "Arial", "size": font_size}},
+            tickfont={"family": "Arial", "size": font_size}, **_BOX_AXIS_STYLE,
         )
         if lsv_x_range is not None:
             lsv_fig.update_xaxes(range=lsv_x_range)
@@ -1898,7 +1898,7 @@ def render_tafel_tab() -> None:
     for f, _ in results:
         start, stop = f["start"], f["stop"]
         n_pts = len(f["log_i"])
-        margin = int(round((stop - start) * vicinity_pct / 100.0))
+        margin = round((stop - start) * vicinity_pct / 100.0)
         v0, v1 = max(0, start - margin), min(n_pts, stop + margin)
         if v1 > v0:
             view_x_los.append(float(np.min(f["log_i"][v0:v1])))
@@ -1939,8 +1939,8 @@ def render_tafel_tab() -> None:
             x=f["log_i"], y=f["potential"], mode="lines+markers",
             name=f["label"],
             legendgroup=grp,
-            marker=dict(size=10, color=color, opacity=0.55),
-            line=dict(color=color, width=1),
+            marker={"size": 10, "color": color, "opacity": 0.55},
+            line={"color": color, "width": 1},
             customdata=[f["orig_label"]] * n_pts,
         ))
         xs = f["log_i"][f["start"]:f["stop"]]
@@ -1953,7 +1953,7 @@ def render_tafel_tab() -> None:
         fig.add_trace(go.Scatter(
             x=xline, y=yline, mode="lines", showlegend=False, legendgroup=grp,
             name=f"{f['label']} — linear (Tafel) fit, {slope_abs:.0f} mV/dec",
-            line=dict(color=fit_color, width=3, dash="dot"),
+            line={"color": fit_color, "width": 3, "dash": "dot"},
         ))
         xmid, ymid = float(np.mean(xline)), float(np.mean(yline))
         label_text = (
@@ -1963,7 +1963,7 @@ def render_tafel_tab() -> None:
         fig.add_annotation(
             x=xmid, y=ymid, text=label_text,
             showarrow=False, yshift=16,
-            font=dict(family="Arial", color=fit_color, size=22),
+            font={"family": "Arial", "color": fit_color, "size": 22},
         )
 
     title_text = (
@@ -1971,27 +1971,27 @@ def render_tafel_tab() -> None:
         else "Tafel plot"
     )
     fig.update_layout(
-        title=dict(text=title_text, font=dict(family="Arial", size=font_size)),
+        title={"text": title_text, "font": {"family": "Arial", "size": font_size}},
         template="plotly_white",
         height=560,
         font=axis_font,  # baseline (inherited by legend/annotations unless overridden)
-        legend=dict(x=0.02, y=0.98, xanchor="left", yanchor="top", font=small_font,
-                    bgcolor="rgba(255,255,255,0.7)", tracegroupgap=18),
-        margin=dict(l=10, r=10, t=60, b=10),
+        legend={"x": 0.02, "y": 0.98, "xanchor": "left", "yanchor": "top", "font": small_font,
+                    "bgcolor": "rgba(255,255,255,0.7)", "tracegroupgap": 18},
+        margin={"l": 10, "r": 10, "t": 60, "b": 10},
         dragmode="select",
     )
     # Axis titles/ticks are the "axes" text: always the full 28/36 pt Arial.
     # A sparse tick count (~4-5, via _BOX_AXIS_STYLE) keeps a publication-
     # style plot uncluttered.
     fig.update_xaxes(
-        title=dict(text=f"log₁₀ |Current| ({display_unit})",
-                   font=dict(family="Arial", size=font_size)),
-        tickfont=dict(family="Arial", size=font_size), range=tafel_x_range,
+        title={"text": f"log₁₀ |Current| ({display_unit})",
+                   "font": {"family": "Arial", "size": font_size}},
+        tickfont={"family": "Arial", "size": font_size}, range=tafel_x_range,
         **_BOX_AXIS_STYLE,
     )
     fig.update_yaxes(
-        title=dict(text="Potential vs RHE / V", font=dict(family="Arial", size=font_size)),
-        tickfont=dict(family="Arial", size=font_size), range=tafel_y_range,
+        title={"text": "Potential vs RHE / V", "font": {"family": "Arial", "size": font_size}},
+        tickfont={"family": "Arial", "size": font_size}, range=tafel_y_range,
         **_BOX_AXIS_STYLE,
     )
     st.caption(
@@ -2153,23 +2153,23 @@ def render_tafel_tab() -> None:
             bar_colors = [_PALETTE[i % len(_PALETTE)] for i in range(len(means))]
             fig_bar = go.Figure(go.Bar(
                 x=list(means.index), y=means.to_numpy(),
-                error_y=dict(type="data", array=stds.to_numpy(), visible=True),
-                marker=dict(color=bar_colors),
+                error_y={"type": "data", "array": stds.to_numpy(), "visible": True},
+                marker={"color": bar_colors},
             ))
             fig_bar.update_layout(
-                title=dict(text=f"Benchmark @ j = {target_j:g} {display_unit}",
-                           font=dict(family="Arial", size=font_size)),
+                title={"text": f"Benchmark @ j = {target_j:g} {display_unit}",
+                           "font": {"family": "Arial", "size": font_size}},
                 template="plotly_white", height=420,
-                font=dict(family="Arial", size=font_size),
-                margin=dict(l=10, r=10, t=60, b=10),
+                font={"family": "Arial", "size": font_size},
+                margin={"l": 10, "r": 10, "t": 60, "b": 10},
             )
             fig_bar.update_xaxes(
-                title=dict(text="Replicate group", font=dict(family="Arial", size=font_size)),
-                tickfont=dict(family="Arial", size=font_size), **_BOX_AXIS_STYLE,
+                title={"text": "Replicate group", "font": {"family": "Arial", "size": font_size}},
+                tickfont={"family": "Arial", "size": font_size}, **_BOX_AXIS_STYLE,
             )
             fig_bar.update_yaxes(
-                title=dict(text=ylabel, font=dict(family="Arial", size=font_size)),
-                tickfont=dict(family="Arial", size=font_size), **_BOX_AXIS_STYLE,
+                title={"text": ylabel, "font": {"family": "Arial", "size": font_size}},
+                tickfont={"family": "Arial", "size": font_size}, **_BOX_AXIS_STYLE,
             )
             st.plotly_chart(fig_bar, use_container_width=True, config=_PLOTLY_EDIT_CONFIG)
             figure_downloads(
@@ -2373,7 +2373,7 @@ def render_kl_tab() -> None:
         curves_a_cm2[rv] = (p, disk_a_cm2[m][order])
         fig_rde.add_trace(go.Scatter(
             x=p, y=j, mode="lines", name=f"{rv:g} rpm",
-            line=dict(color=_PALETTE[i % len(_PALETTE)], width=2.5),
+            line={"color": _PALETTE[i % len(_PALETTE)], "width": 2.5},
         ))
     _style_axes(fig_rde, "Potential vs RHE / V", f"Disk current ({display_unit})")
     if rde_x_range is not None:
@@ -2480,13 +2480,13 @@ def render_kl_tab() -> None:
         y = invj / _KL_PLOT_J_SCALE
         fig_kl.add_trace(go.Scatter(
             x=x, y=y, mode="markers", name=f"{ap:.3f} V",
-            marker=dict(color=color, size=9),
+            marker={"color": color, "size": 9},
         ))
         xline = np.array([float(np.min(x)), float(np.max(x))])
         yline = (fit.slope * xline + fit.intercept) / _KL_PLOT_J_SCALE
         fig_kl.add_trace(go.Scatter(
             x=xline, y=yline, mode="lines", showlegend=False,
-            line=dict(color=_darken(color), width=2.5, dash="dot"),
+            line={"color": _darken(color), "width": 2.5, "dash": "dot"},
         ))
         kl_data[f"{ap:.3f}V — omega^-1/2 (rad^-1/2 s^1/2)"] = list(x)
         kl_data[f"{ap:.3f}V — 1/j (cm²/mA)"] = list(y)
@@ -3069,10 +3069,10 @@ def render_orr_tab() -> None:
         rpm_arr = df["rpm"].to_numpy(dtype=float)
         rpm_values = sorted(set(rpm_arr.tolist()))
         all_rpms.update(rpm_values)
-        prepared[lbl] = dict(
-            potential=pot_rhe, disk=disk, ring=ring, has_ring=has_ring,
-            rpm=rpm_arr, rpm_values=rpm_values,
-        )
+        prepared[lbl] = {
+            "potential": pot_rhe, "disk": disk, "ring": ring, "has_ring": has_ring,
+            "rpm": rpm_arr, "rpm_values": rpm_values,
+        }
 
     if not all_rpms:
         st.error("No rotation-rate data found.")
@@ -3104,10 +3104,10 @@ def render_orr_tab() -> None:
                 f"↪ {lbl} has no {primary_rpm:g} rpm data — using its nearest "
                 f"available rotation rate, {sample_rpm:g} rpm, instead."
             )
-        slices[lbl] = dict(
-            rpm=sample_rpm, potential=p["potential"][idx], disk=p["disk"][idx],
-            ring=(p["ring"][idx] if p["has_ring"] else None), has_ring=p["has_ring"],
-        )
+        slices[lbl] = {
+            "rpm": sample_rpm, "potential": p["potential"][idx], "disk": p["disk"][idx],
+            "ring": (p["ring"][idx] if p["has_ring"] else None), "has_ring": p["has_ring"],
+        }
     if not slices:
         return
 
@@ -3170,17 +3170,17 @@ def render_orr_tab() -> None:
             if s["has_ring"]:
                 fig_disk.add_trace(go.Scatter(
                     x=s["potential"], y=s["ring"], mode="lines", name=lbl,
-                    legendgroup=lbl, line=dict(color=color, width=3),
+                    legendgroup=lbl, line={"color": color, "width": 3},
                 ), row=1, col=1)
                 disk_data[f"{lbl} — Ring current ({display_unit})"] = list(s["ring"])
             fig_disk.add_trace(go.Scatter(
                 x=s["potential"], y=s["disk"], mode="lines", name=lbl,
                 legendgroup=lbl, showlegend=not s["has_ring"],
-                line=dict(color=color, width=3),
+                line={"color": color, "width": 3},
             ), row=2, col=1)
             disk_data[f"{lbl} — Potential vs RHE (V)"] = list(s["potential"])
             disk_data[f"{lbl} — Disk current ({display_unit})"] = list(s["disk"])
-        axis_font_disk = dict(family="Arial", size=font_size)
+        axis_font_disk = {"family": "Arial", "size": font_size}
         # Room for the tick numbers (which can run wide at the 36 pt export
         # size, e.g. "-10.000") plus the rotated title beyond them — a fixed
         # margin sized for the worst case, since automargin was what caused
@@ -3189,10 +3189,10 @@ def render_orr_tab() -> None:
         left_margin = 160 + (font_size - 28) * 4
         fig_disk.update_layout(
             template="plotly_white", height=680, width=930, font=axis_font_disk,
-            margin=dict(l=left_margin, r=40),
+            margin={"l": left_margin, "r": 40},
         )
         fig_disk.update_xaxes(
-            title=dict(text="Potential vs RHE / V", font=axis_font_disk),
+            title={"text": "Potential vs RHE / V", "font": axis_font_disk},
             tickfont=axis_font_disk, row=2, col=1,
         )
         # One common Y-axis title spanning both rows (no separate "Ring"/
@@ -3260,7 +3260,7 @@ def render_orr_tab() -> None:
         for lbl, s in slices.items():
             fig_disk.add_trace(go.Scatter(
                 x=s["potential"], y=s["disk"], mode="lines", name=lbl,
-                line=dict(color=palette_for[lbl], width=3),
+                line={"color": palette_for[lbl], "width": 3},
             ))
             disk_data[f"{lbl} — Potential vs RHE (V)"] = list(s["potential"])
             disk_data[f"{lbl} — Disk current ({display_unit})"] = list(s["disk"])
@@ -3383,7 +3383,7 @@ def render_orr_tab() -> None:
             color = palette_for[lbl]
             fig_deriv.add_trace(go.Scatter(
                 x=s["deriv_pot"], y=s["deriv"], mode="lines", name=lbl,
-                line=dict(color=color, width=2.5),
+                line={"color": color, "width": 2.5},
             ))
             e_half = s["onset"].half_wave_potential
             # np.interp needs ascending x — deriv_pot may be descending
@@ -3393,10 +3393,10 @@ def render_orr_tab() -> None:
             deriv_at_half = float(np.interp(e_half, s["deriv_pot"][order], s["deriv"][order]))
             fig_deriv.add_trace(go.Scatter(
                 x=[e_half], y=[deriv_at_half], mode="markers", showlegend=False,
-                marker=dict(size=11, color=_darken(color), symbol="circle"),
+                marker={"size": 11, "color": _darken(color), "symbol": "circle"},
             ))
             fig_deriv.add_vline(
-                x=e_half, line=dict(color=_darken(color), width=1.5, dash="dash"),
+                x=e_half, line={"color": _darken(color), "width": 1.5, "dash": "dash"},
             )
             deriv_data[f"{lbl} — Potential vs RHE (V)"] = list(s["deriv_pot"])
             deriv_data[f"{lbl} — dI/dE"] = list(s["deriv"])
@@ -3477,7 +3477,7 @@ def render_orr_tab() -> None:
             start, stop = r.fit_slice
             fig_tafel.add_trace(go.Scatter(
                 x=log_jk, y=pot_tafel, mode="markers", name=lbl,
-                marker=dict(size=8, color=color, opacity=0.5),
+                marker={"size": 8, "color": color, "opacity": 0.5},
             ))
             xs = log_jk[start:stop]
             xline = np.array([float(np.min(xs)), float(np.max(xs))])
@@ -3487,13 +3487,13 @@ def render_orr_tab() -> None:
             fig_tafel.add_trace(go.Scatter(
                 x=xline, y=yline, mode="lines", showlegend=False,
                 name=f"{lbl} fit, {slope_abs:.0f} mV/dec",
-                line=dict(color=fit_color, width=3, dash="dot"),
+                line={"color": fit_color, "width": 3, "dash": "dot"},
             ))
             xmid, ymid = float(np.mean(xline)), float(np.mean(yline))
             fig_tafel.add_annotation(
                 x=xmid, y=ymid, text=f"{slope_abs:.0f} mV/dec", showarrow=False,
                 yshift=14,
-                font=dict(family="Arial", color=fit_color, size=round(font_size * 0.6)),
+                font={"family": "Arial", "color": fit_color, "size": round(font_size * 0.6)},
             )
         _style_axes(fig_tafel, f"log₁₀ |j_k| ({display_unit})", "Potential vs RHE / V")
         if orr_tafel_x_range is not None:
@@ -3557,11 +3557,11 @@ def render_orr_tab() -> None:
             pct_arr = orr.peroxide_percent(s["disk"], s["ring"], collection_efficiency)
             fig_ho2.add_trace(go.Scatter(
                 x=s["potential"], y=pct_arr, mode="lines", name=lbl,
-                line=dict(color=color, width=3),
+                line={"color": color, "width": 3},
             ))
             fig_n.add_trace(go.Scatter(
                 x=s["potential"], y=n_arr, mode="lines", name=lbl,
-                line=dict(color=color, width=3),
+                line={"color": color, "width": 3},
             ))
             ho2_data[f"{lbl} — Potential vs RHE (V)"] = list(s["potential"])
             ho2_data[f"{lbl} — %H2O2"] = list(pct_arr)
@@ -3609,22 +3609,22 @@ def render_orr_tab() -> None:
                 fig_rrde.add_trace(go.Scatter(
                     x=p["potential"][m], y=p["ring"][m], mode="lines",
                     name=f"{rv:g} rpm", legendgroup=f"{rv:g}",
-                    line=dict(color=color, width=2.5),
+                    line={"color": color, "width": 2.5},
                 ))
             fig_rrde.add_trace(go.Scatter(
                 x=p["potential"][m], y=p["disk"][m], mode="lines",
                 name=f"{rv:g} rpm", legendgroup=f"{rv:g}",
                 showlegend=not p["has_ring"],
-                line=dict(color=color, width=2.5),
+                line={"color": color, "width": 2.5},
             ))
         if p["has_ring"]:
             fig_rrde.add_annotation(
                 xref="paper", yref="paper", x=0.98, y=0.95, showarrow=False,
-                text="ring", font=dict(family="Arial", size=round(font_size * 0.7)),
+                text="ring", font={"family": "Arial", "size": round(font_size * 0.7)},
             )
             fig_rrde.add_annotation(
                 xref="paper", yref="paper", x=0.98, y=0.05, showarrow=False,
-                text="disk", font=dict(family="Arial", size=round(font_size * 0.7)),
+                text="disk", font={"family": "Arial", "size": round(font_size * 0.7)},
             )
             fig_rrde.add_hline(y=0, line_color="black", line_width=1)
         _style_axes(fig_rrde, "Potential vs RHE / V", f"Current ({display_unit})")
