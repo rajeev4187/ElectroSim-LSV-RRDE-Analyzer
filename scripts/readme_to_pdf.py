@@ -34,18 +34,23 @@ blockquote { border-left: 3px solid #0b4f6c; margin: 8px 0;
 hr { border: none; border-top: 1px solid #ccc; }
 """
 
+
 def main() -> None:
     md_text = SRC.read_text(encoding="utf-8")
     body = markdown.markdown(
         md_text,
         extensions=["tables", "fenced_code", "sane_lists", "toc"],
     )
-    html = f"<html><head><meta charset='utf-8'><style>{CSS}</style></head><body>{body}</body></html>"
+    html = (
+        f"<html><head><meta charset='utf-8'><style>{CSS}</style></head>"
+        f"<body>{body}</body></html>"
+    )
     with OUT.open("wb") as fh:
         result = pisa.CreatePDF(html, dest=fh, encoding="utf-8")
     if result.err:
         raise SystemExit(f"PDF generation failed with {result.err} error(s)")
     print(f"Wrote {OUT} ({OUT.stat().st_size:,} bytes)")
+
 
 if __name__ == "__main__":
     main()
