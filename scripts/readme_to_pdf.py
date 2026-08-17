@@ -76,10 +76,25 @@ _SUBSUP_REPLACEMENTS = [
     ("₄", "<sub>4</sub>"),  # HClO₄, H₂SO₄
 ]
 
+# Glyphs outside Helvetica's WinAnsi set that also show as tofu boxes. Greek
+# gets a spelled-out fallback; arrows and comparisons go through HTML entities
+# (preserved by markdown), so keep these out of inline `code` spans, where
+# entities would be escaped and shown literally.
+_GLYPH_FALLBACKS = [
+    ("Ω", "Ohm"),
+    ("ω", "omega"),
+    ("η", "eta"),
+    ("↔", "&lt;-&gt;"),
+    ("→", "-&gt;"),
+    ("≥", "&gt;="),
+    ("≤", "&lt;="),
+    ("−", "-"),  # U+2212 minus sign; safe anywhere, code spans included
+]
+
 
 def _fix_unsupported_glyphs(md_text: str) -> str:
     md_text = md_text.replace("pH⁻¹", "pH^-1")  # inside an inline `code` span
-    for old, new in _SUBSUP_REPLACEMENTS:
+    for old, new in _SUBSUP_REPLACEMENTS + _GLYPH_FALLBACKS:
         md_text = md_text.replace(old, new)
     return md_text.replace("\U0001f517 ", "")  # 🔗 emoji has no PDF glyph either
 

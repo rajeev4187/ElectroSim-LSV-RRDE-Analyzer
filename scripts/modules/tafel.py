@@ -26,6 +26,8 @@ from dataclasses import dataclass
 
 import numpy as np
 
+from . import sweep
+
 # --------------------------------------------------------------------------- #
 # Reference-electrode -> RHE conversion                                       #
 # --------------------------------------------------------------------------- #
@@ -35,11 +37,19 @@ import numpy as np
 # of the reference and is the community convention for comparing HER/OER/ORR
 # Tafel data across labs and electrolytes:
 #
-#     E(RHE) = E(measured) + E_ref_vs_NHE + NERNST_SLOPE_V_PER_PH * pH
+#     E(RHE) = E(measured) + E_ref_vs_NHE + nernst_slope(T) * pH
 #
 # Values are widely tabulated (e.g. Bard & Faulkner, "Electrochemical
 # Methods"); minor (<5 mV) variations exist between sources/temperatures.
-NERNST_SLOPE_V_PER_PH = 0.05916  # V/pH at 25 degC: (R*T*ln10)/F
+
+# Physical constants (CODATA 2018).
+GAS_CONSTANT_J_PER_MOL_K = 8.314462618
+FARADAY_C_PER_MOL = 96485.33212
+STANDARD_TEMPERATURE_K = 298.15
+
+# V/pH at 25 degC: (R*T*ln10)/F. Kept as a module constant for the common
+# case; use nernst_slope() for any other temperature.
+NERNST_SLOPE_V_PER_PH = 0.05916
 
 REFERENCE_ELECTRODES: dict[str, float] = {
     "SHE / NHE": 0.000,
@@ -49,21 +59,52 @@ REFERENCE_ELECTRODES: dict[str, float] = {
     "Ag/AgCl, 3 M KCl": 0.210,
     "Ag/AgCl, 3 M NaCl": 0.209,
     "Ag/AgCl, 1 M KCl": 0.235,
+    "Ag/AgCl, 0.1 M KCl": 0.288,
     "Hg/HgO, 1 M NaOH": 0.140,
+    "Hg/HgO, 1 M KOH": 0.098,
+    "Hg/HgO, 0.1 M NaOH": 0.165,
     "Hg/Hg2SO4, saturated K2SO4": 0.640,
+    "Hg/Hg2SO4, 0.5 M H2SO4": 0.680,
+    "Hg/HgSO4, 1 M H2SO4": 0.674,
 }
 
 
-def to_rhe(potential: np.ndarray, e_ref_vs_nhe: float, ph: float) -> np.ndarray:
+def nernst_slope(temperature_k: float = STANDARD_TEMPERATURE_K) -> float:
+    """Nernstian pH slope ``(R*T*ln10)/F`` in V/pH.
+
+    59.16 mV/pH at 25 degC, but the RHE conversion is done at the temperature
+    the experiment ran at — a 60 degC cell shifts the conversion by ~7 mV/pH,
+    i.e. ~90 mV at pH 13, which is far from negligible when comparing onset
+    potentials.
+    """
+    return (GAS_CONSTANT_J_PER_MOL_K * float(temperature_k) * np.log(10.0)
+            / FARADAY_C_PER_MOL)
+
+
+def to_rhe(potential: np.ndarray, e_ref_vs_nhe: float, ph: float,
+           temperature_k: float = STANDARD_TEMPERATURE_K) -> np.ndarray:
     """Convert ``potential`` (measured vs a reference electrode) to the RHE scale.
 
     ``e_ref_vs_nhe`` is the reference electrode's standard potential vs NHE
     (V); see :data:`REFERENCE_ELECTRODES` for common values. Pass ``0.0`` and
     ``ph=0`` (or simply skip the call) for data that is already reported vs
-    RHE.
+    RHE. ``temperature_k`` sets the Nernstian pH slope (see
+    :func:`nernst_slope`).
     """
     return (np.asarray(potential, dtype=float)
-            + float(e_ref_vs_nhe) + NERNST_SLOPE_V_PER_PH * float(ph))
+            + float(e_ref_vs_nhe) + nernst_slope(temperature_k) * float(ph))
+
+
+def theoretical_tafel_slope_mv(alpha: float = 0.5, n_electrons: int = 1,
+                               temperature_k: float = STANDARD_TEMPERATURE_K) -> float:
+    """Butler-Volmer Tafel slope ``2.303 R T / (alpha n F)`` in mV/decade.
+
+    The canonical 120 / 60 / 40 / 30 mV/dec benchmarks in
+    :data:`REACTION_REFERENCES` are just this expression at 25 degC for
+    ``alpha*n`` = 0.5, 1, 1.5 and 2 — worth computing explicitly when the
+    experiment was not at 25 degC.
+    """
+    return 1000.0 * nernst_slope(temperature_k) / (float(alpha) * float(n_electrons))
 
 
 @dataclass
@@ -74,10 +115,29 @@ class TafelResult:
     intercept_v: float       # potential at log10|i| = 0, V
     r_squared: float         # goodness of fit of the linear region
     fit_slice: tuple[int, int]  # (start, stop) indices used, in the caller's order
+    slope_stderr_v_per_dec: float = float("nan")  # 1-sigma uncertainty on the slope
+    intercept_stderr_v: float = float("nan")
+    n_points: int = 0
+    decades: float = float("nan")  # span of log10|i| covered by the fit
 
     @property
     def slope_mv_per_dec(self) -> float:
         return self.slope_v_per_dec * 1000.0
+
+    @property
+    def slope_stderr_mv_per_dec(self) -> float:
+        return self.slope_stderr_v_per_dec * 1000.0
+
+    @property
+    def slope_ci95_mv_per_dec(self) -> float:
+        """Half-width of the ~95 % confidence interval on the slope, mV/dec.
+
+        A Tafel slope quoted without an uncertainty is not comparable between
+        papers; 1.96 sigma is the usual shorthand (exact for large samples,
+        mildly optimistic for the handful of points a narrow fit window
+        holds).
+        """
+        return 1.96 * self.slope_stderr_mv_per_dec
 
     @property
     def exchange_current(self) -> float | None:
@@ -92,11 +152,95 @@ class TafelResult:
             return None
         return float(10.0 ** exponent)
 
+    @property
+    def quality_warnings(self) -> list[str]:
+        """Reasons this fit should not be quoted as-is.
+
+        A high R^2 alone does not make a Tafel slope credible: the usual
+        failure is a *short* window, where a handful of adjacent points on any
+        smooth curve look perfectly linear. Convention in the electrocatalysis
+        literature is to fit at least one decade of current; less than half a
+        decade is not a Tafel region in any meaningful sense.
+        """
+        issues = []
+        if np.isfinite(self.decades):
+            if self.decades < 0.5:
+                issues.append(
+                    f"fitted over only {self.decades:.2f} decades of current "
+                    "(convention is >= 1 decade) — the slope is not reliable"
+                )
+            elif self.decades < 1.0:
+                issues.append(
+                    f"fitted over {self.decades:.2f} decades (< 1 decade); "
+                    "widen the range if the data allows"
+                )
+        if self.n_points < 5:
+            issues.append(f"only {self.n_points} points in the fit")
+        if self.r_squared < 0.98:
+            issues.append(f"R² = {self.r_squared:.3f} — noticeable curvature in the window")
+        return issues
+
 
 def log_current(current: np.ndarray) -> np.ndarray:
-    """Return log10(|current|), dropping non-positive/non-finite samples is
-    the caller's responsibility (zero current has no logarithm)."""
-    return np.log10(np.abs(np.asarray(current, dtype=float)))
+    """Return log10(|current|).
+
+    Exact zeros have no logarithm; they map to ``-inf`` here rather than
+    raising, and callers filter with ``numpy.isfinite`` (an exactly-zero
+    current sample carries no kinetic information anyway).
+    """
+    cur = np.abs(np.asarray(current, dtype=float))
+    with np.errstate(divide="ignore", invalid="ignore"):
+        return np.log10(cur)
+
+
+def _regression_prefix_sums(x: np.ndarray, y: np.ndarray):
+    """Cumulative sums enabling O(1) least-squares stats for *any* slice.
+
+    The window searches below evaluate a linear fit over O(n) nested windows.
+    Calling ``numpy.polyfit`` per window makes that O(n^2) work — measurably
+    slow (~1.7 s for a 4000-point sweep) and, because Streamlit re-runs the
+    whole script on every widget interaction, it was paid again on every
+    slider drag. Since ordinary least squares depends on the data only
+    through the five sums below, prefix sums give every window's slope,
+    intercept and R^2 in constant time and the whole scan in O(n).
+    """
+    n = len(x)
+    zero = np.zeros(1)
+    return (
+        np.concatenate([zero, np.cumsum(x)]),
+        np.concatenate([zero, np.cumsum(y)]),
+        np.concatenate([zero, np.cumsum(x * x)]),
+        np.concatenate([zero, np.cumsum(y * y)]),
+        np.concatenate([zero, np.cumsum(x * y)]),
+        n,
+    )
+
+
+def _stats_from_sums(sums, start, stop):
+    """``(slope, intercept, r_squared)`` for ``[start, stop)`` from prefix
+    sums. Returns ``None`` where the window is degenerate (fewer than 3
+    points, or no spread in x)."""
+    sx, sy, sxx, syy, sxy, _ = sums
+    k = stop - start
+    if k < 3:
+        return None
+    n = float(k)
+    x_sum = sx[stop] - sx[start]
+    y_sum = sy[stop] - sy[start]
+    xx = sxx[stop] - sxx[start]
+    yy = syy[stop] - syy[start]
+    xy = sxy[stop] - sxy[start]
+    sxx_c = xx - x_sum * x_sum / n
+    if sxx_c <= 0:
+        return None
+    sxy_c = xy - x_sum * y_sum / n
+    syy_c = yy - y_sum * y_sum / n
+    slope = sxy_c / sxx_c
+    intercept = (y_sum - slope * x_sum) / n
+    if syy_c <= 0:
+        return slope, intercept, 0.0
+    r2 = float(np.clip((sxy_c * sxy_c) / (sxx_c * syy_c), 0.0, 1.0))
+    return float(slope), float(intercept), r2
 
 
 def _r_squared(x: np.ndarray, y: np.ndarray, slope: float, intercept: float) -> float:
@@ -125,23 +269,32 @@ def _grow_from_onset(x: np.ndarray, y: np.ndarray, onset_idx: int,
     this keeps a reaction-appropriate default even when a wider window
     still happens to pass the R^2 test (e.g. a long, accidentally-linear
     mass-transport-limited stretch).
+
+    Runs in O(n) via :func:`_regression_prefix_sums`.
     """
     n = len(x)
     stop = min(onset_idx + min_points, n)
     if stop - onset_idx < 3:
         return stop
+
+    # Hard cap from the overpotential limit, resolved up front so the scan
+    # below is a single pass with no per-step branching.
+    limit = n
+    if e_eq is not None and max_overpotential is not None:
+        beyond = np.flatnonzero(np.abs(y[onset_idx:] - e_eq) > max_overpotential)
+        if len(beyond):
+            limit = onset_idx + int(beyond[0])
+        if limit < stop:
+            limit = stop
+
+    sums = _regression_prefix_sums(x, y)
     best_stop = stop
     bad_streak = 0
-    for candidate_stop in range(stop, n + 1):
-        if (e_eq is not None and max_overpotential is not None
-                and candidate_stop > onset_idx
-                and abs(y[candidate_stop - 1] - e_eq) > max_overpotential):
-            break
-        xs, ys = x[onset_idx:candidate_stop], y[onset_idx:candidate_stop]
-        if len(xs) < 3 or np.ptp(xs) == 0:
+    for candidate_stop in range(stop, limit + 1):
+        stats = _stats_from_sums(sums, onset_idx, candidate_stop)
+        if stats is None:
             continue
-        slope, intercept = np.polyfit(xs, ys, 1)
-        if _r_squared(xs, ys, slope, intercept) >= r2_threshold:
+        if stats[2] >= r2_threshold:
             best_stop = candidate_stop
             bad_streak = 0
         else:
@@ -152,21 +305,21 @@ def _grow_from_onset(x: np.ndarray, y: np.ndarray, onset_idx: int,
 
 
 def _best_r2_window(x: np.ndarray, y: np.ndarray, min_frac: float) -> tuple[int, int]:
-    """Legacy fallback: scan candidate windows (coarse grid) and score each
-    by R^2 * window_size, favouring windows that are both linear and wide."""
+    """Fallback: scan candidate windows (coarse grid) and score each by
+    R^2 * window_size, favouring windows that are both linear and wide.
+    Uses the same O(1)-per-window prefix sums as :func:`_grow_from_onset`."""
     n = len(x)
     min_size = max(4, int(round(min_frac * n)))
     step = max(1, n // 40)
+    sums = _regression_prefix_sums(x, y)
 
     best_start, best_stop, best_score = 0, n, -np.inf
     for start in range(0, n - min_size + 1, step):
         for stop in range(start + min_size, n + 1, step):
-            xs, ys = x[start:stop], y[start:stop]
-            if len(xs) < 3 or np.ptp(xs) == 0:
+            stats = _stats_from_sums(sums, start, stop)
+            if stats is None:
                 continue
-            slope, intercept = np.polyfit(xs, ys, 1)
-            r2 = _r_squared(xs, ys, slope, intercept)
-            score = r2 * len(xs)
+            score = stats[2] * (stop - start)
             if score > best_score:
                 best_start, best_stop, best_score = start, stop, score
     return best_start, best_stop
@@ -183,14 +336,27 @@ def _onset_index(current: np.ndarray, baseline_frac: float,
     later spans several more decades on its way to a mass-transport
     plateau — using the endpoint max would push "onset" deep into the
     exponential rise on any wide-dynamic-range sweep.
+
+    ``current`` must already be ``|current|`` **oriented rest-end-first**;
+    callers go through :func:`scripts.modules.sweep.orient_rest_first`.
     """
     n = len(current)
+    if n < 4:
+        return None
     baseline_n = max(3, min(n // 4, int(round(baseline_frac * n))))
     baseline = current[:baseline_n]
     level = float(np.median(baseline))
     spread = float(np.std(baseline))
-    threshold = max(level * onset_multiplier, level + 5.0 * spread,
-                    level + 1e-12)
+    # Scale-aware floor: a baseline sitting at exactly zero (or at the noise
+    # floor of a high-resolution ADC) makes the multiplicative and
+    # spread-based terms vanish, and a bare +1e-12 absolute floor then fires
+    # on the first quantisation step of a nanoamp-scale sweep. Anchor the
+    # floor to the sweep's own dynamic range instead.
+    reach = float(np.max(current)) - level
+    threshold = max(level * onset_multiplier,
+                    level + 5.0 * spread,
+                    level + 1e-4 * max(reach, 0.0),
+                    level + 1e-15)
     crossings = np.flatnonzero(current[baseline_n:] >= threshold)
     return int(crossings[0]) + baseline_n if len(crossings) else None
 
@@ -216,14 +382,129 @@ REACTION_E_EQ_V_RHE: dict[str, float] = {
 }
 
 
+# --------------------------------------------------------------------------- #
+# Automatic reaction identification                                           #
+# --------------------------------------------------------------------------- #
+@dataclass
+class ReactionGuess:
+    """A reaction inferred from the shape of a polarization curve."""
+
+    reaction: str
+    confidence: str        # "high" | "medium" | "low"
+    reason: str            # human-readable justification, shown in the GUI
+
+    def __str__(self) -> str:  # pragma: no cover - convenience only
+        return f"{self.reaction} ({self.confidence}): {self.reason}"
+
+
+def infer_reaction(potential: np.ndarray, current: np.ndarray,
+                   default: str = "Other / unspecified") -> ReactionGuess:
+    """Best guess at which reaction a polarization curve represents.
+
+    Two facts identify most electrocatalysis sweeps, and both are already in
+    the data — so defaulting every sample to one fixed reaction (which then
+    silently drives the E_eq used for overpotentials, the mechanistic
+    benchmark table, and the auto Tafel window's overpotential cap) throws
+    away information the file itself carries:
+
+    * **Sign of the faradaic current** — anodic (positive, oxidation) vs
+      cathodic (negative, reduction), measured where the current is actually
+      flowing rather than near the open-circuit crossover.
+    * **Where the active window sits on the RHE scale** — water's
+      thermodynamic window pins the common reactions apart: OER above 1.23 V,
+      ORR just below it, HER/HOR at 0 V.
+
+    ``potential`` must already be on the RHE scale; the caller converts
+    first. Ambiguous cases (e.g. a cathodic sweep at strongly negative
+    potentials, where HER and CO2RR/N2RR overlap and only the electrolyte
+    distinguishes them) return the more common assignment with a
+    ``"low"``/``"medium"`` confidence and a reason saying so, so the GUI can
+    prompt rather than assert.
+    """
+    pot, cur = sweep.clean_sweep(potential, current)
+    if len(pot) < 3:
+        return ReactionGuess(default, "low", "too few points to judge")
+
+    # Judge the sign where current is genuinely flowing: the top decile of
+    # |current| avoids the near-OCP region, where noise and capacitive
+    # charging flip the sign at random.
+    mag = np.abs(cur)
+    if not np.isfinite(mag).any() or float(np.max(mag)) <= 0:
+        return ReactionGuess(default, "low", "current is zero throughout")
+    active = mag >= np.nanpercentile(mag, 90)
+    signed = float(np.nanmedian(cur[active]))
+    cathodic = signed < 0
+
+    # The potential range over which the reaction is actually running.
+    e_active = pot[active]
+    e_lo, e_hi = float(np.nanmin(e_active)), float(np.nanmax(e_active))
+    e_mid = float(np.nanmedian(e_active))
+    window = f"{e_lo:.2f}–{e_hi:.2f} V vs RHE"
+
+    if cathodic:
+        if e_mid > 0.95:
+            return ReactionGuess(
+                "ORR", "medium",
+                f"cathodic current at {window}, just below the O₂/H₂O "
+                "equilibrium (1.23 V) — but check this is not a reduction "
+                "of the electrode itself",
+            )
+        if 0.15 <= e_mid <= 0.95:
+            return ReactionGuess(
+                "ORR", "high",
+                f"cathodic current at {window} — the classic O₂-reduction "
+                "window below 1.23 V and well above the HER onset",
+            )
+        if e_mid < -0.35:
+            return ReactionGuess(
+                "HER", "medium",
+                f"cathodic current at {window}; that is HER territory, though "
+                "CO₂RR/N₂RR/NO₃RR run at similar potentials — set it "
+                "manually if your electrolyte says otherwise",
+            )
+        return ReactionGuess(
+            "HER", "high",
+            f"cathodic current at {window}, at/below the H⁺/H₂ equilibrium (0 V)",
+        )
+
+    if e_mid >= 1.23:
+        return ReactionGuess(
+            "OER", "high",
+            f"anodic current at {window}, above the O₂/H₂O equilibrium (1.23 V)",
+        )
+    if e_hi >= 1.35:
+        return ReactionGuess(
+            "OER", "medium",
+            f"anodic current reaching {e_hi:.2f} V vs RHE — past the OER onset",
+        )
+    if e_mid <= 0.25:
+        return ReactionGuess(
+            "HOR", "high",
+            f"anodic current at {window}, at/just above the H₂/H⁺ equilibrium (0 V)",
+        )
+    return ReactionGuess(
+        default, "low",
+        f"anodic current at {window} — between the HOR and OER windows, "
+        "which is where small-molecule oxidations (MOR/EOR/UOR) sit; "
+        "pick the reaction manually",
+    )
+
+
 def onset_potential(potential: np.ndarray, current: np.ndarray,
                     baseline_frac: float = 0.1,
                     onset_multiplier: float = 4.0) -> float:
     """Potential at which ``|current|`` first departs from the flat
-    pre-onset baseline — see :func:`_onset_index`. ``potential``/``current``
-    should be in the sweep's own recorded order (not sorted)."""
-    pot = np.asarray(potential, dtype=float)
-    cur = np.asarray(current, dtype=float)
+    pre-onset baseline — see :func:`_onset_index`.
+
+    The arrays are cleaned and oriented first (approach/vertex leg stripped,
+    rest-potential end put at index 0), so the answer no longer depends on
+    which direction the instrument happened to record the sweep in. Reversing
+    the input returns the same onset potential.
+    """
+    pot, cur = sweep.clean_sweep(potential, current)
+    if len(pot) < 4:
+        raise ValueError("Not enough points to locate an onset.")
+    pot, cur = sweep.orient_rest_first(pot, cur)
     idx = _onset_index(np.abs(cur), baseline_frac, onset_multiplier)
     if idx is None:
         raise ValueError("No clear onset found (current never departs from baseline).")
@@ -235,18 +516,49 @@ def potential_at_current_density(potential: np.ndarray, current_density: np.ndar
     """Potential at which ``|current_density|`` first reaches ``target_j``
     (same units as ``current_density``), by linear interpolation between the
     two bracketing points. ``None`` if the sweep never reaches ``target_j``.
+
+    "First" means first *along the sweep, starting from the rest-potential
+    end* — not first in file order. Those differ whenever the instrument
+    recorded the scan plateau-end first, which would otherwise report the
+    potential at which the curve *falls back* through j rather than the
+    benchmark potential the literature means (a large error on any curve that
+    overshoots the target).
     """
-    pot = np.asarray(potential, dtype=float)
-    j = np.abs(np.asarray(current_density, dtype=float))
-    idx = np.flatnonzero(j >= target_j)
+    pot, cur = sweep.clean_sweep(potential, current_density)
+    if len(pot) == 0:
+        return None
+    pot, cur = sweep.orient_rest_first(pot, cur)
+    j = np.abs(cur)
+    target = abs(float(target_j))
+    idx = np.flatnonzero(j >= target)
     if len(idx) == 0:
         return None
     i = int(idx[0])
     if i == 0:
         return float(pot[0])
     x0, x1, y0, y1 = pot[i - 1], pot[i], j[i - 1], j[i]
-    frac = 0.0 if y1 == y0 else (target_j - y0) / (y1 - y0)
+    frac = 0.0 if y1 == y0 else (target - y0) / (y1 - y0)
     return float(x0 + frac * (x1 - x0))
+
+
+def overpotential_at_current_density(
+    potential: np.ndarray, current_density: np.ndarray, target_j: float,
+    reaction: str,
+) -> tuple[float | None, bool]:
+    """``(value, is_overpotential)`` at ``target_j`` for ``reaction``.
+
+    Returns the overpotential ``eta = |E - E_eq|`` when the reaction has a
+    well-defined equilibrium potential (see :data:`REACTION_E_EQ_V_RHE`), and
+    otherwise the raw potential with ``is_overpotential=False`` so the caller
+    can label the column honestly.
+    """
+    e_at_j = potential_at_current_density(potential, current_density, target_j)
+    if e_at_j is None:
+        return None, False
+    e_eq = REACTION_E_EQ_V_RHE.get(reaction)
+    if e_eq is None:
+        return float(e_at_j), False
+    return float(abs(e_at_j - e_eq)), True
 
 
 def auto_tafel_range(potential: np.ndarray, log_i: np.ndarray,
@@ -291,13 +603,31 @@ def auto_tafel_range(potential: np.ndarray, log_i: np.ndarray,
 
     if current is not None:
         abs_i = np.abs(np.asarray(current, dtype=float))
+        # The onset detector reads its baseline off the *first* points, so it
+        # only works on a sweep that starts at the rest potential. Detect the
+        # orientation here and map the resulting window back to the caller's
+        # own indexing, so a plateau-first recording (an equally common
+        # instrument convention) auto-detects the same physical region rather
+        # than failing outright.
+        reversed_input = False
+        if n >= 4:
+            k = max(1, min(5, n // 4))
+            if float(np.median(abs_i[-k:])) < float(np.median(abs_i[:k])):
+                reversed_input = True
+        if reversed_input:
+            x, y, abs_i = x[::-1], y[::-1], abs_i[::-1]
+
         onset_idx = _onset_index(abs_i, baseline_frac, onset_multiplier)
         if onset_idx is not None:
             stop = _grow_from_onset(x, y, onset_idx, min_points,
                                     r2_threshold, patience,
                                     e_eq=e_eq, max_overpotential=max_overpotential)
             if stop - onset_idx >= max(3, min_points):
+                if reversed_input:
+                    return n - stop, n - onset_idx
                 return onset_idx, stop
+        if reversed_input:  # restore for the fallback scan below
+            x, y = x[::-1], y[::-1]
 
     return _best_r2_window(x, y, min_frac)
 
@@ -327,20 +657,47 @@ def fit_tafel(
         raise ValueError("Need at least 3 points to fit the Tafel region.")
 
     xs, ys = x[start:stop], pot[start:stop]
+    # log10|i| is -inf wherever the current is exactly zero, and a single such
+    # point silently poisons the whole least-squares fit (every sum becomes
+    # nan). Drop non-finite pairs rather than returning a nan slope.
+    finite = np.isfinite(xs) & np.isfinite(ys)
+    if finite.sum() < 3:
+        raise ValueError(
+            "Fewer than 3 usable points in the selected region "
+            "(zero or non-finite current)."
+        )
+    xs, ys = xs[finite], ys[finite]
     if np.ptp(xs) == 0:
         raise ValueError("Selected region has no spread in log|current|.")
 
+    k = len(xs)
     slope, intercept = np.polyfit(xs, ys, 1)
     pred = slope * xs + intercept
-    ss_res = float(np.sum((ys - pred) ** 2))
+    resid = ys - pred
+    ss_res = float(np.sum(resid ** 2))
     ss_tot = float(np.sum((ys - np.mean(ys)) ** 2))
     r_squared = 1.0 - ss_res / ss_tot if ss_tot > 0 else 0.0
+
+    # Standard errors of the OLS coefficients. A Tafel slope is only
+    # comparable between studies when quoted with its uncertainty, and the
+    # residual scatter is the honest estimate of it.
+    sxx = float(np.sum((xs - np.mean(xs)) ** 2))
+    if k > 2 and sxx > 0:
+        resid_var = ss_res / (k - 2)
+        slope_se = float(np.sqrt(resid_var / sxx))
+        intercept_se = float(np.sqrt(resid_var * (1.0 / k + np.mean(xs) ** 2 / sxx)))
+    else:
+        slope_se = intercept_se = float("nan")
 
     return TafelResult(
         slope_v_per_dec=float(slope),
         intercept_v=float(intercept),
         r_squared=float(r_squared),
         fit_slice=(start, stop),
+        slope_stderr_v_per_dec=slope_se,
+        intercept_stderr_v=intercept_se,
+        n_points=k,
+        decades=float(np.ptp(xs)),
     )
 
 

@@ -29,6 +29,8 @@ from dataclasses import dataclass
 
 import numpy as np
 
+from . import sweep
+
 # Faraday constant, C/mol (CODATA).
 FARADAY_C_PER_MOL = 96485.33212
 
