@@ -48,7 +48,8 @@ st.set_page_config(
     page_icon="⚡", layout="wide",
 )
 
-SAMPLE_PATH = "sample-data/Book1-original data.xlsx"
+EIS_SAMPLE_PATH = "sample-data/EIS example.xlsx"
+LSV_SAMPLE_PATH = "sample-data/LSV Example.xlsx"
 REPO_URL = "https://github.com/rajeev4187/LSV-Analysis-iR-compensation-Tafel-slope"
 CITATION_TEXT = (
     f"Kumar, R. (2026). {APP_NAME} "
@@ -273,16 +274,13 @@ def _padded_frame(columns: dict[str, list]) -> pd.DataFrame:
 # --------------------------------------------------------------------------- #
 # Data loading                                                                #
 # --------------------------------------------------------------------------- #
-def sidebar_data_loader():
-    """Render the data-source controls.
+def _clear_reset_control():
+    """Sidebar button to wipe all uploaded data / session state.
 
-    Returns ``(eis_list, lsv_list, label)`` where each list holds one or more
-    datasets parsed from repeated column pairs in the sheet/file.
+    Shared by the EIS/Ru and LSV/iR tabs (and everything else keyed off
+    ``uploader_nonce``) since it resets every uploader in the app at once.
     """
-    st.sidebar.header("1 · Data source")
-
-    # Clear / reset: bump a nonce so the file_uploader widgets are recreated
-    # empty, and wipe loaded state. Uploads live only in this session's memory.
+    st.sidebar.header("Data controls")
     if "uploader_nonce" not in st.session_state:
         st.session_state.uploader_nonce = 0
     if st.sidebar.button("🗑️ Clear / reset files",
@@ -292,68 +290,118 @@ def sidebar_data_loader():
             if k not in ("uploader_nonce", "authed"):
                 del st.session_state[k]
         st.rerun()
-    nonce = st.session_state.uploader_nonce
 
-    # Upload is the default; the bundled sample is opt-in (not preloaded).
-    source = st.sidebar.radio(
-        "Choose input",
-        ["Upload Excel workbook", "Upload two CSV files", "Use bundled sample"],
-        help="Excel: EIS sheet = Z', Z'' pairs; LSV sheet = Potential, Current "
-             "pairs. Several datasets may sit side-by-side as repeated pairs.",
+
+def eis_data_loader():
+    """Render the EIS/Ru tab's own data-source controls.
+
+    Independent of the LSV/iR tab's loader (each tab uploads its own file,
+    matching the LSV Analysis and RRDE tabs) but still *linked* to it: the
+    sidebar "Sample" selector below pairs EIS dataset *i* with LSV dataset
+    *i* by position once both are loaded. Returns ``(eis_list, name)``.
+    """
+    st.markdown(
+        "**Data source** — EIS spectrum (Z', Z'' pairs), used to extract Ru. "
+        "Paired with the LSV iR Correction tab's data by sample position."
     )
-
+    nonce = st.session_state.get("uploader_nonce", 0)
+    source = st.radio(
+        "Choose input", ["Upload Excel workbook", "Upload CSV file",
+                          "Use bundled sample"],
+        horizontal=True, key="eis_source",
+        help="Z', Z'' pairs. Several datasets may sit side-by-side as "
+             "repeated column pairs.",
+    )
     try:
         if source in ("Use bundled sample", "Upload Excel workbook"):
             if source == "Use bundled sample":
-                src = SAMPLE_PATH
-                name = "sample-data/Book1.xlsx"
+                src, name = EIS_SAMPLE_PATH, EIS_SAMPLE_PATH
             else:
-                up = st.sidebar.file_uploader(
-                    "Excel (.xlsx)", type=["xlsx", "xls"],
-                    key=f"xlsx_{nonce}",
+                up = st.file_uploader(
+                    "Excel (.xlsx)", type=["xlsx", "xls"], key=f"eis_xlsx_{nonce}"
                 )
                 if up is None:
-                    st.info("⬅️ Upload an Excel workbook to begin.")
-                    return None, None, None
-                src = io.BytesIO(up.read())
-                name = up.name
+                    st.info("⬆️ Upload an Excel workbook to begin.")
+                    return None, None
+                src, name = io.BytesIO(up.read()), up.name
             sheets = data_io.list_sheets(src)
             if hasattr(src, "seek"):
                 src.seek(0)
-            eis_sheet = st.sidebar.selectbox("EIS sheet", sheets, index=0)
-            lsv_sheet = st.sidebar.selectbox(
-                "LSV sheet", sheets, index=min(1, len(sheets) - 1)
+            sheet = st.selectbox("EIS sheet", sheets, index=0, key="eis_sheet")
+            if hasattr(src, "seek"):
+                src.seek(0)
+            eis_list = data_io.load_eis_datasets(src, sheet=sheet)
+            return eis_list, name
+
+        up = st.file_uploader(
+            "EIS CSV (Z', Z'')", type=["csv", "txt"], key=f"eis_csv_{nonce}"
+        )
+        if up is None:
+            st.info("⬆️ Upload a CSV file to begin.")
+            return None, None
+        eis_list = data_io.load_eis_datasets(io.BytesIO(up.read()), sheet=None)
+        return eis_list, up.name
+
+    except Exception as exc:  # surface loader errors instead of a stack trace
+        st.error(f"Could not load EIS data: {exc}")
+        return None, None
+
+
+def lsv_data_loader():
+    """Render the LSV iR Correction tab's own data-source controls.
+
+    Mirrors :func:`eis_data_loader` — see its docstring for the pairing
+    ("linked") behaviour. Returns ``(lsv_list, name)``.
+    """
+    st.markdown(
+        "**Data source** — LSV curve (Potential, Current pairs), corrected "
+        "using the Ru fitted in the EIS/Ru Analysis tab. Paired with that "
+        "tab's data by sample position."
+    )
+    nonce = st.session_state.get("uploader_nonce", 0)
+    source = st.radio(
+        "Choose input", ["Upload Excel workbook", "Upload CSV file",
+                          "Use bundled sample"],
+        horizontal=True, key="lsv_source",
+        help="Potential, Current pairs. Several datasets may sit side-by-side "
+             "as repeated column pairs.",
+    )
+    try:
+        if source in ("Use bundled sample", "Upload Excel workbook"):
+            if source == "Use bundled sample":
+                src, name = LSV_SAMPLE_PATH, LSV_SAMPLE_PATH
+            else:
+                up = st.file_uploader(
+                    "Excel (.xlsx)", type=["xlsx", "xls"], key=f"lsv_xlsx_{nonce}"
+                )
+                if up is None:
+                    st.info("⬆️ Upload an Excel workbook to begin.")
+                    return None, None
+                src, name = io.BytesIO(up.read()), up.name
+            sheets = data_io.list_sheets(src)
+            if hasattr(src, "seek"):
+                src.seek(0)
+            sheet = st.selectbox(
+                "LSV sheet", sheets, index=min(1, len(sheets) - 1), key="lsv_sheet"
             )
             if hasattr(src, "seek"):
                 src.seek(0)
-            eis_list = data_io.load_eis_datasets(src, sheet=eis_sheet)
-            if hasattr(src, "seek"):
-                src.seek(0)
-            lsv_list = data_io.load_lsv_datasets(src, sheet=lsv_sheet)
-            return eis_list, lsv_list, name
+            lsv_list = data_io.load_lsv_datasets(src, sheet=sheet)
+            return lsv_list, name
 
-        # Two CSV files
-        eis_up = st.sidebar.file_uploader(
-            "EIS CSV (Z', Z'')", type=["csv", "txt"], key=f"eis_csv_{nonce}"
-        )
-        lsv_up = st.sidebar.file_uploader(
+        up = st.file_uploader(
             "LSV CSV (Potential, Current)", type=["csv", "txt"],
             key=f"lsv_csv_{nonce}",
         )
-        if eis_up is None or lsv_up is None:
-            st.info("⬅️ Upload both CSV files to begin.")
-            return None, None, None
-        eis_list = data_io.load_eis_datasets(
-            io.BytesIO(eis_up.read()), sheet=None
-        )
-        lsv_list = data_io.load_lsv_datasets(
-            io.BytesIO(lsv_up.read()), sheet=None
-        )
-        return eis_list, lsv_list, f"{eis_up.name} + {lsv_up.name}"
+        if up is None:
+            st.info("⬆️ Upload a CSV file to begin.")
+            return None, None
+        lsv_list = data_io.load_lsv_datasets(io.BytesIO(up.read()), sheet=None)
+        return lsv_list, up.name
 
     except Exception as exc:  # surface loader errors instead of a stack trace
-        st.sidebar.error(f"Could not load data: {exc}")
-        return None, None, None
+        st.error(f"Could not load LSV data: {exc}")
+        return None, None
 
 
 # --------------------------------------------------------------------------- #
@@ -408,7 +456,7 @@ def sidebar_units(current_default: str | None = None,
     resistance disagree on area-normalisation; otherwise the units are already
     consistent and area is bypassed.
     """
-    st.sidebar.header("3 · Units & electrode area")
+    st.sidebar.header("Units & electrode area")
     st.sidebar.caption(
         "The ohmic drop I·Ru must come out in volts. Tell the app how the LSV "
         "current and the EIS resistance are reported — an electrode area is "
@@ -579,11 +627,17 @@ def render_eis_tab(eis_d, eis_list, sel, ru_unit: str = "Ω",
         if ru_for_marker is not None:
             fig.add_trace(
                 go.Scatter(
-                    x=[ru_for_marker], y=[0], mode="markers+text",
-                    name="Ru", text=[f"Ru={ru_for_marker:.2f} {disp_unit}"],
-                    textposition="top center",
-                    marker={"size": 13, "color": "red", "symbol": "x"},
+                    x=[ru_for_marker], y=[0], mode="markers",
+                    name="Ru", marker={"size": 13, "color": "red", "symbol": "x"},
                 )
+            )
+            # A real annotation (not scatter text) so the edit config's
+            # annotationPosition lets the user drag it off the data if it
+            # starts out overlapping nearby points.
+            fig.add_annotation(
+                x=ru_for_marker, y=0, text=f"Ru={ru_for_marker:.2f} {disp_unit}",
+                showarrow=False, yshift=-18,
+                font={"color": "red"},
             )
         _journal_axes_style(fig, f"Z′ / {disp_unit}", f"−Z″ / {disp_unit}", font_size)
         fig.update_yaxes(scaleanchor="x", scaleratio=1)  # equal aspect -> true circle
@@ -709,7 +763,8 @@ def _build_export_csv(lsv_d, results, ru, current_unit, ru_unit="Ω") -> str:
 
 
 def render_lsv_tab(lsv_d, ru: float | None, current_unit: str = "mA",
-                   ru_unit: str = "Ω", area_cm2: float | None = None):
+                   ru_unit: str = "Ω", area_cm2: float | None = None,
+                   sample_label: str = "Sample 1"):
     st.subheader("LSV — ohmic-drop (iR) correction")
     if ru is None:
         st.warning("Determine Ru on the **EIS / Ru Analysis** tab first.")
@@ -725,12 +780,12 @@ def render_lsv_tab(lsv_d, ru: float | None, current_unit: str = "mA",
             st.caption(
                 f"Current is **{current_unit}** — using area {area_cm2:g} cm² "
                 f"→ effective Ru = **{ru_eff:.3f} {eff_unit}**. "
-                "(Set units in the sidebar · section 3.)"
+                "(Set units in the sidebar · Units & electrode area.)"
             )
         else:
             st.caption(
                 f"Current is **{current_unit}**, Ru in **{ru_unit}** — units "
-                "consistent. (Set units in the sidebar · section 3.)"
+                "consistent. (Set units in the sidebar · Units & electrode area.)"
             )
         factors = st.multiselect(
             "Compensation factors (%) — compare several",
@@ -789,7 +844,13 @@ def render_lsv_tab(lsv_d, ru: float | None, current_unit: str = "mA",
             horizontal=True,
             help="Both show the LSV with vs without iR compensation.",
         )
-        x_range = y_range = None
+        # Pad the full data extent (raw + every corrected curve) so traces
+        # never touch the plot border — Plotly's own autorange sometimes
+        # snaps the window tight to the data, clipping the last point.
+        x_pad = (x_hi - x_lo) * 0.04 or 0.01
+        y_pad = (y_hi - y_lo) * 0.08 or 0.01
+        x_range = [x_lo - x_pad, x_hi + x_pad]
+        y_range = [y_lo - y_pad, y_hi + y_pad]
         with st.expander("🔧 Axis range (applies to plot & TIFF export)"):
             if st.checkbox("Set axis limits manually"):
                 cx1, cx2 = st.columns(2)
@@ -810,23 +871,28 @@ def render_lsv_tab(lsv_d, ru: float | None, current_unit: str = "mA",
                     y_range = [ymin, ymax]
                 else:
                     st.caption("Max must exceed min; using auto range.")
+        raw_hover = "Raw · %{x:.3f} V, %{y:.3f} " + current_unit + "<extra></extra>"
         if view == "Overlay (same axes)":
             fig = go.Figure()
             fig.add_trace(
                 go.Scatter(x=lsv_d.potential, y=lsv_d.current, mode="lines",
                            name="Without iR comp (raw)",
-                           line={"color": "#1f77b4", "width": 3})
+                           line={"color": "#1f77b4", "width": 2.5},
+                           hovertemplate=raw_hover)
             )
             for i, r in enumerate(results):
+                pct = int(r.factor_percent)
                 fig.add_trace(
                     go.Scatter(
                         x=r.potential_corrected, y=lsv_d.current, mode="lines",
-                        name=f"With iR comp {int(r.factor_percent)}%",
-                        line={"color": _PALETTE[i % len(_PALETTE)]},
+                        name=f"With iR comp {pct}%",
+                        line={"color": _PALETTE[i % len(_PALETTE)], "width": 2.5},
+                        hovertemplate=(f"iR {pct}% · " + "%{x:.3f} V, %{y:.3f} "
+                                       + current_unit + "<extra></extra>"),
                     )
                 )
             fig.update_layout(
-                title="LSV — with vs without iR compensation",
+                title=f"LSV — {sample_label} — with vs without iR compensation",
                 xaxis_title="Potential / V",
                 yaxis_title=f"Current / {current_unit}",
             )
@@ -840,15 +906,19 @@ def render_lsv_tab(lsv_d, ru: float | None, current_unit: str = "mA",
             fig.add_trace(
                 go.Scatter(x=lsv_d.potential, y=lsv_d.current, mode="lines",
                            name="Without iR comp (raw)",
-                           line={"color": "#1f77b4", "width": 3}),
+                           line={"color": "#1f77b4", "width": 2.5},
+                           hovertemplate=raw_hover),
                 row=1, col=1,
             )
             for i, r in enumerate(results):
+                pct = int(r.factor_percent)
                 fig.add_trace(
                     go.Scatter(
                         x=r.potential_corrected, y=lsv_d.current, mode="lines",
-                        name=f"With iR comp {int(r.factor_percent)}%",
-                        line={"color": _PALETTE[i % len(_PALETTE)]},
+                        name=f"With iR comp {pct}%",
+                        line={"color": _PALETTE[i % len(_PALETTE)], "width": 2.5},
+                        hovertemplate=(f"iR {pct}% · " + "%{x:.3f} V, %{y:.3f} "
+                                       + current_unit + "<extra></extra>"),
                     ),
                     row=1, col=2,
                 )
@@ -857,13 +927,14 @@ def render_lsv_tab(lsv_d, ru: float | None, current_unit: str = "mA",
             fig.update_yaxes(
                 title_text=f"Current / {current_unit}", row=1, col=1
             )
-            fig.update_layout(title="LSV — with vs without iR compensation")
+            fig.update_layout(
+                title=f"LSV — {sample_label} — with vs without iR compensation"
+            )
 
-        # Apply manual axis ranges (affects both the on-screen plot and TIFF).
-        if x_range is not None:
-            fig.update_xaxes(range=x_range)
-        if y_range is not None:
-            fig.update_yaxes(range=y_range)
+        # Padded default range (or the user's manual override) — applies to
+        # every x/y axis in the figure, including both side-by-side panels.
+        fig.update_xaxes(range=x_range)
+        fig.update_yaxes(range=y_range)
 
         # Legend at the bottom so it never overlaps the title / subplot titles.
         # Journal style (Arial, box-border axes) applied globally, which
@@ -880,11 +951,16 @@ def render_lsv_tab(lsv_d, ru: float | None, current_unit: str = "mA",
                         "font": {"family": "Arial", "size": max(11, round(font_size * 0.55))},
                         "bgcolor": "rgba(255,255,255,0.7)"},
             margin={"l": 10, "r": 10, "t": 60, "b": 90},
+            hovermode="x unified",
+            hoverlabel={"font": {"family": "Arial", "size": 12}},
         )
-        fig.update_xaxes(**_BOX_AXIS_STYLE)
+        fig.update_xaxes(showspikes=True, spikemode="across",
+                         spikethickness=1, spikedash="dot",
+                         spikecolor="#888", **_BOX_AXIS_STYLE)
         fig.update_yaxes(**_BOX_AXIS_STYLE)
         st.plotly_chart(fig, use_container_width=True, config=_PLOTLY_EDIT_CONFIG)
         fac_png = "-".join(str(int(r.factor_percent)) for r in results)
+        slug = re.sub(r"\W+", "_", sample_label).strip("_").lower()
         plotted = {
             "Potential raw (V)": lsv_d.potential,
             f"Current raw ({current_unit})": lsv_d.current,
@@ -894,7 +970,7 @@ def render_lsv_tab(lsv_d, ru: float | None, current_unit: str = "mA",
             plotted[f"Potential iR-corrected {pct}% (V)"] = r.potential_corrected
             plotted[f"Current iR-corrected {pct}% ({current_unit})"] = lsv_d.current
         figure_downloads(
-            fig, f"lsv_iR_comparison_f{fac_png}pct", key="png_lsv",
+            fig, f"lsv_iR_comparison_{slug}_f{fac_png}pct", key="png_lsv",
             what="Comparison plot", data=_padded_frame(plotted),
         )
 
@@ -946,7 +1022,7 @@ def render_lsv_tab(lsv_d, ru: float | None, current_unit: str = "mA",
     st.download_button(
         "⬇️ Download results table (CSV)",
         data=summary.to_csv(index=False).encode("utf-8"),
-        file_name=f"ir_results_summary_Ru{ru:.1f}.csv",
+        file_name=f"ir_results_summary_{slug}_Ru{ru:.1f}.csv",
         mime="text/csv",
         key="dl_summary",
     )
@@ -954,7 +1030,7 @@ def render_lsv_tab(lsv_d, ru: float | None, current_unit: str = "mA",
     for c, fmt in numeric_fmt.items():
         display[c] = [fmt % v for v in summary[c]]
     _journal_table_figure(  # CSV of this table is the results button above
-        display, font_size, f"ir_results_table_Ru{ru:.1f}", key="png_lsv_table",
+        display, font_size, f"ir_results_table_{slug}_Ru{ru:.1f}", key="png_lsv_table",
     )
 
     # Warn if any selected factor over-compensates, and recommend a safe one.
@@ -1750,18 +1826,25 @@ def render_tafel_tab() -> None:
                     st.session_state[range_key] = sel_range
             c0, cg, cr, c1, c2 = st.columns([1.0, 1.0, 0.8, 1.7, 0.5])
             display_name = c0.text_input(
-                "Legend name", value=lbl, key=f"tafel_name_{i}",
-                help="Shown in the plot legend; edit if the auto-detected "
-                     "name isn't the one you want.",
+                "Legend name", value=f"Sample {i + 1}", key=f"tafel_name_{i}",
+                help="Shown in the plot legend; edit if you'd rather show "
+                     "the auto-detected file/column name.",
             )
+            # Only pre-fill a guess when the label carries the "(2)"/"(3)"
+            # suffix _dedup_label adds for a genuine repeat upload (same
+            # base file/folder loaded more than once) — otherwise leave it
+            # blank so a one-off sample doesn't look like it was grouped.
+            default_group = (_default_replicate_group(lbl)
+                             if _REPLICATE_SUFFIX.search(lbl) else "")
             replicate_group = cg.text_input(
-                "Replicate group", value=_default_replicate_group(lbl),
-                key=f"tafel_group_{i}",
+                "Replicate group", value=default_group, key=f"tafel_group_{i}",
+                placeholder="Blank = no repeats",
                 help="Give two or more samples the same group name to treat "
                      "them as repeat scans of the same underlying sample — "
                      "their fitted values (Tafel slope, onset, η@j, …) are "
                      "then also reported as a mean ± SD in the **Replicate "
-                     "statistics** section below.",
+                     "statistics** section below. Pre-filled only when the "
+                     "sample was auto-detected as a repeat upload.",
             )
             sample_reaction = cr.selectbox(
                 "Reaction", _TAFEL_REACTIONS,
@@ -2020,7 +2103,6 @@ def render_tafel_tab() -> None:
             "Reaction": f["reaction"],
             "Tafel slope (mV/dec)": round(slope_abs, 1),
             "R2": round(r.r_squared, 4),
-            f"Intercept current at E=0 ({display_unit})": r.exchange_current,
             "Fit points": f["stop"] - f["start"],
             "Nearest mechanistic benchmark": (
                 f"~{ref[0]:.0f} mV/dec ({ref[1]})" if ref else "—"
@@ -2045,6 +2127,17 @@ def render_tafel_tab() -> None:
             )
         rows.append(row)
     summary = pd.DataFrame(rows)
+
+    # A sample's "Replicate group" defaults to its own name (see the
+    # per-sample controls above) so genuine repeat uploads auto-group; blank
+    # it back out here for groups of exactly one so a one-off sample doesn't
+    # display a group name it was never actually grouped under.
+    group_counts = summary["Replicate group"].value_counts()
+    has_replicates = bool((group_counts > 1).any())
+    summary["Replicate group"] = [
+        g if group_counts[g] > 1 else "" for g in summary["Replicate group"]
+    ]
+
     st.markdown("**Results summary**")
     st.dataframe(summary, use_container_width=True, hide_index=True)
     st.download_button(
@@ -2056,30 +2149,14 @@ def render_tafel_tab() -> None:
     )
 
     # Render the numbers explicitly (the CSV above keeps the full-precision
-    # floats); an intercept current is otherwise printed with a long tail of
-    # zeros that blows the column width out.
+    # floats).
     display = summary.copy()
-    intercept_col = f"Intercept current at E=0 ({display_unit})"
-    display[intercept_col] = [
-        "—" if v is None or not np.isfinite(v) else f"{v:.3e}"
-        for v in summary[intercept_col]
-    ]
     display["R2"] = [f"{v:.4f}" for v in summary["R2"]]
     _journal_table_figure(  # CSV of this table is the summary button above
         display, font_size, "tafel_results_table", key="png_tafel_table",
     )
-    st.caption(
-        "ℹ️ On the RHE scale, 0 V is exactly the H⁺/H₂ equilibrium potential, "
-        "so for **HER and HOR** the intercept current above is the physical "
-        "*exchange current* i₀. Every other reaction has its equilibrium "
-        "potential elsewhere — OER/ORR ≈ 1.23 V, NO₃RR (to NH₃) ≈ 0.69 V, "
-        "N₂RR (to NH₃) ≈ 0.09 V, CO₂RR ≈ −0.1 V (product-dependent) vs RHE — "
-        "so there the intercept is a fit-extrapolation value only. Re-express "
-        "the potential as an overpotential (η = E_RHE − E_eq) before fitting "
-        "if i₀ is what you need."
-    )
 
-    if summary["Replicate group"].duplicated().any():
+    if has_replicates:
         st.markdown("**Replicate statistics**")
         st.caption(
             "Samples sharing the same **Replicate group** name above (set in "
@@ -2094,7 +2171,10 @@ def render_tafel_tab() -> None:
             if c not in exclude and pd.api.types.is_numeric_dtype(summary[c])
         ]
         rep_rows = []
-        for group_name, gdf in summary.groupby(group_col, sort=False):
+        # Blanked-out singletons all share "" — exclude them so they don't
+        # get lumped together as a fake shared group.
+        grouped = summary[summary[group_col] != ""]
+        for group_name, gdf in grouped.groupby(group_col, sort=False):
             rep_row = {
                 "Replicate group": group_name,
                 "Reaction": "/".join(dict.fromkeys(gdf["Reaction"])),  # order-preserving unique
@@ -2125,11 +2205,19 @@ def render_tafel_tab() -> None:
     if len(results) >= 2 and target_js:
         st.markdown("**Benchmark overpotential comparison**")
         st.caption(
-            "One bar per replicate group — its mean across repeat runs, "
-            "with an error bar of ±1 SD where more than one run shares "
-            "that group — at each benchmark current density configured "
-            "above (e.g. j = 10 and 2 " + display_unit + ")."
+            "One bar per sample by default; samples sharing a **Replicate "
+            "group** name above are instead merged into one bar (its mean "
+            "across those repeat runs, with an error bar of ±1 SD) — at "
+            "each benchmark current density configured above (e.g. j = 10 "
+            "and 2 " + display_unit + ")."
         )
+        # Bar per sample, unless it has a real (non-blank) replicate group —
+        # then bar per group. A blank group is unique to its own sample, so
+        # one-off samples never get silently merged with unrelated ones.
+        bar_key = [
+            g if g else s
+            for g, s in zip(summary["Replicate group"], summary["Sample"])
+        ]
         for target_j in target_js:
             target_cols = [c for c in summary.columns if f"j={target_j:g}" in c]
             if not target_cols:
@@ -2142,11 +2230,11 @@ def render_tafel_tab() -> None:
             for c in target_cols[1:]:
                 values = values.combine_first(summary[c])
             bar_df = pd.DataFrame({
-                "Replicate group": summary["Replicate group"], "value": values,
+                "Sample": bar_key, "value": values,
             }).dropna(subset=["value"])
             if bar_df.empty:
                 continue
-            grouped = bar_df.groupby("Replicate group", sort=False)["value"]
+            grouped = bar_df.groupby("Sample", sort=False)["value"]
             means = grouped.mean()
             stds = grouped.std(ddof=1).fillna(0.0)
             ylabel = target_cols[0] if len(target_cols) == 1 else f"Value @ j={target_j:g}"
@@ -2164,7 +2252,6 @@ def render_tafel_tab() -> None:
                 margin={"l": 10, "r": 10, "t": 60, "b": 10},
             )
             fig_bar.update_xaxes(
-                title={"text": "Replicate group", "font": {"family": "Arial", "size": font_size}},
                 tickfont={"family": "Arial", "size": font_size}, **_BOX_AXIS_STYLE,
             )
             fig_bar.update_yaxes(
@@ -2177,7 +2264,7 @@ def render_tafel_tab() -> None:
                 key=f"png_tafel_bar_{target_j:g}",
                 what=f"Benchmark overpotential bar chart @ j={target_j:g}",
                 data=_padded_frame({
-                    "Replicate group": list(means.index),
+                    "Sample": list(means.index),
                     "Mean": list(means.to_numpy()),
                     "SD": list(stds.to_numpy()),
                 }),
@@ -3601,8 +3688,18 @@ def render_orr_tab() -> None:
                  "typical published RRDE overlay).",
         )
         p = prepared[rrde_label]
+        rpm_pick = st.multiselect(
+            "Rotation rates to show", p["rpm_values"], default=p["rpm_values"],
+            format_func=lambda v: f"{v:g} rpm", key=f"orr_rrde_rpms_{rrde_label}",
+            help="Deselect a rotation rate to drop it from this overlay "
+                 "(and its TIFF/CSV export) without affecting the rest of "
+                 "the ORR analysis above.",
+        )
+        if not rpm_pick:
+            st.info("Select at least one rotation rate to plot.")
+            rpm_pick = p["rpm_values"]
         fig_rrde = go.Figure()
-        for i, rv in enumerate(p["rpm_values"]):
+        for i, rv in enumerate(rpm_pick):
             m = np.isclose(p["rpm"], rv)
             color = _PALETTE[i % len(_PALETTE)]
             if p["has_ring"]:
@@ -3629,11 +3726,13 @@ def render_orr_tab() -> None:
             fig_rrde.add_hline(y=0, line_color="black", line_width=1)
         _style_axes(fig_rrde, "Potential vs RHE / V", f"Current ({display_unit})")
         fig_rrde.update_layout(height=560)
-        rrde_y_vals = [p["disk"]] + ([p["ring"]] if p["has_ring"] else [])
+        rpm_mask = np.isin(p["rpm"], rpm_pick)
+        rrde_y_vals = ([p["disk"][rpm_mask]]
+                       + ([p["ring"][rpm_mask]] if p["has_ring"] else []))
         all_cur_rrde = np.concatenate(rrde_y_vals)
         rrde_x_range, rrde_y_range = _range_controls(
             "orr_rrde", "Potential (V)", f"Current ({display_unit})",
-            float(np.min(p["potential"])), float(np.max(p["potential"])),
+            float(np.min(p["potential"][rpm_mask])), float(np.max(p["potential"][rpm_mask])),
             float(np.min(all_cur_rrde)), float(np.max(all_cur_rrde)),
         )
         if rrde_x_range is not None:
@@ -3642,7 +3741,7 @@ def render_orr_tab() -> None:
             fig_rrde.update_yaxes(range=rrde_y_range)
         st.plotly_chart(fig_rrde, use_container_width=True, config=_PLOTLY_EDIT_CONFIG)
         rrde_cols: dict[str, list] = {}
-        for rv in p["rpm_values"]:
+        for rv in rpm_pick:
             m = np.isclose(p["rpm"], rv)
             rrde_cols[f"{rv:g}rpm — Potential vs RHE (V)"] = list(p["potential"][m])
             rrde_cols[f"{rv:g}rpm — Disk current ({display_unit})"] = list(p["disk"][m])
@@ -3667,56 +3766,81 @@ def main():
         "independent Tafel-slope analysis"
     )
 
-    eis_list, lsv_list, label = sidebar_data_loader()
+    _clear_reset_control()
 
     tab_eis, tab_lsv, tab_tafel, tab_kl, tab_orr = st.tabs(
         ["📈 EIS / Ru Analysis", "🔬 LSV iR Correction", "📐 LSV Analysis",
          "📉 K-L Analysis", "⚛️ ORR / RRDE Analysis"]
     )
 
-    if eis_list and lsv_list:
-        # Link EIS dataset i with LSV dataset i (paired samples).
-        n_pairs = min(len(eis_list), len(lsv_list))
-        st.sidebar.header("2 · Sample")
-        if len(eis_list) != len(lsv_list):
-            st.sidebar.warning(
-                f"EIS has {len(eis_list)} dataset(s) but LSV has "
-                f"{len(lsv_list)}. Pairing the first {n_pairs} by position."
-            )
-        options = list(range(n_pairs))
-        sel = st.sidebar.selectbox(
-            "Active sample (EIS ↔ LSV pair)",
-            options,
-            format_func=lambda i: f"Sample {i + 1}",
-            help="EIS pair i is linked to LSV pair i.",
-        )
-        eis_d, lsv_d = eis_list[sel], lsv_list[sel]
-        st.sidebar.success(
-            f"Loaded: {label}\n\n{n_pairs} sample(s) · "
-            f"Sample {sel + 1}: EIS {len(eis_d)} pts · LSV {len(lsv_d)} pts\n\n"
-            f"EIS cols: {eis_d.label}\n\nLSV cols: {lsv_d.label}"
-        )
+    with tab_eis:
+        eis_list, eis_name = eis_data_loader()
+    with tab_lsv:
+        lsv_list, lsv_name = lsv_data_loader()
 
-        cur_default, ru_default = _detect_units(eis_d.label, lsv_d.label)
+    eis_d = lsv_d = None
+    sel, n_pairs = 0, 0
+    current_unit, ru_unit, area_cm2 = "mA", "Ω", None
+    if eis_list or lsv_list:
+        # Link EIS dataset i with LSV dataset i by position — each tab has
+        # its own uploader, but they still share one "active sample" so the
+        # Ru fitted from EIS pair i is the one applied to LSV pair i. The
+        # selector itself lives on the EIS/Ru tab; the LSV tab shows a
+        # read-only caption pointing back to it (a Streamlit widget can't be
+        # rendered twice with the same identity to keep two copies in sync).
+        n_eis, n_lsv = len(eis_list or []), len(lsv_list or [])
+        n_pairs = min(n_eis, n_lsv) if (eis_list and lsv_list) else max(n_eis, n_lsv)
+        with tab_eis:
+            st.divider()
+            st.markdown(
+                "**Sample** — linked with the LSV iR Correction tab by position"
+            )
+            if eis_list and lsv_list and n_eis != n_lsv:
+                st.warning(
+                    f"EIS has {n_eis} dataset(s) but LSV has {n_lsv}. Pairing "
+                    f"the first {n_pairs} by position."
+                )
+            sel = st.selectbox(
+                "Active sample (EIS ↔ LSV pair)",
+                list(range(n_pairs)),
+                format_func=lambda i: f"Sample {i + 1}",
+                help="Also selects which LSV dataset is corrected on the "
+                     "LSV iR Correction tab.",
+            )
+        eis_d = eis_list[sel] if eis_list else None
+        lsv_d = lsv_list[sel] if lsv_list else None
+
+        cur_default, ru_default = _detect_units(
+            eis_d.label if eis_d is not None else "",
+            lsv_d.label if lsv_d is not None else "",
+        )
         current_unit, ru_unit, area_cm2 = sidebar_units(cur_default, ru_default)
 
-        with tab_eis:
+    ru = None
+    with tab_eis:
+        if eis_d is not None:
             # Returns the raw Ru in the EIS file's unit; the LSV tab reconciles it
             # with the electrode area to report both Ru and Ru effective.
             ru = render_eis_tab(eis_d, eis_list, sel, ru_unit, current_unit, area_cm2)
-        with tab_lsv:
-            render_lsv_tab(lsv_d, ru, current_unit, ru_unit, area_cm2)
-    else:
-        with tab_eis:
-            st.info(
-                "⬅️ Load an EIS/LSV workbook or CSV pair in the sidebar "
-                "(section 1) to use this tab."
-            )
-        with tab_lsv:
-            st.info(
-                "⬅️ Load an EIS/LSV workbook or CSV pair in the sidebar "
-                "(section 1) to use this tab."
-            )
+        else:
+            st.info("⬆️ Upload EIS data above to begin.")
+    with tab_lsv:
+        if lsv_d is not None:
+            if eis_d is not None:
+                st.caption(
+                    f"Linked to **Sample {sel + 1}** of {n_pairs} (change it "
+                    f"on the EIS/Ru Analysis tab) · EIS {len(eis_d)} pts · "
+                    f"LSV {len(lsv_d)} pts."
+                )
+            else:
+                st.caption(
+                    f"Sample {sel + 1} of {n_pairs} selected on the EIS/Ru "
+                    "Analysis tab — load EIS data there to compute Ru."
+                )
+            render_lsv_tab(lsv_d, ru, current_unit, ru_unit, area_cm2,
+                           sample_label=f"Sample {sel + 1}")
+        else:
+            st.info("⬆️ Upload LSV data above to begin.")
 
     with tab_tafel:
         render_tafel_tab()
