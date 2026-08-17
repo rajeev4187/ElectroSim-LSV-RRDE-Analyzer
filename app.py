@@ -3108,23 +3108,23 @@ def render_orr_tab() -> None:
     )
     desired_unit = cur3.selectbox(
         "Desired current unit", _ABS_CURRENT_UNITS,
-        index=_ABS_CURRENT_UNITS.index(current_unit), key="orr_desired_unit",
+        index=_ABS_CURRENT_UNITS.index("mA"), key="orr_desired_unit",
         help="Values are rescaled from 'as uploaded' to this unit before "
-             "any density conversion below.",
+             "any density conversion below. Defaults to mA (i.e. mA/cm² "
+             "once density-converted below), the most common RRDE unit.",
     )
     area_cm2 = cur4.number_input(
-        "Electrode area (cm²)", min_value=1e-4, value=0.196, step=0.001,
-        format="%.4f", key="orr_area_cm2",
-        help="0.196 cm² is the standard 5 mm-diameter RRDE glassy-carbon disk.",
+        "Electrode area (cm²)", min_value=1e-4, value=0.19625, step=0.001,
+        format="%.5f", key="orr_area_cm2",
+        help="0.19625 cm² is the standard 5 mm-diameter RRDE glassy-carbon disk.",
     ) if convert_density else None
     display_unit = f"{desired_unit}/cm²" if convert_density else desired_unit
     collection_efficiency = cur5.number_input(
         "Ring collection efficiency N", min_value=0.01, max_value=1.0,
-        value=0.37, step=0.01, format="%.2f", key="orr_collection_efficiency",
+        value=0.222, step=0.01, format="%.3f", key="orr_collection_efficiency",
         help="From the RRDE electrode's own calibration (e.g. a "
-             "ferri/ferrocyanide test); 0.37 is the common Pine 5 mm "
-             "Pt-ring/glassy-carbon-disk default. Only used where ring "
-             "current is available.",
+             "ferri/ferrocyanide test); 0.222 is this app's default. Only "
+             "used where ring current is available.",
     )
     if unit_hint:
         st.caption(f"ℹ️ Detected current unit from the column header: **{unit_hint}**.")
@@ -3676,16 +3676,15 @@ def render_orr_tab() -> None:
                 what="n plot", data=_padded_frame(n_data),
             )
 
-    # ---- Rotation-rate comparison, one sample, ring/disk merged axes -----
+    # ---- Rotation-rate comparison, one sample, ring/disk stacked subplots -
     multi_rpm_labels = [lbl for lbl in chosen if len(prepared[lbl]["rpm_values"]) > 1]
     if multi_rpm_labels:
         st.markdown("**Rotation-rate comparison (single sample)**")
         rrde_label = st.selectbox(
             "Sample", multi_rpm_labels, key="orr_rrde_sample",
             help="Every rotation rate this sample has, ring and disk current "
-                 "sharing one potential axis — ring reads above zero, disk "
-                 "below, so the pair reads as one merged figure (as in a "
-                 "typical published RRDE overlay).",
+                 "as two stacked sub-plots sharing one potential axis — the "
+                 "same layout as the multi-sample disk & ring plot above.",
         )
         p = prepared[rrde_label]
         rpm_pick = st.multiselect(
@@ -3698,48 +3697,110 @@ def render_orr_tab() -> None:
         if not rpm_pick:
             st.info("Select at least one rotation rate to plot.")
             rpm_pick = p["rpm_values"]
-        fig_rrde = go.Figure()
-        for i, rv in enumerate(rpm_pick):
-            m = np.isclose(p["rpm"], rv)
-            color = _PALETTE[i % len(_PALETTE)]
-            if p["has_ring"]:
+        rpm_mask = np.isin(p["rpm"], rpm_pick)
+        pot_sel = p["potential"][rpm_mask]
+        rrde_x_range, _ = _range_controls(
+            "orr_rrde", "Potential (V)", None,
+            float(np.min(pot_sel)), float(np.max(pot_sel)),
+        )
+        axis_font_rrde = {"family": "Arial", "size": font_size}
+        left_margin = 160 + (font_size - 28) * 4
+        if p["has_ring"]:
+            ring_sel, disk_sel = p["ring"][rpm_mask], p["disk"][rpm_mask]
+            _, ring_y_range = _range_controls(
+                "orr_rrde_ring_y", "Potential (V)", f"Ring current ({display_unit})",
+                float(np.min(pot_sel)), float(np.max(pot_sel)),
+                float(np.min(ring_sel)), float(np.max(ring_sel)),
+            )
+            _, disk_y_range = _range_controls(
+                "orr_rrde_disk_y", "Potential (V)", f"Disk current ({display_unit})",
+                float(np.min(pot_sel)), float(np.max(pot_sel)),
+                float(np.min(disk_sel)), float(np.max(disk_sel)),
+            )
+            # Ring on top, disk below — same merged-stacked-subplot recipe as
+            # the multi-sample disk & ring plot above (see its comments for
+            # why: shared/matched X axis, single rotated Y title spanning
+            # both rows, one-sided mirror at the seam, de-duplicated "0" tick).
+            fig_rrde = make_subplots(
+                rows=2, cols=1, shared_xaxes=True, vertical_spacing=0.025,
+                subplot_titles=("Ring", "Disk"),
+            )
+            for i, rv in enumerate(rpm_pick):
+                m = np.isclose(p["rpm"], rv)
+                color = _PALETTE[i % len(_PALETTE)]
                 fig_rrde.add_trace(go.Scatter(
                     x=p["potential"][m], y=p["ring"][m], mode="lines",
                     name=f"{rv:g} rpm", legendgroup=f"{rv:g}",
                     line={"color": color, "width": 2.5},
+                ), row=1, col=1)
+                fig_rrde.add_trace(go.Scatter(
+                    x=p["potential"][m], y=p["disk"][m], mode="lines",
+                    name=f"{rv:g} rpm", legendgroup=f"{rv:g}", showlegend=False,
+                    line={"color": color, "width": 2.5},
+                ), row=2, col=1)
+            fig_rrde.update_layout(
+                template="plotly_white", height=680, width=930,
+                font=axis_font_rrde, margin={"l": left_margin, "r": 40},
+            )
+            fig_rrde.update_xaxes(
+                title={"text": "Potential vs RHE / V", "font": axis_font_rrde},
+                tickfont=axis_font_rrde, row=2, col=1,
+            )
+            fig_rrde.add_annotation(
+                x=0, y=0.5, xref="paper", yref="paper",
+                xanchor="center", yanchor="middle", textangle=-90,
+                text=f"Current ({display_unit})", showarrow=False,
+                font=axis_font_rrde, xshift=-(left_margin - 30),
+            )
+            fig_rrde.update_yaxes(tickfont=axis_font_rrde, row=1, col=1)
+            fig_rrde.update_yaxes(tickfont=axis_font_rrde, row=2, col=1)
+            fig_rrde.update_xaxes(**_BOX_AXIS_STYLE)
+            fig_rrde.update_yaxes(**_BOX_AXIS_STYLE)
+            fig_rrde.update_xaxes(mirror=False, row=2, col=1)
+            fig_rrde.update_xaxes(matches="x")
+            if rrde_x_range is not None:
+                fig_rrde.update_xaxes(range=rrde_x_range)
+            final_ring_range = (
+                ring_y_range if ring_y_range is not None
+                else _zero_anchored_range(ring_sel)
+            )
+            final_disk_range = (
+                disk_y_range if disk_y_range is not None
+                else _zero_anchored_range(disk_sel)
+            )
+            fig_rrde.update_yaxes(range=final_ring_range, row=1, col=1)
+            fig_rrde.update_yaxes(range=final_disk_range, row=2, col=1)
+            ring_span = abs(final_ring_range[1] - final_ring_range[0])
+            ring_ticks = [
+                t for t in np.linspace(final_ring_range[0], final_ring_range[1], 5)
+                if not np.isclose(t, 0, atol=max(ring_span, 1e-9) * 1e-6)
+            ]
+            fig_rrde.update_yaxes(tickvals=ring_ticks, tickformat=".2~f", row=1, col=1)
+        else:
+            disk_sel = p["disk"][rpm_mask]
+            _, disk_y_range = _range_controls(
+                "orr_rrde_disk_y", "Potential (V)", f"Disk current ({display_unit})",
+                float(np.min(pot_sel)), float(np.max(pot_sel)),
+                float(np.min(disk_sel)), float(np.max(disk_sel)),
+            )
+            fig_rrde = go.Figure()
+            for i, rv in enumerate(rpm_pick):
+                m = np.isclose(p["rpm"], rv)
+                fig_rrde.add_trace(go.Scatter(
+                    x=p["potential"][m], y=p["disk"][m], mode="lines",
+                    name=f"{rv:g} rpm",
+                    line={"color": _PALETTE[i % len(_PALETTE)], "width": 2.5},
                 ))
-            fig_rrde.add_trace(go.Scatter(
-                x=p["potential"][m], y=p["disk"][m], mode="lines",
-                name=f"{rv:g} rpm", legendgroup=f"{rv:g}",
-                showlegend=not p["has_ring"],
-                line={"color": color, "width": 2.5},
-            ))
-        if p["has_ring"]:
-            fig_rrde.add_annotation(
-                xref="paper", yref="paper", x=0.98, y=0.95, showarrow=False,
-                text="ring", font={"family": "Arial", "size": round(font_size * 0.7)},
+            _style_axes(fig_rrde, "Potential vs RHE / V", f"Disk current ({display_unit})")
+            if rrde_x_range is not None:
+                fig_rrde.update_xaxes(range=rrde_x_range)
+            fig_rrde.update_yaxes(
+                range=disk_y_range if disk_y_range is not None
+                else _zero_anchored_range(disk_sel)
             )
-            fig_rrde.add_annotation(
-                xref="paper", yref="paper", x=0.98, y=0.05, showarrow=False,
-                text="disk", font={"family": "Arial", "size": round(font_size * 0.7)},
-            )
-            fig_rrde.add_hline(y=0, line_color="black", line_width=1)
-        _style_axes(fig_rrde, "Potential vs RHE / V", f"Current ({display_unit})")
-        fig_rrde.update_layout(height=560)
-        rpm_mask = np.isin(p["rpm"], rpm_pick)
-        rrde_y_vals = ([p["disk"][rpm_mask]]
-                       + ([p["ring"][rpm_mask]] if p["has_ring"] else []))
-        all_cur_rrde = np.concatenate(rrde_y_vals)
-        rrde_x_range, rrde_y_range = _range_controls(
-            "orr_rrde", "Potential (V)", f"Current ({display_unit})",
-            float(np.min(p["potential"][rpm_mask])), float(np.max(p["potential"][rpm_mask])),
-            float(np.min(all_cur_rrde)), float(np.max(all_cur_rrde)),
+        st.plotly_chart(
+            fig_rrde, use_container_width=not p["has_ring"], config=_PLOTLY_EDIT_CONFIG
         )
-        if rrde_x_range is not None:
-            fig_rrde.update_xaxes(range=rrde_x_range)
-        if rrde_y_range is not None:
-            fig_rrde.update_yaxes(range=rrde_y_range)
-        st.plotly_chart(fig_rrde, use_container_width=True, config=_PLOTLY_EDIT_CONFIG)
         rrde_cols: dict[str, list] = {}
         for rv in rpm_pick:
             m = np.isclose(p["rpm"], rv)
