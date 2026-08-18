@@ -142,6 +142,69 @@ def test_screen_canvas_prints_at_its_stated_width_at_every_dpi():
     assert app._SCREEN_CANVAS_W == app._cm_to_css_px(app._SCREEN_CANVAS_W_CM)
 
 
+def test_browser_discovery_collects_more_than_one_candidate():
+    """Kaleido 1.x drives a real browser and finds one from a fixed path list
+    built, on Windows, out of %PROGRAMFILES% and friends -- so a server whose
+    environment lacks those reports "requires Google Chrome to be installed"
+    on a machine that has Chrome. The app looks browsers up itself and keeps
+    every one it finds, because any single browser can also just fail to
+    launch."""
+    import app
+
+    import os
+
+    paths = app._browser_paths()
+    assert isinstance(paths, tuple)
+    assert len(set(paths)) == len(paths), "duplicate browsers in the list"
+    for path in paths:
+        assert os.path.isfile(path), f"{path} does not exist"
+    # _browser_path is the one that would be used, for reporting.
+    assert app._browser_path() == (paths[0] if paths else None)
+
+
+def test_render_falls_through_to_the_next_browser():
+    """A dead first browser must not end the export: every candidate is tried
+    before giving up, and the original error is what surfaces if none work."""
+    import plotly.graph_objects as go
+
+    import app
+
+    fig = go.Figure(go.Scatter(x=[0, 1], y=[0, 1]))
+    boom = RuntimeError("Kaleido requires Google Chrome to be installed.")
+    calls = []
+
+    def explode(**kwargs):
+        raise boom
+
+    def fake_calc(export_fig, opts, kopts):
+        calls.append(kopts["path"])
+        if kopts["path"] == "/nonexistent/chrome":
+            raise RuntimeError("could not launch")
+        return b"PNGBYTES"
+
+    kaleido = pytest.importorskip("kaleido")
+    real_calc = kaleido.calc_fig_sync
+    real_paths = app._browser_paths
+    fig.to_image = explode  # type: ignore[method-assign]
+    kaleido.calc_fig_sync = fake_calc
+    app._browser_paths = lambda: ("/nonexistent/chrome", "/second/chrome")
+    try:
+        assert app._kaleido_render(fig, {"format": "png"}) == b"PNGBYTES"
+        assert calls == ["/nonexistent/chrome", "/second/chrome"], (
+            "should try each browser in turn"
+        )
+
+        # Nothing available at all -> the original failure is re-raised, so the
+        # message the user sees is kaleido's own rather than a masking one.
+        app._browser_paths = lambda: ()
+        with pytest.raises(RuntimeError) as excinfo:
+            app._kaleido_render(fig, {"format": "png"})
+        assert excinfo.value is boom
+    finally:
+        kaleido.calc_fig_sync = real_calc
+        app._browser_paths = real_paths
+
+
 def test_fonts_name_fallbacks_the_export_renderer_can_actually_find():
     """The live chart is drawn by the user's browser, the TIFF by kaleido's
     headless Chromium on the server -- often a slim Linux container with no

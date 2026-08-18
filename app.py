@@ -27,6 +27,7 @@ Workflow
 from __future__ import annotations
 
 import functools
+import glob
 import hashlib
 import hmac
 import io
@@ -294,70 +295,107 @@ def _flatten_to_rgb(image: "Image.Image") -> "Image.Image":
     return flat
 
 
+# Where a browser fetched by "Fetch a renderer" is kept -- the same place
+# kaleido's own `plotly_get_chrome` puts one, so either route satisfies both.
+_BROWSER_DEPS_DIR = os.path.join(
+    os.path.expanduser("~"), ".cache" if sys.platform != "win32" else
+    os.path.join("AppData", "Local"), "plotly", "choreographer", "deps",
+)
+
+
 @functools.lru_cache(maxsize=1)
-def _browser_path() -> str | None:
-    """Full path to an installed Chrome/Chromium, or ``None`` if there is none.
+def _browser_paths() -> tuple[str, ...]:
+    """Every Chromium-family browser on this machine, best first.
 
-    Kaleido 1.x dropped the bundled browser the 0.x wheels carried and now
-    drives a real Chrome. It finds one by checking a fixed list of install
-    locations, and on Windows that list is built from ``%PROGRAMFILES%``,
-    ``%PROGRAMFILES(X86)%`` and ``%LOCALAPPDATA%`` -- so a server started
-    from an environment where those are missing or rewritten reports "Kaleido
-    requires Google Chrome to be installed" on a machine where Chrome is
-    sitting in Program Files. Looking it up here as well gives
-    :func:`_render_export` a path to hand kaleido explicitly when its own
-    discovery comes up empty.
+    Kaleido 1.x dropped the browser the 0.x wheels bundled and drives a real
+    one, which it locates from a fixed list of install paths -- on Windows
+    built out of ``%PROGRAMFILES%``, ``%PROGRAMFILES(X86)%`` and
+    ``%LOCALAPPDATA%``. A server started from an environment that drops or
+    rewrites those reports "Kaleido requires Google Chrome to be installed" on
+    a machine with Chrome sitting in Program Files, so the paths are gathered
+    here too and handed over explicitly.
+
+    Several are collected, not one, because any single browser can also just
+    fail to launch (a half-dead process holding its profile, an update in
+    progress). **Edge** is in the list on purpose: it is Chromium underneath,
+    kaleido drives it perfectly well, and every Windows machine has it -- so
+    on the platform where discovery is most fragile there is always a
+    fallback that needs nothing installed.
     """
-    for exe in ("chrome", "google-chrome", "google-chrome-stable", "chromium",
-                "chromium-browser"):
-        found = shutil.which(exe)
-        if found:
-            return found
+    found: list[str] = []
 
-    candidates: list[str] = []
+    def add(path: str | None) -> None:
+        if path and os.path.isfile(path) and path not in found:
+            found.append(path)
+
+    for exe in ("chrome", "google-chrome", "google-chrome-stable", "chromium",
+                "chromium-browser", "msedge", "microsoft-edge"):
+        add(shutil.which(exe))
+
     if sys.platform == "win32":
         roots = [os.environ.get("PROGRAMFILES", r"C:\Program Files"),
                  os.environ.get("PROGRAMFILES(X86)", r"C:\Program Files (x86)"),
                  os.environ.get("LOCALAPPDATA", "")]
         for root in filter(None, roots):
-            candidates += [
-                rf"{root}\Google\Chrome\Application\chrome.exe",
-                rf"{root}\Chromium\Application\chrome.exe",
-            ]
+            add(rf"{root}\Google\Chrome\Application\chrome.exe")
+            add(rf"{root}\Chromium\Application\chrome.exe")
+            add(rf"{root}\Microsoft\Edge\Application\msedge.exe")
+            add(rf"{root}\BraveSoftware\Brave-Browser\Application\brave.exe")
     elif sys.platform == "darwin":
-        candidates += [
-            "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
-            "/Applications/Chromium.app/Contents/MacOS/Chromium",
-        ]
+        add("/Applications/Google Chrome.app/Contents/MacOS/Google Chrome")
+        add("/Applications/Chromium.app/Contents/MacOS/Chromium")
+        add("/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge")
     else:
-        candidates += ["/usr/bin/google-chrome-stable", "/usr/bin/google-chrome",
-                       "/usr/bin/chromium", "/usr/bin/chromium-browser"]
-    return next((p for p in candidates if os.path.isfile(p)), None)
+        for path in ("/usr/bin/google-chrome-stable", "/usr/bin/google-chrome",
+                     "/usr/bin/chromium", "/usr/bin/chromium-browser",
+                     "/usr/bin/microsoft-edge", "/snap/bin/chromium"):
+            add(path)
+
+    # Anything a previous "fetch a renderer" downloaded (see _fetch_browser).
+    for exe in ("chrome.exe", "chrome", "Google Chrome for Testing"):
+        for path in glob.glob(os.path.join(_BROWSER_DEPS_DIR, "**", exe),
+                              recursive=True):
+            add(path)
+    return tuple(found)
 
 
-def _figure_to_png(export_fig, width: int, height: int, scale: float) -> bytes:
-    """Kaleido's PNG for a figure, retrying with an explicitly located browser.
+def _browser_path() -> str | None:
+    """The browser :func:`_render_export` would use, for reporting."""
+    paths = _browser_paths()
+    return paths[0] if paths else None
 
-    The plain call is the fast path. If it fails -- kaleido's own Chrome
-    discovery came up empty, or the launch fell over -- and a browser can be
-    found on this machine, it is retried with that path handed straight to
-    kaleido, which is what turns "requires Google Chrome to be installed" on a
-    machine that has Chrome back into a rendered figure.
+
+def _fetch_browser() -> str:
+    """Download a private Chrome for kaleido, for a machine that has none."""
+    import kaleido
+
+    _browser_paths.cache_clear()
+    return str(kaleido.get_chrome_sync(path=_BROWSER_DEPS_DIR))
+
+
+def _kaleido_render(export_fig, opts: dict) -> bytes:
+    """Render through kaleido, trying every browser before giving up.
+
+    The plain plotly call comes first: when kaleido's own discovery works this
+    is the whole story. Otherwise each browser found on the machine is handed
+    over explicitly, which covers both a discovery that came up empty and a
+    particular browser that would not start.
     """
     try:
-        return export_fig.to_image(format="png", width=width, height=height,
-                                   scale=scale)
-    except Exception:
-        path = _browser_path()
-        if not path:
-            raise
-        import kaleido  # only needed on this fallback path
-        return kaleido.calc_fig_sync(
-            export_fig,
-            opts={"format": "png", "width": width, "height": height,
-                  "scale": scale},
-            kopts={"path": path},
-        )
+        return export_fig.to_image(**opts)
+    except Exception as first_error:
+        import kaleido  # only needed once the fast path has failed
+
+        # to_image takes the format/size as keywords; calc_fig_sync wants them
+        # in one dict, and never a `format=None`.
+        kal_opts = {k: v for k, v in opts.items() if v is not None}
+        for path in _browser_paths():
+            try:
+                return kaleido.calc_fig_sync(export_fig, opts=kal_opts,
+                                             kopts={"path": path})
+            except Exception:
+                continue
+        raise first_error
 
 
 def _render_export(export_fig, fmt: str, width: int, height: int,
@@ -386,21 +424,15 @@ def _render_export(export_fig, fmt: str, width: int, height: int,
         # Vector: dpi is meaningless. Kaleido sizes these in CSS pixels, the
         # same unit as the raster paths (not in points, despite the sizes
         # looking point-like at typical figure dimensions).
-        try:
-            return export_fig.to_image(format=fmt, width=width, height=height)
-        except Exception:
-            path = _browser_path()
-            if not path:
-                raise
-            import kaleido  # see _figure_to_png for why this retry exists
-            return kaleido.calc_fig_sync(
-                export_fig,
-                opts={"format": fmt, "width": width, "height": height},
-                kopts={"path": path},
-            )
+        return _kaleido_render(
+            export_fig, {"format": fmt, "width": width, "height": height}
+        )
 
     scale = max(1.0, float(dpi) / 96.0)
-    png_bytes = _figure_to_png(export_fig, width, height, scale)
+    png_bytes = _kaleido_render(
+        export_fig,
+        {"format": "png", "width": width, "height": height, "scale": scale},
+    )
     image = _flatten_to_rgb(Image.open(io.BytesIO(png_bytes)))
     buffer = io.BytesIO()
     if fmt == "tiff":
@@ -556,22 +588,37 @@ def figure_downloads(fig, stem: str, key: str, what: str = "figure",
                                "rendered — press Render again to refresh it.")
             elif cached.get("error"):
                 # Kaleido's own message says to install Chrome. When one is
-                # already on the machine that is misleading -- the render was
-                # retried with that exact path (see _figure_to_png) and still
-                # failed, so the browser is not the thing to go and fix.
-                found = _browser_path()
+                # already on the machine that is misleading -- every browser
+                # found was tried explicitly (see _kaleido_render) before this
+                # gave up, so a missing Chrome is not the thing to go and fix.
+                browsers = _browser_paths()
                 st.caption(
                     f"Image export failed ({cached['error']})."
-                    + (f" A browser was found at `{found}` and used for a "
-                       "retry, so this is not a missing Chrome — try Render "
-                       "again, and if it keeps failing, close any stray "
+                    + (f" {len(browsers)} browser(s) were found and each was "
+                       "tried, so this is not a missing Chrome — press Render "
+                       "again, and if it keeps failing close any stray "
                        "chrome.exe processes."
-                       if found else
-                       " No Chrome/Chromium was found on this machine; "
-                       "install one, or run `plotly_get_chrome`.")
+                       if browsers else
+                       " No Chromium-family browser was found on this "
+                       "machine.")
                     + " The HTML download beside this button and the 📷 icon "
                     "on the chart need no renderer."
                 )
+                if not browsers and st.button(
+                    "⬇️ Fetch a renderer (one-time download)",
+                    key=f"_get_chrome_{key}", width="stretch",
+                ):
+                    try:
+                        with st.spinner("Downloading a headless browser…"):
+                            where = _fetch_browser()
+                        st.success(f"Renderer installed at `{where}`. Press "
+                                   "Render again.")
+                    except Exception as exc:
+                        st.caption(
+                            f"Could not fetch a renderer ({exc}). Install "
+                            "Chrome, or run `plotly_get_chrome` in this "
+                            "environment's terminal."
+                        )
 
         with cols[1]:
             try:
