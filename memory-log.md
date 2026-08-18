@@ -246,27 +246,106 @@ here. 133 tests pass, flake8 clean.
   top margin follows it. The Tafel slope annotation scales with the chosen font
   instead of a fixed 22 pt.
 
-### Still open
-- 🟡 `_stats_from_sums` one-pass variance cancellation (fine at current
-  scales); `_grow_from_onset` overpotential cap assumption; `sweep._blocks`
-  degenerating to 1 on tiny sweeps; `tafel.exchange_current` only being i0 on
-  overpotential input (all latent, none reachable from the GUI).
-- 🟡 No "nice" tick-rounding helper ported from the EIS app yet.
-- 🟡 HTML export still rebuilds on every rerun of an open expander;
-  Streamlit's `download_button` needs its bytes upfront, so making it lazy
-  costs a click.
-- 🟡 Client-side legend/annotation drags are still not reflected in the
-  server-side export.
-☑️ **kaleido 1.3.0 is now installed and the export path is verified
-  end-to-end** (it needs no separate `plotly_get_chrome` step). All 20
-  format × dpi combinations render; every raster lands within 0.01 cm of the
-  requested 8.6 cm and carries the correct dpi tag. Rendered figures were
-  inspected: nothing is clipped at 10 pt / 8.6 cm or 28 pt / 17.8 cm.
+### Export verified end-to-end (kaleido)
 
-  Doing this immediately caught a bug in the new preset code: **kaleido's
-  width/height are CSS pixels (1/96 in) which it then multiplies by
-  `scale = dpi/96`**, so converting cm → px *at dpi* double-counted the
-  resolution and a 150 dpi single-column figure came out 13.4 cm instead of
-  8.6. Physical size follows from the CSS size alone; dpi only buys
-  resolution within it. A parametrised end-to-end test now covers
-  5 formats × 3 dpi, skipped automatically where kaleido cannot render.
+☑️ **kaleido 1.3.0 installed; the export path is exercised end-to-end for
+the first time** (it needs no separate `plotly_get_chrome` step). All 20
+format × dpi combinations render; every raster lands within 0.01 cm of the
+requested 8.6 cm and carries the correct dpi tag. Rendered figures were
+inspected: nothing is clipped at 10 pt / 8.6 cm or 28 pt / 17.8 cm.
+
+Doing this immediately caught a bug in the then-new preset code: **kaleido's
+width/height are CSS pixels (1/96 in) which it then multiplies by
+`scale = dpi/96`**, so converting cm → px *at dpi* double-counted the
+resolution and a 150 dpi single-column figure came out 13.4 cm instead of 8.6.
+Physical size follows from the CSS size alone; dpi only buys resolution within
+it. A parametrised end-to-end test now covers 5 formats × 3 dpi, skipped
+automatically where kaleido cannot render.
+
+That in turn exposed the margin problem: margins are absolute pixels, so the
+reference app's fixed l=110/r=90 (sized for its ~930 px canvas) ate 62 % of an
+8.6 cm figure at *any* font size. Margins are now derived from the text they
+hold.
+
+### Second fix pass — 2026-08-18 (all remaining MINOR items)
+
+Everything left on the list above is now addressed. Where a finding did not
+reproduce, or could not be fixed as stated, that is recorded rather than
+silently dropped.
+
+**Fixed**
+
+- **Per-sample widgets were keyed on selection position** (`tafel_reaction_0`,
+  `tafel_name_1`, ...). De-selecting the first of three samples shifted every
+  later one down a slot and handed it the previous occupant's stored reaction,
+  fit range, legend name and colour — attributing one sample's settings to
+  another. Now keyed on `_widget_slug(label)` (labels are already unique via
+  `_dedup_label`), with a hash tail so labels differing only in punctuation
+  stay distinct.
+- **`_abs_imag` folded inductive points onto the capacitive side.** New
+  `eis.inductive_lead_count()` identifies a high-frequency inductive lead by
+  the *sign* of Z'' before the magnitude is taken — the dominant sign is the
+  capacitive one, so the test works under either file convention — and
+  `auto_arc_range` starts after it. On a synthetic arc with a realistic
+  inductive branch, **Ru error 1.108 → 0.000 ohm**. The bundled sample is
+  unchanged at 27.5336 (no false positive). This needed a second fix: the
+  first version passed `auto_arc_range` the already-absolute values, so the
+  sign test had nothing to read and detected nothing.
+- **`_stats_from_sums` cancellation.** The prefix sums are now accumulated on
+  mean-centred copies and the intercept shifted back. Slope error against
+  `polyfit` at a 1e6 axis offset: **1.4e-5 → 4.7e-13** (~3e7x); at 1e8 the old
+  form was 100 % wrong (0.12 error on a 0.12 slope).
+- **`_grow_from_onset` inapplicable overpotential cap.** When the onset was
+  already past the cap (mis-assigned reaction, or e_eq from another couple),
+  the cap pinned the window to its minimum width and quietly reported a slope
+  fitted to five points. An inapplicable cap now drops out entirely and R^2
+  alone decides.
+- **`tafel.exchange_current` returned a wrong i0 on a potential axis.** It
+  extrapolates to zero on whatever y-axis it was given; on V vs RHE that is
+  the current at 0 V vs RHE, orders of magnitude from i0. Nothing in the
+  numbers distinguishes the two axes, so `TafelResult` now carries
+  `fitted_on_overpotential` (set by `fit_tafel(..., overpotential=True)`) and
+  the property returns `None` unless it is declared.
+- **Nice tick rounding**, ported from the reference EIS app as `_nice_axis`
+  (1/2/2.5/5 x 10^n steps) plus `_square_nyquist`.
+- **HTML export rebuilt on every rerun.** Measured: `to_html` is ~65 ms on a
+  4-sample/4000-point figure against ~7 ms for the signature that says it was
+  not needed. The signature is now computed once per figure per rerun and
+  shared by the image and HTML caches, so an unchanged figure costs ~7 ms
+  instead of ~72 ms — and expander bodies run even while collapsed, so this
+  was being paid for every figure on the page on every widget interaction.
+
+**Could not be fixed as stated — mitigated instead**
+
+- **Client-side legend/annotation drags in the server-side export.** Not
+  possible: `st.plotly_chart` surfaces selection events but has no API for
+  relayout ones, so a dragged legend cannot be read back into the Python
+  figure. Mitigated on both sides: the chart's camera button (the one path
+  that *does* keep drags) now emits a 4x-scale PNG (~300 dpi at double-column
+  width) instead of a screen-resolution one, and the download panel says
+  plainly that drags are not in the server-rendered files and points at the
+  legend-position control, which is.
+- **`sweep._blocks` degenerating to 1 on tiny sweeps.** No fix exists — a
+  6-point sweep does not contain enough of an end to take a median of.
+  Documented as a best guess rather than a robust one.
+
+**Judgement call**
+
+- Squaring the Nyquist axes on the *whole* spectrum (as the reference app
+  does) crushed the kinetic arc into the corner on the bundled sample: the
+  diffusion tail reaches 500 ohm against a 60 ohm arc. Since that tab exists
+  to judge the arc, the axes are framed on the fitted arc plus the fitted
+  circle, with a checkbox for the full spectrum and a caption naming how many
+  points are off-view.
+
+### Still open
+
+Nothing from the review remains. Two notes for future work:
+
+- The 28/36 pt journal font sizes assume a large canvas; at 8.6 cm single
+  column the margins necessarily take >55 % of the figure. The export panel
+  now warns and points at the font control, but a smaller default font set
+  for single-column work would be a genuine improvement.
+- `_orr_data_loader`'s per-slot widgets (`orr_sample_name_{i}`) are still
+  index-keyed. That one is correct: the slot exists before the user has typed
+  a name, so there is no stable label to key on.

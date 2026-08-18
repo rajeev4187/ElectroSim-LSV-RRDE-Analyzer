@@ -243,3 +243,49 @@ def test_short_arcs_are_flagged_as_extrapolated():
     wide_fit = eis.fit_ru_circle(75 + 50 * np.cos(wide), 50 * np.sin(wide))
     assert short_fit.is_extrapolated
     assert not wide_fit.is_extrapolated
+
+
+def _semicircle(ru=25.0, rct=100.0, n=60):
+    """Textbook capacitive arc, high -> low frequency."""
+    theta = np.linspace(np.pi, 0.0, n)
+    centre, radius = ru + rct / 2, rct / 2
+    return centre + radius * np.cos(theta), radius * np.sin(theta)
+
+
+def _with_inductive_lead(zr, zi):
+    """Prepend a high-frequency inductive branch: Z' dips below Ru while Z''
+    crosses to the other side of the real axis."""
+    lead_zr = np.array([19.0, 21.0, 22.8, 24.0, 24.8])
+    lead_zi = np.array([-13.0, -9.5, -6.0, -3.0, -0.8])
+    return np.concatenate([lead_zr, zr]), np.concatenate([lead_zi, zi])
+
+
+def test_inductive_lead_is_excluded_from_the_arc_fit():
+    """abs() folds an inductive lead onto the capacitive side, where it reads
+    as extra arc curving the wrong way and drags Ru with it."""
+    zr, zi = _with_inductive_lead(*_semicircle())
+    folded = eis.fit_ru_circle(zr, zi, start=0, stop=len(zr))
+    fixed = eis.fit_ru_circle(zr, zi)
+    assert abs(folded.ru - 25.0) > 1.0        # the defect this guards
+    assert fixed.ru == pytest.approx(25.0, abs=0.05)
+    assert fixed.arc_slice[0] == 5
+
+
+def test_inductive_lead_detection_is_sign_convention_agnostic():
+    zr, zi = _with_inductive_lead(*_semicircle())
+    assert eis.inductive_lead_count(zi) == 5
+    assert eis.inductive_lead_count(-zi) == 5
+    assert eis.fit_ru_circle(zr, -zi).ru == pytest.approx(25.0, abs=0.05)
+
+
+def test_a_clean_spectrum_loses_no_points_to_inductance_detection():
+    zr, zi = _semicircle()
+    assert eis.inductive_lead_count(zi) == 0
+    assert eis.fit_ru_circle(zr, zi).arc_slice[0] == 0
+
+
+def test_mostly_opposite_sign_data_is_left_alone():
+    """If "most" of a spectrum reads as inductive the sign test has failed;
+    trust nothing rather than eating the arc."""
+    _, zi = _semicircle()
+    assert eis.inductive_lead_count(-zi) == 0

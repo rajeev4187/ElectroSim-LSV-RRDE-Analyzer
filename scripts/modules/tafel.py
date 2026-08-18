@@ -119,6 +119,11 @@ class TafelResult:
     intercept_stderr_v: float = float("nan")
     n_points: int = 0
     decades: float = float("nan")  # span of log10|i| covered by the fit
+    # True only when the fit's y-axis was *overpotential* rather than
+    # electrode potential. Set by fit_tafel from its own argument; it cannot
+    # be inferred from the numbers, since an overpotential axis and a
+    # potential axis look identical once they are in the array.
+    fitted_on_overpotential: bool = False
 
     @property
     def slope_mv_per_dec(self) -> float:
@@ -141,10 +146,24 @@ class TafelResult:
 
     @property
     def exchange_current(self) -> float | None:
-        """Current at potential = 0 (extrapolated). See module docstring for
-        when this is physically the exchange current i0. ``None`` for a flat
-        (near-zero-slope) fit, where the extrapolation is undefined/unstable
-        and the exponent would overflow a float."""
+        """The exchange current density i0, or ``None`` when the fit cannot
+        yield one.
+
+        i0 is the current extrapolated to **zero overpotential**. This fit
+        extrapolates to zero on whatever y-axis it was given, so the answer is
+        i0 only when that axis was overpotential -- if it was electrode
+        potential (V vs RHE, the usual case in this app), the same arithmetic
+        returns the current extrapolated to 0 V vs RHE, which for an OER
+        catalyst is a meaningless number many orders of magnitude from i0.
+        Nothing in the numbers distinguishes the two cases, so rather than
+        return a confident wrong value this returns ``None`` unless the caller
+        declared an overpotential axis (``fit_tafel(..., overpotential=True)``).
+
+        Also ``None`` for a flat (near-zero-slope) fit, where the
+        extrapolation is undefined and the exponent would overflow a float.
+        """
+        if not self.fitted_on_overpotential:
+            return None
         if self.slope_v_per_dec == 0:
             return None
         exponent = -self.intercept_v / self.slope_v_per_dec
@@ -203,16 +222,29 @@ def _regression_prefix_sums(x: np.ndarray, y: np.ndarray):
     slider drag. Since ordinary least squares depends on the data only
     through the five sums below, prefix sums give every window's slope,
     intercept and R^2 in constant time and the whole scan in O(n).
+
+    The sums are accumulated on **mean-centred** copies of x and y. A sum of
+    squares is a textbook cancellation trap: the centred sum of squares is
+    recovered as ``Sxx - (Sx)^2 / n``, a difference of two large numbers whose
+    leading digits agree when the data sits far from the origin. Potentials in
+    V vs RHE are small, but ``log10|i|`` for currents in A runs around -5 and
+    an overpotential axis can be offset by volts, so the guard is cheap
+    insurance. Centring is exact for the slope and R^2 (both are invariant
+    under a shift) and the intercept is shifted back in
+    :func:`_stats_from_sums`.
     """
     n = len(x)
+    x0 = float(np.mean(x)) if n else 0.0
+    y0 = float(np.mean(y)) if n else 0.0
+    xc, yc = x - x0, y - y0
     zero = np.zeros(1)
     return (
-        np.concatenate([zero, np.cumsum(x)]),
-        np.concatenate([zero, np.cumsum(y)]),
-        np.concatenate([zero, np.cumsum(x * x)]),
-        np.concatenate([zero, np.cumsum(y * y)]),
-        np.concatenate([zero, np.cumsum(x * y)]),
-        n,
+        np.concatenate([zero, np.cumsum(xc)]),
+        np.concatenate([zero, np.cumsum(yc)]),
+        np.concatenate([zero, np.cumsum(xc * xc)]),
+        np.concatenate([zero, np.cumsum(yc * yc)]),
+        np.concatenate([zero, np.cumsum(xc * yc)]),
+        n, x0, y0,
     )
 
 
@@ -220,7 +252,7 @@ def _stats_from_sums(sums, start, stop):
     """``(slope, intercept, r_squared)`` for ``[start, stop)`` from prefix
     sums. Returns ``None`` where the window is degenerate (fewer than 3
     points, or no spread in x)."""
-    sx, sy, sxx, syy, sxy, _ = sums
+    sx, sy, sxx, syy, sxy, _, x0, y0 = sums
     k = stop - start
     if k < 3:
         return None
@@ -236,7 +268,9 @@ def _stats_from_sums(sums, start, stop):
     sxy_c = xy - x_sum * y_sum / n
     syy_c = yy - y_sum * y_sum / n
     slope = sxy_c / sxx_c
-    intercept = (y_sum - slope * x_sum) / n
+    # Undo the centring: the fit was made on (x - x0, y - y0), so a point at
+    # x = 0 in the caller's own frame sits at -x0 in the centred one.
+    intercept = (y_sum - slope * x_sum) / n + y0 - slope * x0
     if syy_c <= 0:
         return slope, intercept, 0.0
     r2 = float(np.clip((sxy_c * sxy_c) / (sxx_c * syy_c), 0.0, 1.0))
@@ -284,7 +318,16 @@ def _grow_from_onset(x: np.ndarray, y: np.ndarray, onset_idx: int,
         beyond = np.flatnonzero(np.abs(y[onset_idx:] - e_eq) > max_overpotential)
         if len(beyond):
             limit = onset_idx + int(beyond[0])
-        if limit < stop:
+        # The cap assumes the onset lies on the faradaic side of e_eq, within
+        # max_overpotential of it. When it does not -- the reaction was
+        # mis-assigned, or e_eq belongs to a different couple than the one
+        # actually running -- the *first* point is already past the cap and
+        # this would pin the window to its minimum width, quietly reporting a
+        # slope fitted to five points. An inapplicable cap should not truncate
+        # the fit: drop it and let the R^2 test alone decide the extent.
+        if limit <= onset_idx:
+            limit = n
+        elif limit < stop:
             limit = stop
 
     sums = _regression_prefix_sums(x, y)
@@ -667,6 +710,7 @@ def fit_tafel(
     potential: np.ndarray, log_i: np.ndarray,
     start: int | None = None, stop: int | None = None,
     current: np.ndarray | None = None, e_eq: float | None = None,
+    overpotential: bool = False,
 ) -> TafelResult:
     """Linear-fit ``potential`` vs ``log_i`` over ``[start, stop)``.
 
@@ -683,6 +727,11 @@ def fit_tafel(
                   current (and the reaction's equilibrium potential) should
                   pass them to get the onset-anchored, overpotential-capped
                   region instead.
+
+    overpotential : declare that ``potential`` is an overpotential axis, not
+                  an electrode potential. Only then does
+                  :attr:`TafelResult.exchange_current` return a value -- see
+                  its docstring for why this cannot be detected automatically.
 
     ``fit_slice`` on the result is the **requested** window, not the fitted
     one: points that are non-finite in either array are dropped inside the
@@ -742,6 +791,7 @@ def fit_tafel(
         intercept_stderr_v=intercept_se,
         n_points=k,
         decades=float(np.ptp(xs)),
+        fitted_on_overpotential=bool(overpotential),
     )
 
 

@@ -66,8 +66,49 @@ class RuResult:
 
 
 def _abs_imag(z_imag: np.ndarray) -> np.ndarray:
-    """Return |Z''| regardless of the file's sign convention."""
+    """Return |Z''| regardless of the file's sign convention.
+
+    Taking the magnitude is what makes the module convention-agnostic, but it
+    also **folds inductive points onto the capacitive side**: high-frequency
+    inductance from the cell leads puts the first few points on the far side
+    of the real axis, and after ``abs`` they look like an extra piece of arc
+    curving the wrong way. See :func:`inductive_lead_count`, which identifies
+    them by sign *before* the magnitude is taken.
+    """
     return np.abs(z_imag)
+
+
+def inductive_lead_count(z_imag: np.ndarray) -> int:
+    """Number of leading points that sit on the inductive side of the axis.
+
+    Impedance files use either sign convention for Z'', so "inductive" cannot
+    be read off the sign alone. The capacitive arc is what the spectrum is
+    mostly made of, so the *dominant* sign is the capacitive one, and a run of
+    opposite-signed points at the high-frequency start is lead inductance.
+
+    Only a leading run counts. Opposite-signed points elsewhere are noise
+    about a near-zero baseline, not a physical inductive branch, and dropping
+    those would eat into the arc itself.
+    """
+    zi = np.asarray(z_imag, dtype=float)
+    if len(zi) < 3:
+        return 0
+    finite = zi[np.isfinite(zi)]
+    if len(finite) == 0:
+        return 0
+    # Dominant (capacitive) side, weighted by magnitude so a handful of large
+    # inductive points cannot outvote a long shallow arc, or vice versa.
+    capacitive_sign = np.sign(np.sum(finite))
+    if capacitive_sign == 0:
+        return 0
+    count = 0
+    for value in zi:
+        if not np.isfinite(value) or np.sign(value) == capacitive_sign or value == 0:
+            break
+        count += 1
+    # Never let this consume the spectrum: if "most" of it reads as inductive
+    # the sign test has failed, so trust nothing and drop nothing.
+    return count if count <= len(zi) // 4 else 0
 
 
 def _smooth(v: np.ndarray, w: int = 3) -> np.ndarray:
@@ -99,19 +140,27 @@ def auto_arc_range(z_real: np.ndarray, z_imag: np.ndarray) -> tuple[int, int]:
     global one, because a strong diffusion tail commonly ends higher than the
     arc's own apex.
     """
-    zi = _abs_imag(np.asarray(z_imag, dtype=float))
+    raw = np.asarray(z_imag, dtype=float)
+    zi = _abs_imag(raw)
     n = len(zi)
     if n < 5:
         return 0, n
+
+    # Drop a high-frequency inductive lead before anything else looks at the
+    # curve: folded onto the capacitive side by abs(), it reads as a rise into
+    # a spurious apex and drags the fitted circle (and so Ru) with it.
+    start = inductive_lead_count(raw)
+    if n - start < 5:
+        start = 0
 
     sm = _smooth(zi)
     d = np.diff(sm)
 
     # First local maximum: the first descent that follows a rise. A spectrum
     # that starts already past its apex (no initial rise) has apex 0.
-    apex = 0
+    apex = start
     rose = False
-    for i, step in enumerate(d):
+    for i, step in enumerate(d[start:], start):
         if step > 0:
             rose = True
         elif step < 0 and rose:
@@ -126,9 +175,9 @@ def auto_arc_range(z_real: np.ndarray, z_imag: np.ndarray) -> tuple[int, int]:
     # Keep a couple of points past the trough so the right-hand intercept is
     # constrained, but never include the steep tail that follows.
     stop = min(trough + 3, n)
-    if stop < 4:
-        stop = n
-    return 0, stop
+    if stop - start < 4:
+        return start, n
+    return start, stop
 
 
 def _fit_circle_kasa(x: np.ndarray, y: np.ndarray) -> tuple[float, float, float]:
@@ -193,9 +242,13 @@ def fit_ru_circle(z_real: np.ndarray, z_imag: np.ndarray,
     start, stop    : index range of arc points to fit; auto-detected if omitted.
     """
     zr = np.asarray(z_real, dtype=float)
-    zi = _abs_imag(z_imag)
+    raw_zi = np.asarray(z_imag, dtype=float)
+    zi = _abs_imag(raw_zi)
     if start is None or stop is None:
-        a0, a1 = auto_arc_range(zr, zi)
+        # Pass the *signed* imaginary part: auto_arc_range needs the sign to
+        # tell a high-frequency inductive lead from the capacitive arc, and
+        # handing it the already-absolute values hid every such lead.
+        a0, a1 = auto_arc_range(zr, raw_zi)
         start = a0 if start is None else start
         stop = a1 if stop is None else stop
     start = max(0, int(start))

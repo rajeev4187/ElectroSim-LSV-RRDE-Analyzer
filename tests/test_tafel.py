@@ -252,3 +252,51 @@ def test_cathodic_current_above_1v23_is_not_described_as_below_it():
     cur = -2.0 / (1 + np.exp((pot - 1.40) / 0.02))
     guess = tafel.infer_reaction(pot, cur)
     assert "just below" not in guess.reason
+
+
+@pytest.mark.parametrize("offset", [0.0, 1e3, 1e6, 1e8])
+def test_prefix_sum_regression_survives_a_large_axis_offset(offset):
+    """The one-pass form recovers the centred sum of squares as
+    ``Sxx - (Sx)^2/n`` — a difference of two large nearly-equal numbers when
+    the data sits far from the origin. Mean-centring before accumulating keeps
+    the slope exact; without it a 1e8 offset made the slope 100 % wrong."""
+    x = np.linspace(-5, -1, 400) + offset
+    y = 0.12 * x + 0.4
+    sums = tafel._regression_prefix_sums(x, y)
+    slope, intercept, r_squared = tafel._stats_from_sums(sums, 0, len(x))
+    assert slope == pytest.approx(0.12, rel=1e-8)
+    assert r_squared == pytest.approx(1.0, abs=1e-9)
+    # The intercept is an extrapolation back to x = 0, so its absolute error
+    # scales with the offset; compare it where it is meaningful instead.
+    assert (slope * x[0] + intercept) == pytest.approx(y[0], rel=1e-9)
+
+
+def test_prefix_sum_regression_matches_polyfit_on_a_slice():
+    x = np.linspace(-6.0, -2.0, 200)
+    y = -0.09 * x + 1.4
+    sums = tafel._regression_prefix_sums(x, y)
+    slope, intercept, _ = tafel._stats_from_sums(sums, 40, 160)
+    ref_slope, ref_intercept = np.polyfit(x[40:160], y[40:160], 1)
+    assert slope == pytest.approx(ref_slope, rel=1e-10)
+    assert intercept == pytest.approx(ref_intercept, rel=1e-10)
+
+
+def test_exchange_current_refuses_a_potential_axis():
+    """i0 is the current at zero *overpotential*. On an electrode-potential
+    axis the same extrapolation returns the current at 0 V vs RHE, which is
+    not i0 and can be many orders of magnitude out. Nothing in the numbers
+    distinguishes the two axes, so the caller has to declare it."""
+    eta = np.linspace(0.05, 0.35, 200)
+    log_i = (eta - 0.1) / 0.12
+    on_potential = tafel.fit_tafel(eta, log_i, 0, len(eta))
+    on_overpotential = tafel.fit_tafel(eta, log_i, 0, len(eta), overpotential=True)
+
+    assert on_potential.exchange_current is None
+    assert on_overpotential.exchange_current is not None
+    # 10 ** (-intercept/slope): the fit is eta = 0.12*log_i + 0.1, so log10(i0)
+    # at eta = 0 is -0.1/0.12.
+    assert on_overpotential.exchange_current == pytest.approx(
+        10 ** (-0.1 / 0.12), rel=1e-6)
+    # The slope itself is unaffected by the declaration.
+    assert on_potential.slope_v_per_dec == pytest.approx(
+        on_overpotential.slope_v_per_dec)

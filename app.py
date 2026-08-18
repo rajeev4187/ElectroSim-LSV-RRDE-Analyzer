@@ -29,6 +29,7 @@ from __future__ import annotations
 import hashlib
 import hmac
 import io
+import math
 import re
 import zipfile
 
@@ -314,6 +315,10 @@ def figure_downloads(fig, stem: str, key: str, what: str = "figure",
     state_key = f"_export_{key}"
     with st.expander(f"⬇️ Download {what}"):
         export_fig = _export_figure(fig)
+        # One serialisation per figure per rerun, shared by the image cache
+        # and the HTML cache below. Both need to know whether the figure has
+        # changed, and to_json is ~10x cheaper than the to_html it saves.
+        sig = _figure_signature(export_fig)
         cols = st.columns(3 if data is not None else 2)
 
         with cols[0]:
@@ -409,10 +414,6 @@ def figure_downloads(fig, stem: str, key: str, what: str = "figure",
                     }
             cached = st.session_state.get(state_key) or {}
             if cached.get("bytes") or cached.get("error"):
-                # Only now is the signature worth computing -- it serialises
-                # the whole figure, so doing it unconditionally on every rerun
-                # was pure overhead for figures nobody exports.
-                sig = _figure_signature(export_fig)
                 stale_settings = cached.get("settings") != settings
                 fresh = (cached.get("bytes") and cached.get("sig") == sig
                          and not stale_settings)
@@ -439,9 +440,23 @@ def figure_downloads(fig, stem: str, key: str, what: str = "figure",
 
         with cols[1]:
             try:
-                html = export_fig.to_html(include_plotlyjs="cdn", full_html=True)
+                # Expander bodies run on every rerun even while collapsed, so
+                # this used to re-serialise every figure on the page to a
+                # standalone HTML document on every widget interaction -- ~65 ms
+                # each on a 4-sample, 4000-point plot, against ~7 ms for the
+                # signature that tells us it was not needed. Memoise it.
+                html_key = f"_html_{key}"
+                html_cached = st.session_state.get(html_key) or {}
+                if html_cached.get("sig") != sig:
+                    html_cached = {
+                        "sig": sig,
+                        "data": export_fig.to_html(
+                            include_plotlyjs="cdn", full_html=True
+                        ).encode("utf-8"),
+                    }
+                    st.session_state[html_key] = html_cached
                 st.download_button(
-                    f"⬇️ {what} (HTML)", data=html.encode("utf-8"),
+                    f"⬇️ {what} (HTML)", data=html_cached["data"],
                     file_name=f"{stem}.html", mime="text/html",
                     key=f"_html_dl_{key}", width="stretch",
                     help="Interactive page — opens in any browser (needs "
@@ -452,6 +467,14 @@ def figure_downloads(fig, stem: str, key: str, what: str = "figure",
                 )
             except Exception as exc:
                 st.caption(f"HTML export unavailable ({exc}).")
+            st.caption(
+                "↳ Dragging the legend or a label on the chart changes it "
+                "in your browser only — those moves cannot be read back by "
+                "the server, so they are **not** in the files above. To keep "
+                "them, use the 📷 camera button on the chart itself "
+                "(it saves a 4x-scale PNG), or set the legend position in the "
+                "plot-appearance panel, which does reach the export."
+            )
 
         if data is not None:
             with cols[2]:
@@ -932,7 +955,43 @@ def render_eis_tab(eis_d, eis_list, sel, ru_unit: str = "Ω",
             )
         _journal_axes_style(fig, f"Z′ / {disp_unit}", f"−Z″ / {disp_unit}",
                             font_size, style=style)
-        fig.update_yaxes(scaleanchor="x", scaleratio=1)  # equal aspect -> true circle
+        # Equal aspect *and* one shared round-ticked range, so the arc is a
+        # true circle rather than an ellipse (see :func:`_square_nyquist`).
+        #
+        # Framed on the *fitted arc*, not the whole spectrum. Squaring off the
+        # global maximum sounds more honest but is not: a strong diffusion
+        # tail routinely reaches ten times the arc's own diameter (500 vs
+        # 60 ohm on the bundled sample), and squaring to it leaves the arc a
+        # few pixels wide in the corner -- unreadable, in the one tab whose
+        # entire job is judging that arc. The full spectrum stays one
+        # checkbox away.
+        full_view = st.checkbox(
+            "Show the full spectrum (including the low-frequency tail)",
+            value=False, key="eis_full_view",
+            help="Off: the axes are framed on the fitted arc, so its shape is "
+                 "readable. On: the whole spectrum is shown, which a strong "
+                 "diffusion tail can shrink the arc right down inside.",
+        )
+        arc_x, arc_y = zr[start:stop], np.abs(zi)[start:stop]
+        if full_view or len(arc_x) < 3:
+            view_x, view_y = zr, np.abs(zi)
+        else:
+            # Include the fitted circle's own extent so the extrapolated Ru
+            # marker and the dashed circle are not cropped out of the view.
+            view_x, view_y = arc_x, arc_y
+            if ru_result is not None and ru_result.center is not None:
+                cx_v, cy_v = eis.circle_path(ru_result.center, ru_result.radius)
+                keep = cy_v >= 0
+                view_x = np.concatenate([view_x, cx_v[keep]])
+                view_y = np.concatenate([view_y, cy_v[keep]])
+            hidden = len(zr) - len(arc_x)
+            if hidden > 0:
+                st.caption(
+                    f"↳ Axes framed on the fitted arc; {hidden} point(s) "
+                    "outside it are off-view. Tick the box above to see them."
+                )
+        _square_nyquist(fig, view_x, view_y,
+                        target=int(style.get("n_ticks", 5)))
         st.plotly_chart(fig, width="stretch", config=_PLOTLY_EDIT_CONFIG)
         nyquist_data = _padded_frame({
             f"Z′ ({disp_unit})": zr,
@@ -1607,8 +1666,10 @@ def trace_color_pickers(labels: list[str], style: dict, key_prefix: str) -> dict
         for i, label in enumerate(labels):
             default = palette[i % len(palette)]
             # Keyed on the palette name too, so switching palette re-seeds the
-            # pickers instead of leaving them stuck on the previous set.
-            widget_key = f"{key_prefix}_color_{i}_{style.get('palette_name', '')}"
+            # pickers instead of leaving them stuck on the previous set, and
+            # on the label rather than the position (see :func:`_widget_slug`).
+            widget_key = (f"{key_prefix}_color_{_widget_slug(label)}"
+                          f"_{style.get('palette_name', '')}")
             colors[label] = cols[i % len(cols)].color_picker(
                 label if len(label) <= 18 else label[:17] + "…",
                 value=default, key=widget_key,
@@ -1658,9 +1719,18 @@ _BOX_AXIS_STYLE = {
 }
 # Every journal-style plot uses this so its legend and any text annotations
 # (slope labels, etc.) can be dragged to a better spot before export.
+#
+# Those drags happen in the browser and never reach the server: Streamlit's
+# st.plotly_chart surfaces selection events but has no API for relayout ones,
+# so a dragged legend cannot be read back into the Python figure and cannot
+# appear in the server-rendered TIFF/PNG. The chart's own camera button is the
+# one export path that *does* keep them, so it is configured here to produce a
+# publication-usable raster rather than the screen-resolution default. Scale 4
+# on a ~900 px chart is ~3600 px across, i.e. 300 dpi at a double-column width.
 _PLOTLY_EDIT_CONFIG = {
     "edits": {"legendPosition": True, "annotationPosition": True},
     "displaylogo": False,
+    "toImageButtonOptions": {"format": "png", "scale": 4},
 }
 
 
@@ -1857,6 +1927,72 @@ def _default_replicate_group(label: str) -> str:
     one sample."""
     stripped = _REPLICATE_SUFFIX.sub("", label).strip()
     return stripped or label
+
+
+def _nice_axis(vmax: float, vmin: float = 0.0,
+               target: int = 5) -> tuple[float, float, float]:
+    """A "nice" axis span ``(lo, hi, step)`` covering ``[vmin, vmax]``.
+
+    Steps are 1/2/2.5/5 x 10^n, so ticks land on round numbers a reader can
+    interpolate between by eye. Plotly's ``nticks`` only *suggests* a count
+    and still chooses the values itself; a journal figure wants the axis
+    pinned. Ported from the reference EIS app so both read alike.
+    """
+    if not (np.isfinite(vmax) and np.isfinite(vmin)) or vmax <= vmin:
+        return 0.0, 1.0, 0.5
+    raw = (vmax - vmin) / max(1, target - 1)
+    magnitude = 10.0 ** math.floor(math.log10(raw))
+    step = next((m * magnitude for m in (1, 2, 2.5, 5, 10)
+                 if m * magnitude >= raw), 10 * magnitude)
+    return (math.floor(vmin / step) * step,
+            math.ceil(vmax / step) * step, step)
+
+
+def _square_nyquist(fig, xs, ys, target: int = 5):
+    """Give a Nyquist plot identical, round-ticked ranges on both axes.
+
+    The figure already pins a 1:1 pixel aspect, but equal *pixels per ohm* is
+    only half of it: with different ranges on the two axes the semicircle
+    still reads as an ellipse, and arc shape is what a Nyquist plot is looked
+    at for. One shared nice range fixes both.
+
+    ``xs``/``ys`` should be the region worth framing, not necessarily the whole
+    spectrum -- see the note at the call site about the diffusion tail.
+    """
+    ax = np.asarray(xs, dtype=float)
+    ay = np.asarray(ys, dtype=float)
+    ax, ay = ax[np.isfinite(ax)], ay[np.isfinite(ay)]
+    if not len(ax) or not len(ay):
+        return fig
+    lo, hi, step = _nice_axis(max(ax.max(), ay.max()),
+                              min(ax.min(), ay.min(), 0.0), target=target)
+    # Don't spend a whole tick of blank space on tiny near-origin negatives
+    # (instrument artefacts); anchor at 0 unless the data is genuinely below it.
+    if lo < 0 and min(ax.min(), ay.min()) > -0.1 * hi:
+        lo = 0.0
+    fig.update_xaxes(range=[lo, hi], dtick=step, constrain="domain")
+    fig.update_yaxes(range=[lo, hi], dtick=step, scaleanchor="x", scaleratio=1,
+                     constrain="domain")
+    return fig
+
+
+def _widget_slug(label: str) -> str:
+    """A stable, key-safe token for one sample's label.
+
+    Per-sample widgets used to be keyed on the sample's position in the
+    selection (``tafel_reaction_0``, ``tafel_name_1``, ...). Streamlit keys
+    session state by widget key, so de-selecting the first of three samples
+    shifted every later one down a slot and handed it the previous
+    occupant's stored reaction, fit range, legend name and colour -- silently
+    attributing one sample's settings to another. Labels are already unique
+    within a run (see :func:`_dedup_label`), so they are the stable identity.
+
+    A hash tail disambiguates labels that differ only in characters stripped
+    by the slug (``"Pt/C #1"`` vs ``"Pt/C #2"``).
+    """
+    cleaned = re.sub(r"[^0-9A-Za-z]+", "-", label).strip("-").lower()[:40]
+    tail = hashlib.sha1(label.encode("utf-8")).hexdigest()[:8]
+    return f"{cleaned}-{tail}" if cleaned else tail
 
 
 def _dedup_label(label: str, seen: dict[str, int]) -> str:
@@ -2422,7 +2558,8 @@ def render_tafel_tab() -> None:
             # user pinned one at the top of the tab. Done before the
             # selectbox renders so the detection can seed its initial value.
             guess = None
-            reaction_key = f"tafel_reaction_{i}"
+            slug = _widget_slug(lbl)
+            reaction_key = f"tafel_reaction_{slug}"
             if auto_reaction:
                 try:
                     guess = tafel.infer_reaction(pot, cur)
@@ -2440,7 +2577,7 @@ def render_tafel_tab() -> None:
             a0, a1 = tafel.auto_tafel_range(
                 pot, log_i, current=cur, e_eq=e_eq_for_range
             )
-            range_key = f"tafel_range_{i}"
+            range_key = f"tafel_range_{slug}"
             if apply_selection:
                 try:
                     sel_range = _selection_range_for_sample(prior_points, lbl, log_i)
@@ -2450,7 +2587,8 @@ def render_tafel_tab() -> None:
                     st.session_state[range_key] = sel_range
             c0, cg, cr, c1, c2 = st.columns([1.0, 1.0, 0.8, 1.7, 0.5])
             display_name = c0.text_input(
-                "Legend name", value=f"Sample {i + 1}", key=f"tafel_name_{i}",
+                "Legend name", value=f"Sample {i + 1}",
+                key=f"tafel_name_{slug}",
                 help="Shown in the plot legend; edit if you'd rather show "
                      "the auto-detected file/column name.",
             )
@@ -2461,7 +2599,8 @@ def render_tafel_tab() -> None:
             default_group = (_default_replicate_group(lbl)
                              if _REPLICATE_SUFFIX.search(lbl) else "")
             replicate_group = cg.text_input(
-                "Replicate group", value=default_group, key=f"tafel_group_{i}",
+                "Replicate group", value=default_group,
+                key=f"tafel_group_{slug}",
                 placeholder="Blank = no repeats",
                 help="Give two or more samples the same group name to treat "
                      "them as repeat scans of the same underlying sample — "
@@ -2499,7 +2638,7 @@ def render_tafel_tab() -> None:
             )
             color = c2.color_picker(
                 "Color", value=_PALETTE_T[i % len(_PALETTE_T)],
-                key=f"tafel_color_{i}_{style['palette_name']}",
+                key=f"tafel_color_{slug}_{style['palette_name']}",
             )
             if trimmed:
                 c1.caption(

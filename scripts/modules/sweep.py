@@ -41,6 +41,16 @@ _ORIENT_BLOCK = 5
 
 
 def _blocks(n: int) -> int:
+    """Points to median over at each end when deciding sweep orientation.
+
+    Capped at a quarter of the record so the two blocks cannot overlap or
+    swallow the sweep. Note the consequence at the small end: below 8 points
+    this necessarily returns 1, and the orientation test degenerates to the
+    single-endpoint comparison the block median exists to avoid. There is no
+    fix for that -- a 6-point sweep does not contain enough of an end to take
+    a median of -- so orientation on very short records is a best guess, not a
+    robust one. Callers handling short records should not lean on it.
+    """
     return max(1, min(_ORIENT_BLOCK, n // 4)) if n >= 4 else 1
 
 
