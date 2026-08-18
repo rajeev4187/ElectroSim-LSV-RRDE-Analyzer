@@ -218,8 +218,8 @@ _CSS_PX_PER_INCH = 96
 # 17.8 cm (double column) is the widest journal width and the only one that
 # leaves room for the default 28 pt axis type -- at the narrower ones the
 # margins alone take most of the canvas.
-_SCREEN_CANVAS_W = int(round(_JOURNAL_WIDTHS_CM["Double column (17.8 cm)"]
-                             / 2.54 * _CSS_PX_PER_INCH))
+_SCREEN_CANVAS_W_CM = _JOURNAL_WIDTHS_CM["Double column (17.8 cm)"]
+_SCREEN_CANVAS_W = int(round(_SCREEN_CANVAS_W_CM / 2.54 * _CSS_PX_PER_INCH))
 
 
 def _margin_crowding(fig, out_w: int, out_h: int) -> tuple[str, float] | None:
@@ -245,13 +245,11 @@ def _margin_crowding(fig, out_w: int, out_h: int) -> tuple[str, float] | None:
     return worst if worst[1] > 0.55 else None
 
 
-def _preset_export_size(width_cm: float,
-                        base_w: int, base_h: int) -> tuple[int, int]:
-    """CSS-pixel size for a ``width_cm``-wide figure, keeping the figure's own
-    aspect ratio so nothing is stretched. Independent of dpi -- see above."""
-    out_w = int(round(width_cm / 2.54 * _CSS_PX_PER_INCH))
-    aspect = (base_h / base_w) if base_w else 1.0
-    return out_w, int(round(out_w * aspect))
+def _cm_to_css_px(width_cm: float) -> int:
+    """CSS-pixel width of a ``width_cm``-wide figure. Independent of dpi (see
+    :data:`_CSS_PX_PER_INCH` above): the physical size follows from the CSS
+    size alone, and dpi only decides how many pixels fill it."""
+    return int(round(width_cm / 2.54 * _CSS_PX_PER_INCH))
 
 
 # Raster/vector formats offered for figure export. TIFF is what most journals
@@ -393,62 +391,40 @@ def figure_downloads(fig, stem: str, key: str, what: str = "figure",
                     help="300 dpi is the common minimum for halftone figures; "
                          "600+ for line art in high-quality journals.",
                 )
-            base_w, base_h = _export_size(export_fig, width, height)
-            # Default to the figure's own canvas -- i.e. what is on screen.
-            # This used to default to the single-column preset instead, which
-            # re-flowed the figure onto a 325 px canvas while its fonts and
-            # margins stayed at their absolute on-screen pixel sizes: margins
-            # alone took 91 % of the width, axis titles ran off both edges and
-            # the tick labels overlapped into a blur. That download did not
-            # resemble the plot it came from, and the presets are the place to
-            # opt into a column width deliberately, not the default.
-            preset = st.selectbox(
-                "Figure width", list(_JOURNAL_WIDTHS_CM), index=0,
-                key=f"_wpreset_{key}",
-                help="Defaults to the size shown on screen, so the file "
-                     "matches the plot. The column presets re-flow the figure "
-                     "to a journal width — check the preview size below, and "
-                     "lower the axis font size if it warns about margins.",
-            )
-            width_cm = _JOURNAL_WIDTHS_CM[preset]
-            if width_cm is not None:
-                base_w, base_h = _preset_export_size(width_cm, base_w, base_h)
-            # The preset is part of the widget key, not just its default:
-            # Streamlit keeps a number_input's stored value across reruns, so
-            # a changed default alone would never reach the widget and picking
-            # a preset would appear to do nothing.
-            sc1, sc2 = st.columns(2)
-            out_w = sc1.number_input(
-                "Width (px)", min_value=200, max_value=4000,
-                value=int(base_w), step=20, key=f"_w_{key}_{preset}",
-            )
-            out_h = sc2.number_input(
-                "Height (px)", min_value=200, max_value=4000,
-                value=int(base_h), step=20, key=f"_h_{key}_{preset}",
-            )
+            # The figure is exported at its own canvas -- the one it is shown
+            # at -- and dpi only multiplies the pixels inside it. There is no
+            # size to choose and nothing to re-flow.
+            #
+            # There used to be a width preset and width/height boxes, and they
+            # defaulted to the single-column (8.6 cm) preset. Re-flowing a
+            # figure to a narrower canvas does not shrink it: fonts, margins
+            # and legend anchors are all in absolute pixels, so the same text
+            # was laid out on a 325 px canvas where the margins alone took
+            # 91 % of the width -- axis titles ran off both edges and the tick
+            # labels overlapped into a blur. To publish at a different column
+            # width, change the figure itself (font size, legend placement),
+            # where the effect is visible on screen before anything is saved.
+            out_w, out_h = _export_size(export_fig, width, height)
             scale = max(1.0, float(dpi) / _CSS_PX_PER_INCH)
             st.caption(
-                f"↳ Figure size "
+                f"↳ Exports at the size shown: "
                 f"{out_w / _CSS_PX_PER_INCH * 2.54:.1f} × "
-                f"{out_h / _CSS_PX_PER_INCH * 2.54:.1f} cm; exported at "
-                f"{dpi} dpi that is "
+                f"{out_h / _CSS_PX_PER_INCH * 2.54:.1f} cm — "
                 f"{int(round(out_w * scale))} × {int(round(out_h * scale))} "
-                "pixels."
+                f"pixels at {dpi} dpi."
             )
             # Margins are in absolute pixels (they have to be: they hold text
-            # of a fixed point size). On a narrow canvas they can therefore
-            # take most of the figure, leaving a strip of plot inside a wide
-            # white border. That is a font/width mismatch, not a bug, but it
-            # is invisible until the file is opened -- so say it here.
+            # of a fixed point size), so a large axis font on this canvas can
+            # still crowd the plot out. Now that the canvas is the one on
+            # screen this is visible before exporting -- but say it anyway,
+            # with the control that fixes it.
             crowding = _margin_crowding(export_fig, int(out_w), int(out_h))
             if crowding is not None:
                 axis, used = crowding
                 st.warning(
-                    f"At this size the margins take {used:.0%} of the "
-                    f"figure's {axis}, leaving little room for the plot "
-                    "itself. The axis text is sized for a larger canvas: "
-                    "lower **Font size** in the plot-appearance panel, or "
-                    "choose a wider column."
+                    f"The margins take {used:.0%} of this figure's {axis}, "
+                    "leaving little room for the plot itself — lower **Axis "
+                    "font size** in the plot-appearance panel."
                 )
             # Rendered on click, not on layout: kaleido spawns a headless
             # browser and takes seconds, which is far too slow to repeat on
@@ -1364,25 +1340,26 @@ def render_lsv_tab(lsv_d, ru: float | None, current_unit: str = "mA",
         # works for both the single-axes overlay and the two-panel
         # side-by-side view (update_xaxes/update_yaxes with no row/col
         # target every axis in the figure).
-        lsvir_small_font = {"family": "Arial", "size": max(11, round(font_size * 0.55))}
+        lsvir_small_font = {"family": _ARIAL, "size": max(11, round(font_size * 0.55))}
         lsvir_legend = _legend_layout(style, lsvir_small_font)
         lsvir_position = style.get("legend_position", "outside-right")
         fig.update_layout(
             template="plotly_white",
             height=470,
-            font={"family": "Arial", "size": font_size},
+            font={"family": _ARIAL, "size": font_size},
             title={"y": 0.97, "yanchor": "top"},
             showlegend=lsvir_legend is not None,
             **({"legend": lsvir_legend} if lsvir_legend is not None else {}),
             margin={**_journal_margin(font_size, legend_below=(lsvir_position == "below")),
                     **_legend_margin_extra(style)},
             hovermode="x unified",
-            hoverlabel={"font": {"family": "Arial", "size": 12}},
+            hoverlabel={"font": {"family": _ARIAL, "size": 12}},
         )
         fig.update_xaxes(showspikes=True, spikemode="across",
                          spikethickness=1, spikedash="dot",
                          spikecolor="#888", **_axis_style(style))
         fig.update_yaxes(**_axis_style(style))
+        _white_background(fig)
         _pin_canvas(fig, panels=(1 if view == "Overlay (same axes)" else 2))
         _show_figure(fig)
         fac_png = "-".join(str(int(r.factor_percent)) for r in results)
@@ -1535,6 +1512,45 @@ _JOURNAL_FONTS = [
     "Arial", "Helvetica", "Times New Roman", "Calibri", "Georgia",
     "DejaVu Sans", "Courier New",
 ]
+
+# Each journal face, followed by metric-compatible fallbacks that a Linux host
+# actually has.
+#
+# The live chart is drawn by the user's own browser, which has these fonts. The
+# TIFF/PNG is drawn by kaleido's headless Chromium on the *server* -- on
+# Streamlit Community Cloud a slim Linux container, where "Arial" and "Calibri"
+# do not exist. Asking for a font that is not installed leaves the renderer to
+# substitute whatever it likes, and glyphs outside the substitute's coverage
+# come out as tofu boxes: this app's axes are full of them (log₁₀, Ω, −Z″,
+# %H₂O₂, √, ·, ⁻²). That is a figure whose text is garbled in the download while
+# the on-screen chart and the 📷 snapshot -- both rendered in the browser --
+# look perfect. Naming the fallbacks explicitly keeps the exported glyphs the
+# ones that were on screen.
+_FONT_FALLBACKS = "Liberation Sans, Noto Sans, DejaVu Sans, sans-serif"
+_SERIF_FALLBACKS = "Liberation Serif, Noto Serif, DejaVu Serif, serif"
+_FONT_STACKS = {
+    "Arial": f"Arial, {_FONT_FALLBACKS}",
+    "Helvetica": f"Helvetica, Arial, {_FONT_FALLBACKS}",
+    "Times New Roman": f"Times New Roman, {_SERIF_FALLBACKS}",
+    "Calibri": f"Calibri, Carlito, {_FONT_FALLBACKS}",
+    "Georgia": f"Georgia, Gelasio, {_SERIF_FALLBACKS}",
+    "DejaVu Sans": f"DejaVu Sans, {_FONT_FALLBACKS}",
+    "Courier New": ("Courier New, Liberation Mono, Noto Sans Mono, "
+                    "DejaVu Sans Mono, monospace"),
+}
+# The default stack, for the figures that do not take a style dict.
+_ARIAL = _FONT_STACKS["Arial"]
+
+
+def _font_stack(family: str | None) -> str:
+    """The CSS font stack for a chosen journal face (see :data:`_FONT_STACKS`).
+
+    Always use this rather than the bare family name when setting a figure's
+    fonts -- the bare name is what makes exported text differ from the text on
+    screen.
+    """
+    return _FONT_STACKS.get(family or "Arial", f"{family}, {_FONT_FALLBACKS}")
+
 
 # Named colour sets. "Colourblind-safe" is Okabe-Ito, which stays
 # distinguishable under all three common forms of colour-vision deficiency and
@@ -1725,7 +1741,7 @@ def apply_plot_style(fig, style: dict, xtitle: str, ytitle: str,
     displayed, rather than a re-layout of it onto a square.
     """
     style = {**_default_style(), **(style or {})}
-    family, size = style["font_family"], int(style["font_size"])
+    family, size = _font_stack(style["font_family"]), int(style["font_size"])
     axis_font = {"family": family, "size": size}
     small_font = {"family": family, "size": max(9, round(size * 0.55))}
     position = style.get("legend_position", "outside-right")
@@ -1736,6 +1752,12 @@ def apply_plot_style(fig, style: dict, xtitle: str, ytitle: str,
         "height": height,
         "width": _SCREEN_CANVAS_W,
         "font": axis_font,
+        # Stated outright rather than left to the template. A figure with no
+        # background of its own renders on whatever the renderer defaults to,
+        # which is how a transparent paper reaches the exported raster and
+        # then shows up as black in a viewer that ignores alpha.
+        "paper_bgcolor": "white",
+        "plot_bgcolor": "white",
         "showlegend": legend_kwargs is not None,
         # 10 px is not enough room for a tick label, let alone an axis title:
         # every exported figure came out with its y-axis numbers and both axis
@@ -1852,6 +1874,15 @@ _PLOTLY_EDIT_CONFIG = {
 }
 
 
+def _white_background(fig) -> None:
+    """State the figure's background explicitly (see :func:`apply_plot_style`).
+
+    For the hand-built figures that set their own layout instead of going
+    through that function.
+    """
+    fig.update_layout(paper_bgcolor="white", plot_bgcolor="white")
+
+
 def _pin_canvas(fig, *, panels: int = 1) -> None:
     """Give ``fig`` the on-screen canvas width so its export matches it.
 
@@ -1963,7 +1994,7 @@ def _journal_table_figure(display_df: pd.DataFrame, font_size: int, stem: str,
     underlying (full-precision) data.
     """
     style = {**_default_style(), **(style or {})}
-    family = style["font_family"]
+    family = _font_stack(style["font_family"])
     cell_font = max(9.0, font_size * 0.4)
     header_font = max(10.0, font_size * 0.45)
     # Explicit NaN/None check before stringifying: a plain ``.astype(str)``
@@ -2884,8 +2915,8 @@ def render_tafel_tab() -> None:
     # together in plot/legend order, enabling a split legend per reaction.
     fits.sort(key=lambda f: _TAFEL_REACTIONS.index(f["reaction"]))
 
-    axis_font = {"family": "Arial", "size": font_size}
-    small_font = {"family": "Arial", "size": max(12, round(font_size * 0.5))}
+    axis_font = {"family": _ARIAL, "size": font_size}
+    small_font = {"family": _ARIAL, "size": max(12, round(font_size * 0.5))}
 
     # Original LSV (linear-scale polarization curve), before the log-current
     # Tafel transform — shown for context alongside the derived Tafel plot.
@@ -2935,7 +2966,7 @@ def render_tafel_tab() -> None:
         orig_lsv_position = style.get("legend_position", "outside-right")
         lsv_fig.update_layout(
             title=({"text": "Original LSV",
-                    "font": {"family": style["font_family"], "size": font_size}}
+                    "font": {"family": _font_stack(style["font_family"]), "size": font_size}}
                    if style.get("show_title") else None),
             template="plotly_white", height=460, font=axis_font,
             showlegend=orig_lsv_legend is not None,
@@ -2946,18 +2977,19 @@ def render_tafel_tab() -> None:
                 **_legend_margin_extra(style)},
         )
         lsv_fig.update_xaxes(
-            title={"text": "Potential vs RHE / V", "font": {"family": "Arial", "size": font_size}},
-            tickfont={"family": "Arial", "size": font_size}, **_axis_style(style),
+            title={"text": "Potential vs RHE / V", "font": {"family": _ARIAL, "size": font_size}},
+            tickfont={"family": _ARIAL, "size": font_size}, **_axis_style(style),
         )
         lsv_fig.update_yaxes(
             title={"text": f"Current ({display_unit})",
-                   "font": {"family": "Arial", "size": font_size}},
-            tickfont={"family": "Arial", "size": font_size}, **_axis_style(style),
+                   "font": {"family": _ARIAL, "size": font_size}},
+            tickfont={"family": _ARIAL, "size": font_size}, **_axis_style(style),
         )
         if lsv_x_range is not None:
             lsv_fig.update_xaxes(range=lsv_x_range)
         if lsv_y_range is not None:
             lsv_fig.update_yaxes(range=lsv_y_range)
+        _white_background(lsv_fig)
         _pin_canvas(lsv_fig)
         _show_figure(lsv_fig)
         figure_downloads(
@@ -3059,7 +3091,7 @@ def render_tafel_tab() -> None:
             # Sized off the chosen figure font rather than a fixed 22 pt,
             # which was illegible next to a 36 pt axis and oversized next to
             # a small one.
-            font={"family": style["font_family"], "color": fit_color,
+            font={"family": _font_stack(style["font_family"]), "color": fit_color,
                   "size": max(11, round(font_size * 0.62))},
         )
 
@@ -3071,7 +3103,7 @@ def render_tafel_tab() -> None:
     tafel_legend_position = style.get("legend_position", "outside-right")
     fig.update_layout(
         title=({"text": title_text,
-                "font": {"family": style["font_family"], "size": font_size}}
+                "font": {"family": _font_stack(style["font_family"]), "size": font_size}}
                if style.get("show_title") else None),
         template="plotly_white",
         height=560,
@@ -3090,13 +3122,13 @@ def render_tafel_tab() -> None:
     # uncluttered.
     fig.update_xaxes(
         title={"text": f"log₁₀ |Current| ({display_unit})",
-               "font": {"family": "Arial", "size": font_size}},
-        tickfont={"family": "Arial", "size": font_size}, range=tafel_x_range,
+               "font": {"family": _ARIAL, "size": font_size}},
+        tickfont={"family": _ARIAL, "size": font_size}, range=tafel_x_range,
         **_axis_style(style),
     )
     fig.update_yaxes(
-        title={"text": "Potential vs RHE / V", "font": {"family": "Arial", "size": font_size}},
-        tickfont={"family": "Arial", "size": font_size}, range=tafel_y_range,
+        title={"text": "Potential vs RHE / V", "font": {"family": _ARIAL, "size": font_size}},
+        tickfont={"family": _ARIAL, "size": font_size}, range=tafel_y_range,
         **_axis_style(style),
     )
     st.caption(
@@ -3107,6 +3139,7 @@ def render_tafel_tab() -> None:
         "use the **Legend** control in *Plot appearance* to move the legend "
         "in the downloaded figure."
     )
+    _white_background(fig)
     _pin_canvas(fig)  # height stays the 560 set above — this is the tab's
     # headline figure and has always been taller than the rest.
     _show_figure(
@@ -3294,21 +3327,22 @@ def render_tafel_tab() -> None:
             ))
             fig_bar.update_layout(
                 title=({"text": f"Benchmark @ j = {target_j:g} {display_unit}",
-                        "font": {"family": style["font_family"],
+                        "font": {"family": _font_stack(style["font_family"]),
                                  "size": font_size}}
                        if style.get("show_title") else None),
                 template="plotly_white", height=420,
-                font={"family": "Arial", "size": font_size},
+                font={"family": _ARIAL, "size": font_size},
                 margin=_journal_margin(
                     font_size, titled=bool(style.get("show_title"))),
             )
             fig_bar.update_xaxes(
-                tickfont={"family": "Arial", "size": font_size}, **_axis_style(style),
+                tickfont={"family": _ARIAL, "size": font_size}, **_axis_style(style),
             )
             fig_bar.update_yaxes(
-                title={"text": ylabel, "font": {"family": "Arial", "size": font_size}},
-                tickfont={"family": "Arial", "size": font_size}, **_axis_style(style),
+                title={"text": ylabel, "font": {"family": _ARIAL, "size": font_size}},
+                tickfont={"family": _ARIAL, "size": font_size}, **_axis_style(style),
             )
+            _white_background(fig_bar)
             _pin_canvas(fig_bar)
             _show_figure(fig_bar)
             figure_downloads(
@@ -4414,7 +4448,7 @@ def render_orr_tab() -> None:
             ), row=2, col=1)
             disk_data[f"{lbl} — Potential vs RHE (V)"] = list(s["potential"])
             disk_data[f"{lbl} — Disk current ({display_unit})"] = list(s["disk"])
-        axis_font_disk = {"family": "Arial", "size": font_size}
+        axis_font_disk = {"family": _ARIAL, "size": font_size}
         # Room for the tick numbers (which can run wide at the 36 pt export
         # size, e.g. "-10.000") plus the rotated title beyond them — a fixed
         # margin sized for the worst case, since automargin was what caused
@@ -4841,7 +4875,7 @@ def render_orr_tab() -> None:
             fig_tafel.add_annotation(
                 x=xmid, y=ymid, text=f"{slope_abs:.0f} mV/dec", showarrow=False,
                 yshift=14,
-                font={"family": "Arial", "color": fit_color, "size": round(font_size * 0.6)},
+                font={"family": _ARIAL, "color": fit_color, "size": round(font_size * 0.6)},
             )
         _style_axes(fig_tafel, f"log₁₀ |j_k| ({display_unit})", "Potential vs RHE / V")
         if orr_tafel_x_range is not None:
@@ -4975,7 +5009,7 @@ def render_orr_tab() -> None:
             "orr_rrde", "Potential (V)", None,
             float(np.min(pot_sel)), float(np.max(pot_sel)),
         )
-        axis_font_rrde = {"family": "Arial", "size": font_size}
+        axis_font_rrde = {"family": _ARIAL, "size": font_size}
         left_margin = 160 + (font_size - 28) * 4
         if p["has_ring"]:
             ring_sel, disk_sel = p["ring"][rpm_mask], p["disk"][rpm_mask]
