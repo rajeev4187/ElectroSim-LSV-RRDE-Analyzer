@@ -174,13 +174,9 @@ If you use this app (including the public Streamlit deployment) in your work,
 please cite it. Machine-readable metadata is in
 [`CITATION.cff`](CITATION.cff).
 
-<!-- TODO: replace 10.5281/zenodo.XXXXXXX with the real Zenodo DOI here,
-     in CITATION.cff (add a `doi:` field), and in the GitHub repo "About"
-     sidebar / release description. -->
-
 > Kumar, R. (2026). *ElectroSim-LSV-RRDE-Analyzer* (v1.1.0)
 > [Computer software]. North Carolina Central University.
-> DOI: 10.5281/zenodo.XXXXXXX.
+> DOI: [10.5281/zenodo.21997767](https://doi.org/10.5281/zenodo.21997767).
 > <https://github.com/rajeev4187/LSV-Analysis-iR-compensation-Tafel-slope>
 
 ```bibtex
@@ -189,7 +185,7 @@ please cite it. Machine-readable metadata is in
   title   = {ElectroSim-LSV-RRDE-Analyzer},
   version = {1.1.0},
   year    = {2026},
-  doi     = {10.5281/zenodo.XXXXXXX},
+  doi     = {10.5281/zenodo.21997767},
   url     = {https://github.com/rajeev4187/LSV-Analysis-iR-compensation-Tafel-slope}
 }
 ```

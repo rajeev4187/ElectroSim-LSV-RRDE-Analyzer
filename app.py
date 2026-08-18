@@ -52,10 +52,11 @@ st.set_page_config(
 EIS_SAMPLE_PATH = "sample-data/EIS example.xlsx"
 LSV_SAMPLE_PATH = "sample-data/LSV Example.xlsx"
 REPO_URL = "https://github.com/rajeev4187/LSV-Analysis-iR-compensation-Tafel-slope"
+CITATION_DOI = "10.5281/zenodo.21997767"
 CITATION_TEXT = (
     f"Kumar, R. (2026). {APP_NAME} "
     "(v1.1.0) [Computer software]. North Carolina Central "
-    f"University. {REPO_URL}"
+    f"University. DOI: {CITATION_DOI}. {REPO_URL}"
 )
 CITATION_BIBTEX = (
     "@software{kumar_electrosim_lsv_rrde_2026,\n"
@@ -63,6 +64,7 @@ CITATION_BIBTEX = (
     f"  title   = {{{APP_NAME}}},\n"
     "  version = {1.1.0},\n"
     "  year    = {2026},\n"
+    f"  doi     = {{{CITATION_DOI}}},\n"
     f"  url     = {{{REPO_URL}}}\n"
     "}"
 )
@@ -79,8 +81,8 @@ def render_citation() -> None:
     st.sidebar.markdown(f"> {CITATION_TEXT}")
     st.sidebar.code(CITATION_BIBTEX, language="bibtex")
     st.sidebar.caption(
-        "Machine-readable metadata: CITATION.cff. A versioned release can "
-        "be archived on Zenodo to obtain a citable DOI."
+        "Machine-readable metadata: CITATION.cff. "
+        f"Archived on Zenodo: https://doi.org/{CITATION_DOI}"
     )
 
 

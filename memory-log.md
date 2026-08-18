@@ -349,3 +349,102 @@ Nothing from the review remains. Two notes for future work:
 - `_orr_data_loader`'s per-slot widgets (`orr_sample_name_{i}`) are still
   index-keyed. That one is correct: the slot exists before the user has typed
   a name, so there is no stable label to key on.
+
+---
+
+## Third pass — 2026-08-18 (independent re-review)
+
+The two earlier passes were re-verified against the code (all their FIXED
+claims hold) and the suite was re-run: **158 tests passed, no skips**, kaleido
+exports included. Two process notes: `pytest` is not installed in `.venv`, so
+the "133 tests pass" line above was not reproducible as written; and an
+interrupted kaleido run leaves orphan `chrome.exe` processes that make
+`test_export_renders_at_the_requested_physical_size` fail spuriously with
+"Couldn't close or kill browser subprocess" — clear them and re-run.
+
+Then a fresh review found one substantive defect the earlier passes missed.
+
+### 🔴 The auto Tafel window optimised something it was not graded on — FIXED
+
+`TafelResult.quality_warnings` grades a fit by **decades of current covered**
+(>= 1 decade is the stated convention). Neither window search targeted that:
+`_grow_from_onset` maximised R^2 greedily, `_best_r2_window` scored
+`R^2 x point-count`. The auto-detector was therefore optimising a different
+quantity from the one it was judged by, and it showed on both bundled samples:
+
+| sample | before | after |
+|---|---|---|
+| LSV (OER) | 5 pts, 0.02 dec, 227 mV/dec, R2 0.845 | 300 pts, **1.33 dec, 191 mV/dec, R2 0.982** |
+| ORR (j_k) | 18 pts, 0.18 dec, **491 mV/dec** | 86 pts, **2.65 dec, 130 mV/dec** |
+
+491 mV/dec is physically impossible for ORR; ~130 mV/dec over 2.6 decades is
+the textbook first-electron-transfer value. Both old windows were flagged
+unreliable by the app, so no silently wrong number was ever displayed — but
+the feature failed on the project's own sample data.
+
+Underneath sat a concrete bug: **the `patience` counter was armed from the
+first candidate**, so a window whose R^2 was still *climbing* out of the noise
+of its own minimum width aborted growth. On the LSV sample R^2 ran 0.845 ->
+0.906 -> 0.938 -> 0.957 — four consecutive "misses" against the 0.99
+threshold, so it broke — when R^2 = 0.992 lay eleven points further on. A
+rising R^2 means the window is improving, which is the opposite of the
+curvature the counter existed to detect.
+
+Fixes, all in `tafel.py`:
+
+- New `MIN_TAFEL_DECADES = 1.0` and an R^2 ladder (threshold, then 0.98 /
+  0.97 / 0.95). `_pick_by_decades` returns the first floor's widest-in-decades
+  window that reaches a decade; if no floor gets there the *strictest* floor's
+  answer stands, so fit quality is never traded for width the data cannot
+  support.
+- `_grow_from_onset` scores every candidate in one vectorised pass instead of
+  growing greedily. `patience` is kept for signature compatibility and is
+  documented as unused — there is no longer any growth to abandon.
+- `_best_r2_window` uses the same decade-first score; `R^2 x point-count`
+  rewarded windows wide in *points*, which on a densely-sampled plateau is not
+  wide in current at all.
+- `auto_tafel_range` accepted the onset-anchored window on **point count**
+  alone, so a 5-point, 0.02-decade window was returned as confident and the
+  global scan was never consulted. It now accepts only a window that reaches a
+  decade, and otherwise lets the global scan compete (the onset-anchored
+  window still wins ties, being anchored to physics rather than to whichever
+  stretch scored best).
+
+### ⚡ Efficiency
+
+`_grow_from_onset` was an O(n) Python loop of scalar arithmetic over prefix
+sums — 22 ms on a 16 000-point sweep, re-paid per sample on every Streamlit
+rerun. Vectorised: **22.0 -> 1.8 ms at 16k (12x), 5.6 -> 0.2 ms at 4k**.
+`_window_r2` is pinned to the scalar form to 1e-12 by test.
+
+Trade-off recorded honestly: `_best_r2_window` now allocates per-start arrays
+and calls `np.maximum.accumulate` over the tail for each grid start, so on
+*very* large sweeps it is slower than the old scalar scan — 2.2 -> 6.4 ms at
+16k, 3.6 -> 16.8 ms at 50k. It is faster at the sizes real files actually have
+(1.3 ms vs 2.0 ms at 4k), it is only the fallback path, and 17 ms is
+imperceptible in a Streamlit rerun, so this was left alone rather than
+carrying a block-decomposition for it.
+
+### 🟡 Also fixed
+
+- **`orr.ring_disk_average` was tested but never called by the app.** The ORR
+  tab reported n and %H2O2 interpolated at the single potential E1/2 — the
+  quantity `orr.py`'s own docstring calls inferior to the plateau average the
+  literature quotes. E1/2 is method-dependent (the three methods disagree by
+  65 mV on the bundled file, moving n by ~0.05 and the peroxide yield by ~3
+  points for no change in the data), and a single-point read-off inherits that
+  spread in full. The tab now has a plateau-averaging window (default
+  0.2-0.6 V vs RHE) and reports the average, the point count, and the E1/2
+  value beside it for cross-checking. Non-finite results render blank instead
+  of `nan`, and an empty window warns.
+- **The Levich 4-electron prefactor was retyped inline twice** in `app.py`
+  instead of calling `orr.levich_current_density`. Values agreed exactly; it
+  was a divergence risk, now removed.
+- `app.py` E128 continuation-line lint error in `_legend_dict`. flake8 clean.
+
+### Still open (unchanged from the second pass)
+
+- Smaller default journal font set for single-column work.
+- `_orr_data_loader`'s index-keyed per-slot widgets — correct as they are.
+
+**Test count after this pass: 165 (7 added), all passing, flake8 clean.**

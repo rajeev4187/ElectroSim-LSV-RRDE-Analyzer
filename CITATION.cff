@@ -19,9 +19,7 @@ authors:
     given-names: Rajeev
     email: rkumar@nccu.edu
     affiliation: North Carolina Central University
-# Uncomment and fill in once the Zenodo record is minted (also update the DOI
-# in README.md and the GitHub repo "About" sidebar):
-# doi: "10.5281/zenodo.XXXXXXX"
+doi: "10.5281/zenodo.21997767"
 repository-code: "https://github.com/rajeev4187/LSV-Analysis-iR-compensation-Tafel-slope"
 url: "https://lsv-analysis-ir-compensation-tafel-slope.streamlit.app/"
 keywords:
