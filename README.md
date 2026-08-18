@@ -128,7 +128,7 @@ Electrolyte O₂ transport parameters for K-L ship as presets for 0.1 M KOH,
 
 ```text
 iR correction    E_corr = E - (f/100)·I·Ru
-Koutecky-Levich  1/j = 1/j_k + 1/(B·w^0.5),  w = 2·pi·rpm/60,
+Koutecký–Levich  1/j = 1/j_k + 1/(B·w^0.5),  w = 2·pi·rpm/60,
                  B = 0.62 n F D^(2/3) v^(-1/6) C
 RRDE             n = 4|Id| / (|Id| + |Ir|/N)
                  %H2O2 = 200(|Ir|/N) / (|Id| + |Ir|/N)

@@ -1,5 +1,5 @@
 """ElectroSim-LSV-RRDE-Analyzer: a Streamlit GUI for iR compensation,
-Tafel-slope, Koutecky-Levich, and ORR/RRDE analysis.
+Tafel-slope, Koutecký–Levich, and ORR/RRDE analysis.
 
 Run with:
     streamlit run app.py
@@ -15,7 +15,7 @@ Workflow
    benchmark current densities (e.g. j = 10 mA/cm²), and the Tafel slope of
    the linear (kinetic) region.
 5. **K-L Analysis** tab: independent, multi-rotation-rate RDE data — the
-   classic Koutecky-Levich fit (1/j vs 1/sqrt(omega)) for the kinetic current
+   classic Koutecký–Levich fit (1/j vs 1/sqrt(omega)) for the kinetic current
    density and, given the electrolyte's O2 transport parameters, the
    electron-transfer number n.
 6. **ORR / RRDE Analysis** tab: independent, one rotation rate (usually 1600
@@ -156,15 +156,16 @@ def _export_figure(fig):
 
 
 def _export_size(fig, width: int | None, height: int | None) -> tuple[int, int]:
-    """Pixel size for a static export.
+    """Pixel size for a static export: the figure's own canvas.
 
-    Square by default (the common preference for journal figures): width
-    matches height unless the figure (or caller) pins its own width — e.g.
-    a table (sized by column count) or a deliberately multi-panel figure
-    (the merged Ring/Disk plot) that already sets both dimensions itself.
-    Height defaults to the figure's own layout height when it sets one — a
-    table sizes itself by row count, so forcing the same fixed height on
-    every figure (as this used to) simply cut the last rows off.
+    Both dimensions come from the figure itself — every chart now carries a
+    width (:data:`_SCREEN_CANVAS_W`, the width it is displayed at) as well as
+    a height, so the exported file is the size that was on screen. Tables and
+    the merged Ring/Disk panel set their own dimensions and keep them.
+
+    The square fallback is only for a figure that somehow pins no width at
+    all; it used to be the normal path, and was why a downloaded figure came
+    back re-flowed onto a canvas the on-screen one never had.
     """
     if height is None:
         height = int(getattr(fig.layout, "height", None) or 520)
@@ -202,6 +203,23 @@ _JOURNAL_WIDTHS_CM: dict[str, float | None] = {
 # Converting cm to pixels *at dpi* here would therefore double-count the
 # resolution: a 150 dpi single-column figure came out 13.4 cm instead of 8.6.
 _CSS_PX_PER_INCH = 96
+
+# On-screen canvas width, in the same CSS pixels the export is measured in.
+#
+# Charts used to stretch to whatever the browser column happened to be, and the
+# export -- which has no way to know that width -- fell back to a square canvas.
+# Everything that positions text (font sizes, margins, legend anchors) is in
+# absolute pixels, so those two canvases are not a rescale of each other but two
+# different layouts: the downloaded figure genuinely did not match the one on
+# screen. Pinning the preview to one width fixes that at the source, because
+# :func:`_export_size` then reads the figure's own width back and the file comes
+# out at exactly the size that was displayed.
+#
+# 17.8 cm (double column) is the widest journal width and the only one that
+# leaves room for the default 28 pt axis type -- at the narrower ones the
+# margins alone take most of the canvas.
+_SCREEN_CANVAS_W = int(round(_JOURNAL_WIDTHS_CM["Double column (17.8 cm)"]
+                             / 2.54 * _CSS_PX_PER_INCH))
 
 
 def _margin_crowding(fig, out_w: int, out_h: int) -> tuple[str, float] | None:
@@ -249,6 +267,31 @@ _EXPORT_FORMATS: dict[str, tuple[str, str]] = {
 _EXPORT_DPI_CHOICES = [150, 300, 600, 1200]
 
 
+def _flatten_to_rgb(image: "Image.Image") -> "Image.Image":
+    """Composite ``image`` onto white and return it as 8-bit **RGB**.
+
+    Kaleido's PNG always carries an alpha channel, and for these figures it
+    is 100 % opaque -- it holds no information at all. Carrying it into the
+    saved file is not harmless, though: an RGBA TIFF is a 32-bit,
+    4-samples-per-pixel file tagged ``ExtraSamples = 2`` (unassociated
+    alpha), and a lot of the software a figure actually has to survive --
+    Word/PowerPoint, the Windows photo viewer, several manuscript-submission
+    converters -- either renders that as black or misreads the sample layout
+    and shifts the colour channels, which is what "the TIFF is garbled"
+    looks like. Three-channel RGB is the interchange format every one of
+    them handles, and (alpha being opaque) the pixels are identical.
+
+    White, not black, is the background to composite onto if a figure ever
+    does arrive genuinely transparent: these are journal figures on paper.
+    """
+    if image.mode == "RGB":
+        return image
+    rgba = image.convert("RGBA")
+    flat = Image.new("RGB", rgba.size, (255, 255, 255))
+    flat.paste(rgba, mask=rgba.split()[3])
+    return flat
+
+
 def _render_export(export_fig, fmt: str, width: int, height: int,
                    dpi: int = 300) -> bytes:
     """Render a figure to ``fmt`` at ``dpi``.
@@ -265,6 +308,11 @@ def _render_export(export_fig, fmt: str, width: int, height: int,
     default 72 dpi -- which is the number the submission system and the
     typesetter read, and the reason an otherwise correct figure comes back
     flagged as too low-resolution.
+
+    Every raster format is also flattened to 3-channel RGB first (see
+    :func:`_flatten_to_rgb`) -- the alpha channel Kaleido always emits is
+    fully opaque here, and shipping it is what made the TIFF unreadable in
+    the software these figures end up in.
     """
     if fmt in ("svg", "pdf"):
         # Vector: dpi is meaningless. Kaleido sizes these in CSS pixels, the
@@ -275,14 +323,13 @@ def _render_export(export_fig, fmt: str, width: int, height: int,
     scale = max(1.0, float(dpi) / 96.0)
     png_bytes = export_fig.to_image(format="png", width=width, height=height,
                                     scale=scale)
-    image = Image.open(io.BytesIO(png_bytes))
+    image = _flatten_to_rgb(Image.open(io.BytesIO(png_bytes)))
     buffer = io.BytesIO()
     if fmt == "tiff":
         image.save(buffer, format="TIFF", dpi=(dpi, dpi), compression="tiff_lzw")
     elif fmt in ("jpeg", "jpg"):
-        # JPEG has no alpha channel; a transparent PNG would otherwise raise.
-        image.convert("RGB").save(buffer, format="JPEG", dpi=(dpi, dpi),
-                                  quality=95, subsampling=0)
+        image.save(buffer, format="JPEG", dpi=(dpi, dpi),
+                   quality=95, subsampling=0)
     else:
         image.save(buffer, format="PNG", dpi=(dpi, dpi))
     return buffer.getvalue()
@@ -299,13 +346,21 @@ def figure_downloads(fig, stem: str, key: str, what: str = "figure",
     """Render the download controls for one figure: a chosen image format,
     interactive HTML, and (optionally) the plotted data as CSV.
 
-    Image rendering is server-side (kaleido + Pillow), which launches a
-    headless browser per call -- too slow/fragile to run on *every* script
-    rerun (it would fire on every unrelated widget interaction, e.g. dragging
-    a slider). It only happens when the user clicks "Prepare"; the bytes are
-    cached in session_state together with a signature of the figure, so the
-    download button persists across reruns but is withdrawn as soon as the
-    figure itself changes.
+    Image rendering is server-side (kaleido + Pillow) and launches a headless
+    browser per call, so it must not run on every script rerun -- it would
+    fire on every unrelated widget interaction, e.g. dragging a slider. It is
+    therefore deferred into the download button's own ``data`` callable, which
+    Streamlit runs on click (on its own thread) rather than while laying the
+    page out.
+
+    That deferral replaced a two-step "Prepare, then download" flow whose
+    prepared bytes lived in session_state behind a figure signature. The cache
+    had to be invalidated whenever the figure or the render settings changed,
+    which is *most* interactions in this app -- so the download button
+    routinely vanished between preparing a figure and clicking it, and the
+    only way back was to render the whole thing again. Rendering at click time
+    has no cache to go stale: the bytes are always the figure currently on
+    screen, at the settings currently chosen.
 
     The HTML and CSV exports need no external renderer and are therefore
     always available -- they are the fallback when kaleido/Chrome is
@@ -314,7 +369,6 @@ def figure_downloads(fig, stem: str, key: str, what: str = "figure",
     multi-thousand-point figure to a self-contained HTML page on every rerun
     of every figure was costing far more than the charts themselves.
     """
-    state_key = f"_export_{key}"
     with st.expander(f"⬇️ Download {what}"):
         export_fig = _export_figure(fig)
         # One serialisation per figure per rerun, shared by the image cache
@@ -340,17 +394,21 @@ def figure_downloads(fig, stem: str, key: str, what: str = "figure",
                          "600+ for line art in high-quality journals.",
                 )
             base_w, base_h = _export_size(export_fig, width, height)
-            # A caller that pins its own width has a layout reason for it (a
-            # table sized by column count, a two-panel figure): re-flowing
-            # those to a column width clips their contents, so they default
-            # to their own size and the presets stay available but unchosen.
+            # Default to the figure's own canvas -- i.e. what is on screen.
+            # This used to default to the single-column preset instead, which
+            # re-flowed the figure onto a 325 px canvas while its fonts and
+            # margins stayed at their absolute on-screen pixel sizes: margins
+            # alone took 91 % of the width, axis titles ran off both edges and
+            # the tick labels overlapped into a blur. That download did not
+            # resemble the plot it came from, and the presets are the place to
+            # opt into a column width deliberately, not the default.
             preset = st.selectbox(
-                "Figure width", list(_JOURNAL_WIDTHS_CM),
-                index=0 if width is not None else 1,
+                "Figure width", list(_JOURNAL_WIDTHS_CM), index=0,
                 key=f"_wpreset_{key}",
-                help="Journals specify figures by the column width they must "
-                     "fit. The pixel size below follows from that width and "
-                     "the dpi; override it if you need an exact size.",
+                help="Defaults to the size shown on screen, so the file "
+                     "matches the plot. The column presets re-flow the figure "
+                     "to a journal width — check the preview size below, and "
+                     "lower the axis font size if it warns about margins.",
             )
             width_cm = _JOURNAL_WIDTHS_CM[preset]
             if width_cm is not None:
@@ -392,53 +450,31 @@ def figure_downloads(fig, stem: str, key: str, what: str = "figure",
                     "lower **Font size** in the plot-appearance panel, or "
                     "choose a wider column."
                 )
-            # The prepared bytes depend on the render settings as much as on
-            # the figure, so they are part of the cache identity. Keying on
-            # the figure alone served stale bytes -- with the *old* format's
-            # extension and MIME type -- to anyone who changed format, dpi or
-            # size and downloaded without pressing Prepare again.
-            settings = (fmt, int(dpi), int(out_w), int(out_h))
-            if st.button(f"🖼️ Prepare {what}", key=f"_img_prep_{key}",
-                         width="stretch"):
+            # Rendered on click, not on layout: kaleido spawns a headless
+            # browser and takes seconds, which is far too slow to repeat on
+            # every rerun of every figure on the page. The closure captures
+            # this rerun's figure and settings, so whatever is downloaded is
+            # what was on screen when the button was clicked.
+            def _render_now(_fig=export_fig, _fmt=fmt, _w=int(out_w),
+                            _h=int(out_h), _dpi=int(dpi), _what=what) -> bytes:
                 try:
-                    st.session_state[state_key] = {
-                        "sig": _figure_signature(export_fig),
-                        "settings": settings,
-                        "bytes": _render_export(export_fig, fmt, int(out_w),
-                                                int(out_h), int(dpi)),
-                        "ext": fmt, "mime": mime, "error": None,
-                    }
+                    return _render_export(_fig, _fmt, _w, _h, _dpi)
                 except Exception as exc:  # kaleido missing / no Chrome
-                    st.session_state[state_key] = {
-                        "sig": _figure_signature(export_fig),
-                        "settings": settings, "bytes": None,
-                        "ext": fmt, "mime": mime, "error": str(exc),
-                    }
-            cached = st.session_state.get(state_key) or {}
-            if cached.get("bytes") or cached.get("error"):
-                stale_settings = cached.get("settings") != settings
-                fresh = (cached.get("bytes") and cached.get("sig") == sig
-                         and not stale_settings)
-                if fresh:
-                    st.download_button(
-                        f"⬇️ {what} ({cached['ext'].upper()})",
-                        data=cached["bytes"],
-                        file_name=f"{stem}.{cached['ext']}",
-                        mime=cached["mime"], key=f"_img_dl_{key}",
-                        width="stretch",
-                    )
-                elif cached.get("bytes"):
-                    st.caption(
-                        "↻ Export settings changed — press Prepare again."
-                        if stale_settings else
-                        "↻ Figure changed — press Prepare again."
-                    )
-                elif cached.get("error"):
-                    st.caption(
-                        f"Image export unavailable ({cached['error']}). Use "
-                        "the HTML download beside this button, or the 📷 icon "
-                        "on the chart."
-                    )
+                    # Raising beats handing back a zero-byte file the user
+                    # only discovers is broken after opening it.
+                    raise RuntimeError(
+                        f"Could not render the {_what} as {_fmt.upper()}: "
+                        f"{exc}. The HTML download beside this button, and "
+                        "the 📷 icon on the chart itself, need no renderer."
+                    ) from exc
+
+            st.download_button(
+                f"⬇️ {what} ({fmt.upper()})", data=_render_now,
+                file_name=f"{stem}.{fmt}", mime=mime,
+                key=f"_img_dl_{key}", width="stretch",
+                help="Rendered when you click, at the size and resolution "
+                     "set above — always the figure currently on screen.",
+            )
 
         with cols[1]:
             try:
@@ -827,6 +863,25 @@ def render_manual_ru_section(ru_unit: str = "Ω",
 # --------------------------------------------------------------------------- #
 # EIS / Ru analysis tab                                                       #
 # --------------------------------------------------------------------------- #
+# Where the Nyquist plot's "Ru=" label can sit. The first four hang off the Ru
+# marker itself; the corner options are paper-referenced, which on a Nyquist arc
+# is the reliably empty part of the frame. ``None`` hides the label for anyone
+# who would rather put the value in the caption.
+_RU_LABEL_POSITIONS: dict[str, dict | None] = {
+    "Above the Ru marker": {"yshift": 18, "yanchor": "bottom"},
+    "Below the Ru marker": {"yshift": -18, "yanchor": "top"},
+    "Left of the Ru marker": {"xshift": -12, "xanchor": "right",
+                              "yanchor": "middle"},
+    "Right of the Ru marker": {"xshift": 12, "xanchor": "left",
+                               "yanchor": "middle"},
+    "Top-left corner": {"x": 0.02, "y": 0.98, "xref": "paper", "yref": "paper",
+                        "xanchor": "left", "yanchor": "top"},
+    "Top-right corner": {"x": 0.98, "y": 0.98, "xref": "paper", "yref": "paper",
+                         "xanchor": "right", "yanchor": "top"},
+    "Hidden": None,
+}
+
+
 def render_eis_tab(eis_d, eis_list, sel, ru_unit: str = "Ω",
                    current_unit: str = "mA",
                    area_cm2: float | None = None) -> float | None:
@@ -947,14 +1002,29 @@ def render_eis_tab(eis_d, eis_list, sel, ru_unit: str = "Ω",
                     name="Ru", marker={"size": 13, "color": "red", "symbol": "x"},
                 )
             )
-            # A real annotation (not scatter text) so the edit config's
-            # annotationPosition lets the user drag it off the data if it
-            # starts out overlapping nearby points.
-            fig.add_annotation(
-                x=ru_for_marker, y=0, text=f"Ru={ru_for_marker:.2f} {disp_unit}",
-                showarrow=False, yshift=-18,
-                font={"color": "red"},
+            # Where the Ru label sits has to be decided *here*, on the server.
+            # Dragging it in the browser moves it on screen only -- Plotly
+            # keeps that edit client-side and Streamlit has no relayout event
+            # to send it back (see _PLOTLY_EDIT_CONFIG), so the downloaded
+            # figure was always rendered from the untouched position and the
+            # label jumped back onto the data. This control is the same choice
+            # made somewhere the export can see it.
+            ru_place = st.selectbox(
+                "Ru label position", list(_RU_LABEL_POSITIONS), index=0,
+                key="eis_ru_label_pos",
+                help="Moves the red Ru= label in the figure *and* in every "
+                     "download. Dragging the label on the chart itself only "
+                     "moves it on screen — the saved file cannot see that.",
             )
+            ru_anchor = _RU_LABEL_POSITIONS[ru_place]
+            if ru_anchor is not None:
+                fig.add_annotation(
+                    text=f"Ru={ru_for_marker:.2f} {disp_unit}",
+                    showarrow=False, font={"color": "red"},
+                    **({"x": ru_for_marker, "y": 0} if "xref" not in ru_anchor
+                       else {}),
+                    **ru_anchor,
+                )
         _journal_axes_style(fig, f"Z′ / {disp_unit}", f"−Z″ / {disp_unit}",
                             font_size, style=style)
         # Equal aspect *and* one shared round-ticked range, so the arc is a
@@ -994,7 +1064,7 @@ def render_eis_tab(eis_d, eis_list, sel, ru_unit: str = "Ω",
                 )
         _square_nyquist(fig, view_x, view_y,
                         target=int(style.get("n_ticks", 5)))
-        st.plotly_chart(fig, width="stretch", config=_PLOTLY_EDIT_CONFIG)
+        _show_figure(fig)
         nyquist_data = _padded_frame({
             f"Z′ ({disp_unit})": zr,
             f"−Z″ ({disp_unit})": np.abs(zi),
@@ -1313,7 +1383,8 @@ def render_lsv_tab(lsv_d, ru: float | None, current_unit: str = "mA",
                          spikethickness=1, spikedash="dot",
                          spikecolor="#888", **_axis_style(style))
         fig.update_yaxes(**_axis_style(style))
-        st.plotly_chart(fig, width="stretch", config=_PLOTLY_EDIT_CONFIG)
+        _pin_canvas(fig, panels=(1 if view == "Overlay (same axes)" else 2))
+        _show_figure(fig)
         fac_png = "-".join(str(int(r.factor_percent)) for r in results)
         slug = re.sub(r"\W+", "_", sample_label).strip("_").lower()
         plotted = {
@@ -1527,9 +1598,11 @@ def plot_style_controls(key_prefix: str, *, default_palette: str = "Default (Plo
             "Legend", _LEGEND_POSITIONS,
             index=_LEGEND_POSITIONS.index(default_legend),
             key=f"{key_prefix}_legend_pos",
-            help="Drag the legend on the chart itself to fine-tune; this "
-                 "only sets where it starts. 'outside-right' (default) sits "
-                 "clear of the data so nothing is hidden behind it.",
+            help="This is the setting the downloaded figure uses. Dragging "
+                 "the legend on the chart moves it on screen only — that "
+                 "edit stays in the browser and the saved file will not have "
+                 "it. 'outside-right' (default) sits clear of the data so "
+                 "nothing is hidden behind it.",
         )
 
         d1, d2, d3, d4 = st.columns(4)
@@ -1645,7 +1718,11 @@ def apply_plot_style(fig, style: dict, xtitle: str, ytitle: str,
     """Apply a :func:`plot_style_controls` dict to ``fig`` in place.
 
     The single place figure styling happens, so on-screen and exported
-    figures cannot drift apart.
+    figures cannot drift apart. That now includes the canvas: the figure
+    carries :data:`_SCREEN_CANVAS_W`, :func:`_show_figure` renders the chart
+    at exactly that width, and :func:`_export_size` reads it back — so the
+    downloaded file is the figure that was on screen, at the size it was
+    displayed, rather than a re-layout of it onto a square.
     """
     style = {**_default_style(), **(style or {})}
     family, size = style["font_family"], int(style["font_size"])
@@ -1657,6 +1734,7 @@ def apply_plot_style(fig, style: dict, xtitle: str, ytitle: str,
     layout = {
         "template": "plotly_white",
         "height": height,
+        "width": _SCREEN_CANVAS_W,
         "font": axis_font,
         "showlegend": legend_kwargs is not None,
         # 10 px is not enough room for a tick label, let alone an axis title:
@@ -1754,20 +1832,59 @@ _BOX_AXIS_STYLE = {
     "nticks": 5,
 }
 # Every journal-style plot uses this so its legend and any text annotations
-# (slope labels, etc.) can be dragged to a better spot before export.
+# (slope labels, etc.) can be dragged to a better spot on screen.
 #
 # Those drags happen in the browser and never reach the server: Streamlit's
 # st.plotly_chart surfaces selection events but has no API for relayout ones,
 # so a dragged legend cannot be read back into the Python figure and cannot
-# appear in the server-rendered TIFF/PNG. The chart's own camera button is the
-# one export path that *does* keep them, so it is configured here to produce a
-# publication-usable raster rather than the screen-resolution default. Scale 4
-# on a ~900 px chart is ~3600 px across, i.e. 300 dpi at a double-column width.
+# appear in the server-rendered TIFF/PNG -- it snaps back to wherever the
+# Python figure put it. Anything that has to survive a download therefore needs
+# a server-side control instead: the "Legend" dropdown in *Plot appearance*,
+# and :data:`_RU_LABEL_POSITIONS` for the Nyquist Ru label. The chart's own
+# camera button is the one export path that *does* keep the drags, so it is
+# configured here to produce a publication-usable raster rather than the
+# screen-resolution default. Scale 4 on a ~900 px chart is ~3600 px across,
+# i.e. 300 dpi at a double-column width.
 _PLOTLY_EDIT_CONFIG = {
     "edits": {"legendPosition": True, "annotationPosition": True},
     "displaylogo": False,
     "toImageButtonOptions": {"format": "png", "scale": 4},
 }
+
+
+def _pin_canvas(fig, *, panels: int = 1) -> None:
+    """Give ``fig`` the on-screen canvas width so its export matches it.
+
+    :func:`apply_plot_style` does this for the figures that go through it;
+    this is the same step for the handful that build their own layout (the
+    iR-correction overlay, the LSV Analysis originals, the Tafel plot). Each
+    figure keeps whatever height it already sets for itself -- only the
+    width, the part that used to be left to the browser, is pinned.
+
+    ``panels`` is for a genuinely side-by-side figure: two panels at a column
+    width each are two columns wide.
+    """
+    fig.update_layout(width=_SCREEN_CANVAS_W * max(1, int(panels)))
+
+
+def _show_figure(fig, **kwargs):
+    """Render one figure, honouring a canvas the figure pins for itself.
+
+    ``width="stretch"`` (Streamlit's default, and what every chart here used
+    to pass) re-lays the figure out at whatever the browser column happens to
+    be, which is a width the server-side export has no way to know. A figure
+    that carries its own ``layout.width`` is therefore rendered at
+    ``width="content"`` instead: the preview is then the same canvas the
+    exported file gets, which is the whole point of pinning it. Figures with
+    no pinned width keep the old stretchy behaviour.
+
+    Extra keyword arguments (``key``, ``on_select``, ``selection_mode``, …)
+    pass straight through, so selection-enabled charts use this too.
+    """
+    kwargs.setdefault("config", _PLOTLY_EDIT_CONFIG)
+    pinned = getattr(fig.layout, "width", None)
+    kwargs.setdefault("width", "content" if pinned else "stretch")
+    return st.plotly_chart(fig, **kwargs)
 
 
 def _range_controls(
@@ -2841,7 +2958,8 @@ def render_tafel_tab() -> None:
             lsv_fig.update_xaxes(range=lsv_x_range)
         if lsv_y_range is not None:
             lsv_fig.update_yaxes(range=lsv_y_range)
-        st.plotly_chart(lsv_fig, width="stretch", config=_PLOTLY_EDIT_CONFIG)
+        _pin_canvas(lsv_fig)
+        _show_figure(lsv_fig)
         figure_downloads(
             lsv_fig, "original_lsv_plot", key="png_lsv_original",
             what="LSV plot", data=_padded_frame(lsv_plotted),
@@ -2984,13 +3102,16 @@ def render_tafel_tab() -> None:
     st.caption(
         "🖱️ Drag a box around a sample's linear region to set its fit range "
         "directly (mouse now defaults to box-select instead of zoom — use "
-        "the toolbar's zoom icon or double-click to reset the view). Drag "
-        "the legend or a slope label to reposition it before exporting."
+        "the toolbar's zoom icon or double-click to reset the view). The "
+        "legend and slope labels can be dragged too, but only on screen: "
+        "use the **Legend** control in *Plot appearance* to move the legend "
+        "in the downloaded figure."
     )
-    st.plotly_chart(
-        fig, width="stretch", key="tafel_plot_select",
+    _pin_canvas(fig)  # height stays the 560 set above — this is the tab's
+    # headline figure and has always been taller than the rest.
+    _show_figure(
+        fig, key="tafel_plot_select",
         on_select="rerun", selection_mode=["box"],
-        config=_PLOTLY_EDIT_CONFIG,
     )
     figure_downloads(
         fig, "tafel_combined_plot", key="png_tafel", what="Tafel plot",
@@ -3188,7 +3309,8 @@ def render_tafel_tab() -> None:
                 title={"text": ylabel, "font": {"family": "Arial", "size": font_size}},
                 tickfont={"family": "Arial", "size": font_size}, **_axis_style(style),
             )
-            st.plotly_chart(fig_bar, width="stretch", config=_PLOTLY_EDIT_CONFIG)
+            _pin_canvas(fig_bar)
+            _show_figure(fig_bar)
             figure_downloads(
                 fig_bar, f"overpotential_bar_j{target_j:g}",
                 key=f"png_tafel_bar_{bar_i}",
@@ -3212,7 +3334,7 @@ def render_tafel_tab() -> None:
 
 
 # --------------------------------------------------------------------------- #
-# Koutecky-Levich (K-L) analysis tab (independent data source)                #
+# Koutecký–Levich (K-L) analysis tab (independent data source)                #
 # --------------------------------------------------------------------------- #
 # The K-L fit must run in A/cm² (the units the 0.62 Levich prefactor is
 # defined for), but the plot is conventionally shown in mA/cm². Since
@@ -3287,7 +3409,7 @@ def render_kl_tab() -> None:
         index=(_DENSITY_CURRENT_UNITS if uploaded_is_density
                else _ABS_CURRENT_UNITS).index(current_unit),
         key="kl_desired_unit",
-        help="Display unit for the RDE curves below. The Koutecky-Levich "
+        help="Display unit for the RDE curves below. The Koutecký–Levich "
              "fit and n always use A/cm² internally regardless of this.",
     )
     area_cm2 = cur3.number_input(
@@ -3296,7 +3418,7 @@ def render_kl_tab() -> None:
         disabled=uploaded_is_density,
         help="0.196 cm² is the standard 5 mm-diameter RDE glassy-carbon disk. "
              "Used to convert the uploaded absolute current into the A/cm² "
-             "current density the Koutecky-Levich fit and n require. Not "
+             "current density the Koutecký–Levich fit and n require. Not "
              "needed (and disabled) when the upload is already a density.",
     )
     display_unit = desired_unit if uploaded_is_density else f"{desired_unit}/cm²"
@@ -3353,7 +3475,7 @@ def render_kl_tab() -> None:
     disk = _rescale_current(disk_raw, current_unit, desired_unit)
     if not uploaded_is_density:
         disk = disk / area_cm2
-    # The Koutecky-Levich slope -> n conversion (B = 0.62 F D^(2/3) nu^(-1/6) C)
+    # The Koutecký–Levich slope -> n conversion (B = 0.62 F D^(2/3) nu^(-1/6) C)
     # is only valid when j is a true current density in A/cm^2 -- the units
     # the standard/literature F, D, nu, C values are given in. Using whatever
     # unit the RDE-curve plot happens to display (e.g. mA/cm^2) throws n off
@@ -3371,7 +3493,7 @@ def render_kl_tab() -> None:
     if len(rpm_values) < 3:
         st.error(
             f"{active_label}: only {len(rpm_values)} rotation rate(s) loaded "
-            "— Koutecky-Levich needs at least 3 for a meaningful fit."
+            "— Koutecký–Levich needs at least 3 for a meaningful fit."
         )
         return
 
@@ -3407,7 +3529,7 @@ def render_kl_tab() -> None:
         fig_rde.update_xaxes(range=rde_x_range)
     if rde_y_range is not None:
         fig_rde.update_yaxes(range=rde_y_range)
-    st.plotly_chart(fig_rde, width="stretch", config=_PLOTLY_EDIT_CONFIG)
+    _show_figure(fig_rde)
     rde_cols = {}
     for rv, (p, j) in curves.items():
         rde_cols[f"{rv:g}rpm — Potential vs RHE (V)"] = list(p)
@@ -3563,7 +3685,7 @@ def render_kl_tab() -> None:
     if unreliable:
         st.warning(
             f"{len(unreliable)} of {len(kl_rows)} analysis potentials gave a "
-            "poorly-conditioned Koutecky-Levich fit (R² < 0.95), marked "
+            "poorly-conditioned Koutecký–Levich fit (R² < 0.95), marked "
             "**no** in the *Reliable?* column. This is normal for potentials "
             "close to the onset, where the current is near zero and 1/j "
             "amplifies noise without limit — narrow the analysis window to "
@@ -3615,7 +3737,7 @@ def render_kl_tab() -> None:
         "j<sup>−1</sup> (cm² mA<sup>−1</sup>)",
         legend_position="outside-right",
     )
-    st.plotly_chart(fig_kl, width="stretch", config=_PLOTLY_EDIT_CONFIG)
+    _show_figure(fig_kl)
     st.caption(
         "Koutecký–Levich: 1/j = 1/j_k + 1/(B·ω^½), with "
         "B = 0.62·n·F·D^(2/3)·ν^(−1/6)·C and ω = 2π·rpm/60 (rad/s). "
@@ -4386,9 +4508,11 @@ def render_orr_tab() -> None:
     # width above — stretching it to the full container width was what
     # left too little room for the rotated axis title against the tick
     # numbers at larger export font sizes.
-    st.plotly_chart(
-        fig_disk, width=("content" if has_any_ring else "stretch"), config=_PLOTLY_EDIT_CONFIG
-    )
+    # The merged ring/disk panel sets its own width, so it was already
+    # rendered at "content"; _show_figure reaches the same conclusion from
+    # the figure itself and applies the pinned canvas to the single-panel
+    # case too.
+    _show_figure(fig_disk)
     figure_downloads(
         fig_disk, f"orr_disk_curve_{int(primary_rpm)}rpm", key="png_orr_disk",
         what=title, data=_padded_frame(disk_data),
@@ -4461,6 +4585,25 @@ def render_orr_tab() -> None:
         "Plateau window max (V vs RHE)", value=0.6, step=0.05, format="%.2f",
         key="orr_n_window_hi",
     )
+    # A box-select drag on the Tafel plot further down (key
+    # "orr_tafel_plot_select") arrives here as a selection event on the next
+    # rerun; apply it to the affected sample's fit-range slider exactly once,
+    # so a later manual slider drag isn't re-clobbered by the stale event
+    # Streamlit keeps in session_state (same pattern as the LSV Analysis tab).
+    orr_sel_points = []
+    _orr_sel_event = st.session_state.get("orr_tafel_plot_select")
+    if _orr_sel_event is not None:
+        try:
+            orr_sel_points = _orr_sel_event.get("selection", {}).get("points", [])
+        except Exception:
+            orr_sel_points = []
+    _orr_sel_sig = _selection_signature(orr_sel_points)
+    apply_orr_selection = bool(orr_sel_points) and _orr_sel_sig != st.session_state.get(
+        "_orr_tafel_last_selection_sig"
+    )
+    if apply_orr_selection:
+        st.session_state["_orr_tafel_last_selection_sig"] = _orr_sel_sig
+
     results_rows = []
     tafel_slider_specs = []  # (lbl, range_key, default_range, n_pts) — sliders
     # actually render further down, right above the Tafel plot they control
@@ -4507,6 +4650,15 @@ def render_orr_tab() -> None:
             )
             range_key = f"orr_tafel_range_{lbl}"
             default_range = (int(a0), int(a1))
+            if apply_orr_selection:
+                try:
+                    sel_range = _selection_range_for_sample(
+                        orr_sel_points, lbl, log_jk
+                    )
+                except Exception:
+                    sel_range = None
+                if sel_range is not None:
+                    st.session_state[range_key] = sel_range
             start, stop = st.session_state.get(range_key, default_range)
             tafel_slider_specs.append((lbl, range_key, default_range, len(pot_tafel)))
             try:
@@ -4611,7 +4763,7 @@ def render_orr_tab() -> None:
             y_lo, y_hi = np.percentile(np.concatenate(deriv_in_view), [1, 99])
             pad = (y_hi - y_lo) * 0.15 or abs(y_hi) * 0.15 or 1.0
             fig_deriv.update_yaxes(range=[y_lo - pad, y_hi + pad])
-        st.plotly_chart(fig_deriv, width="stretch", config=_PLOTLY_EDIT_CONFIG)
+        _show_figure(fig_deriv)
         figure_downloads(
             fig_deriv, f"orr_derivative_{int(primary_rpm)}rpm", key="png_orr_deriv",
             what="dI/dE derivative plot", data=_padded_frame(deriv_data),
@@ -4642,6 +4794,9 @@ def render_orr_tab() -> None:
             st.slider(
                 f"{lbl} — Tafel fit range (index)", 0, n_pts_tafel,
                 key=range_key, **slider_kwargs,
+                help="Auto-detected from the kinetic region; drag either "
+                     "handle, or box-select the region directly on the Tafel "
+                     "plot below, to fine-tune.",
             )
 
     # ---- Tafel plot, all chosen samples overlaid --------------------------
@@ -4670,6 +4825,7 @@ def render_orr_tab() -> None:
             fig_tafel.add_trace(go.Scatter(
                 x=log_jk, y=pot_tafel, mode="markers", name=lbl,
                 marker={"size": 8, "color": color, "opacity": 0.5},
+                customdata=[lbl] * len(log_jk),
             ))
             xs = log_jk[start:stop]
             xline = np.array([float(np.min(xs)), float(np.max(xs))])
@@ -4692,7 +4848,18 @@ def render_orr_tab() -> None:
             fig_tafel.update_xaxes(range=orr_tafel_x_range)
         if orr_tafel_y_range is not None:
             fig_tafel.update_yaxes(range=orr_tafel_y_range)
-        st.plotly_chart(fig_tafel, width="stretch", config=_PLOTLY_EDIT_CONFIG)
+        fig_tafel.update_layout(dragmode="select")
+        st.caption(
+            "🖱️ Drag a box around a sample's linear region to set its Tafel "
+            "fit range directly (the mouse defaults to box-select instead of "
+            "zoom here — use the toolbar's zoom icon or double-click to reset "
+            "the view). The per-sample sliders above stay in sync, and the "
+            "axis-range expander sets the visible window without cutting data."
+        )
+        _show_figure(
+            fig_tafel, key="orr_tafel_plot_select",
+            on_select="rerun", selection_mode=["box"],
+        )
         figure_downloads(
             fig_tafel, f"orr_tafel_{int(primary_rpm)}rpm", key="png_orr_tafel",
             what="Tafel plot",
@@ -4769,13 +4936,13 @@ def render_orr_tab() -> None:
 
         pc1, pc2 = st.columns(2)
         with pc1:
-            st.plotly_chart(fig_ho2, width="stretch", config=_PLOTLY_EDIT_CONFIG)
+            _show_figure(fig_ho2)
             figure_downloads(
                 fig_ho2, f"orr_ho2_{int(primary_rpm)}rpm", key="png_orr_ho2",
                 what="%H₂O₂ plot", data=_padded_frame(ho2_data),
             )
         with pc2:
-            st.plotly_chart(fig_n, width="stretch", config=_PLOTLY_EDIT_CONFIG)
+            _show_figure(fig_n)
             figure_downloads(
                 fig_n, f"orr_n_{int(primary_rpm)}rpm", key="png_orr_n",
                 what="n plot", data=_padded_frame(n_data),
@@ -4912,9 +5079,7 @@ def render_orr_tab() -> None:
                 range=disk_y_range if disk_y_range is not None
                 else _zero_anchored_range(disk_sel)
             )
-        st.plotly_chart(
-            fig_rrde, width=("content" if p["has_ring"] else "stretch"), config=_PLOTLY_EDIT_CONFIG
-        )
+        _show_figure(fig_rrde)
         rrde_cols: dict[str, list] = {}
         for rv in rpm_pick:
             m = np.isclose(p["rpm"], rv)

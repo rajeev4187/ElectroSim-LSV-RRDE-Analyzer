@@ -202,3 +202,36 @@ def test_export_renders_at_the_requested_physical_size(fmt, dpi):
     assert float(image.info["dpi"][0]) == pytest.approx(dpi, abs=1)
     printed_cm = image.size[0] / dpi * 2.54
     assert printed_cm == pytest.approx(8.6, abs=0.05)
+
+    # No alpha channel in any raster export. Kaleido's PNG always carries one
+    # and it is always fully opaque here, but a 4-sample TIFF tagged
+    # ExtraSamples=2 is what Word, the Windows photo viewer and several
+    # manuscript-submission converters render as black or with the colour
+    # channels shifted -- the "the TIFF is garbled" report.
+    assert image.mode == "RGB", f"{fmt} exported as {image.mode}, not RGB"
+    if fmt == "tiff":
+        assert image.tag_v2.get(277) == 3, "TIFF has an extra (alpha) sample"
+        assert image.tag_v2.get(338) is None, "TIFF declares ExtraSamples"
+
+
+@pytest.mark.skipif(not _kaleido_available(),
+                    reason="kaleido/headless browser not available")
+def test_export_defaults_to_the_size_the_figure_is_shown_at():
+    """The download must be the figure that was on screen, at the size it was
+    displayed. Charts used to stretch to the browser width while the export
+    fell back to a square canvas, and since fonts, margins and legend anchors
+    are all in absolute pixels that is a different layout, not a rescale: the
+    saved figure had clipped axis titles and overlapping tick labels."""
+    import plotly.graph_objects as go
+
+    import app
+
+    fig = go.Figure(go.Scatter(x=[0, 1], y=[0, -5], mode="lines"))
+    app.apply_plot_style(fig, app._default_style(), "x", "y")
+
+    assert fig.layout.width == app._SCREEN_CANVAS_W
+    assert app._export_size(app._export_figure(fig), None, None) == (
+        fig.layout.width, fig.layout.height
+    )
+    # And at that canvas the margins leave room for the plot itself.
+    assert app._margin_crowding(fig, fig.layout.width, fig.layout.height) is None

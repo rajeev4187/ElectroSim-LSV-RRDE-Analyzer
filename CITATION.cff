@@ -7,7 +7,7 @@ abstract: >-
   the uncompensated resistance (Ru) estimated from an EIS Nyquist-arc circle
   fit; LSV analysis (onset potential, benchmark overpotentials, Tafel slope,
   with RHE reference-electrode conversion and mechanistic interpretation);
-  Koutecky-Levich analysis of multi-rotation-rate RDE data; and ORR/RRDE
+  Koutecký–Levich analysis of multi-rotation-rate RDE data; and ORR/RRDE
   analysis (onset/half-wave potential, electron-transfer number, and
   peroxide yield from ring-disk data).
 type: software
@@ -30,7 +30,7 @@ keywords:
   - electrochemical impedance spectroscopy
   - linear sweep voltammetry
   - Tafel slope
-  - Koutecky-Levich
+  - Koutecký–Levich
   - rotating disk electrode
   - rotating ring-disk electrode
   - RRDE

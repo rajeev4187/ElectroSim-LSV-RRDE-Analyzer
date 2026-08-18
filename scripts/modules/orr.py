@@ -438,7 +438,7 @@ def mass_transport_corrected_current(disk_current, limiting_current: float,
 
 
 # --------------------------------------------------------------------------- #
-# Koutecky-Levich analysis (multi-rotation-rate RDE)                          #
+# Koutecký–Levich analysis (multi-rotation-rate RDE)                          #
 # --------------------------------------------------------------------------- #
 # Koutecký, J.; Levich, V. G. *Zh. Fiz. Khim.* **1958**, *32*, 1565 (original
 # derivation); Levich, V. G. *Physicochemical Hydrodynamics*, Prentice-Hall,
@@ -481,7 +481,7 @@ MIN_KL_CURRENT_FRACTION = 0.05
 
 @dataclass
 class KoutieckyLevichFit:
-    """One potential's Koutecky-Levich fit: 1/|j| vs omega^-0.5."""
+    """One potential's Koutecký–Levich fit: 1/|j| vs omega^-0.5."""
 
     potential: float
     slope: float          # d(1/|j|) / d(omega^-0.5)
@@ -500,7 +500,7 @@ class KoutieckyLevichFit:
         intercept comes out **negative** has no j_k at all -- 1/j_k cannot be
         negative when j_k is a magnitude -- so this returns ``None`` rather
         than a negative kinetic current density. It happens on scattered
-        Koutecky-Levich plots whose regression line crosses below the origin,
+        Koutecký–Levich plots whose regression line crosses below the origin,
         exactly the fits :attr:`is_reliable` also rejects.
         """
         return None if self.intercept <= 0 else float(1.0 / self.intercept)
@@ -509,7 +509,7 @@ class KoutieckyLevichFit:
     def is_reliable(self) -> bool:
         """Whether this fit is worth quoting.
 
-        A Koutecky-Levich plot with only three rotation rates and a poor R^2
+        A Koutecký–Levich plot with only three rotation rates and a poor R^2
         gives an ``n`` that is arithmetic, not evidence.
         """
         return (self.n_rotation_rates >= 3 and np.isfinite(self.r_squared)
@@ -552,7 +552,7 @@ def fit_koutecky_levich(rpm, j, min_points: int = 3,
         rpm_arr = uniq
     if len(rpm_arr) < min_points:
         raise ValueError(
-            f"Need at least {min_points} rotation rates for a Koutecky-Levich fit; "
+            f"Need at least {min_points} rotation rates for a Koutecký–Levich fit; "
             f"got {len(rpm_arr)}."
         )
     x = 1.0 / np.sqrt(angular_velocity(rpm_arr))
@@ -603,7 +603,7 @@ def levich_slope_to_n(kl_slope: float, diffusion_coeff_cm2_s: float,
                       kinematic_viscosity_cm2_s: float,
                       bulk_concentration_mol_cm3: float,
                       faraday_c_per_mol: float = FARADAY_C_PER_MOL) -> float | None:
-    """Electron-transfer number ``n`` from a Koutecky-Levich slope
+    """Electron-transfer number ``n`` from a Koutecký–Levich slope
     (``1/B``) and the electrolyte's O2 transport parameters:
     ``n = B / (0.62 * F * D^(2/3) * nu^(-1/6) * C)``."""
     _validate_transport(diffusion_coeff_cm2_s, kinematic_viscosity_cm2_s,

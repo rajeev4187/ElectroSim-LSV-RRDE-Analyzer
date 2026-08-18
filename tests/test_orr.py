@@ -137,7 +137,7 @@ def test_ring_disk_average_reports_empty_window():
 
 
 # --------------------------------------------------------------------------- #
-# Koutecky-Levich                                                             #
+# Koutecký–Levich                                                             #
 # --------------------------------------------------------------------------- #
 def test_kl_recovers_a_known_electron_number():
     d, nu, c = 1.9e-5, 1.0e-2, 1.2e-6
