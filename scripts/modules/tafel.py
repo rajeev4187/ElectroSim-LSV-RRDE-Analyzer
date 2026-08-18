@@ -284,88 +284,194 @@ def _r_squared(x: np.ndarray, y: np.ndarray, slope: float, intercept: float) -> 
     return 1.0 - ss_res / ss_tot if ss_tot > 0 else 0.0
 
 
+# Convention in the electrocatalysis literature: a Tafel slope is quoted over
+# at least one decade of current (see TafelResult.quality_warnings, which
+# grades every fit by exactly this). The window searches below therefore
+# *optimise* decades rather than merely reporting them afterwards -- an
+# earlier version maximised R^2 (or R^2 x point-count) and was then graded on
+# a criterion it never targeted, which is how it came to prefer an 18-point,
+# 0.18-decade window scoring R^2 = 0.991 over the 2.6-decade region that is
+# the actual Tafel line.
+MIN_TAFEL_DECADES = 1.0
+
+# R^2 floors tried in order, strictest first. The first floor whose best
+# window reaches MIN_TAFEL_DECADES wins; if none does, the strictest floor's
+# answer stands, so fit quality is never traded away for width the data does
+# not actually support.
+_R2_LADDER = (0.98, 0.97, 0.95)
+
+
+def _r2_ladder(r2_threshold: float) -> tuple[float, ...]:
+    """Descending R^2 floors, starting at the caller's own threshold."""
+    floors = [float(r2_threshold)]
+    floors.extend(f for f in _R2_LADDER if f < r2_threshold)
+    return tuple(floors)
+
+
+def _window_r2(sums, start: int, stops: np.ndarray) -> np.ndarray:
+    """R^2 of every window ``[start, stop)`` at once.
+
+    The scalar :func:`_stats_from_sums` costs ~1.3 us per call, which is
+    nothing until the growth scan makes O(n) of them: 22 ms on a 16 000-point
+    sweep, re-paid for every sample on every Streamlit rerun. The arithmetic
+    is identical -- prefix sums differenced, then centred -- just evaluated
+    over the whole array of candidate stops in one numpy pass.
+
+    Returns ``nan`` for degenerate windows (fewer than 3 points, or no spread
+    in x); callers filter with ``isfinite``.
+    """
+    sx, sy, sxx, syy, sxy, _n, _x0, _y0 = sums
+    k = (stops - start).astype(float)
+    x_sum = sx[stops] - sx[start]
+    y_sum = sy[stops] - sy[start]
+    xx = sxx[stops] - sxx[start]
+    yy = syy[stops] - syy[start]
+    xy = sxy[stops] - sxy[start]
+    with np.errstate(divide="ignore", invalid="ignore"):
+        sxx_c = xx - x_sum * x_sum / k
+        sxy_c = xy - x_sum * y_sum / k
+        syy_c = yy - y_sum * y_sum / k
+        r2 = np.where(
+            (k >= 3) & (sxx_c > 0) & (syy_c > 0),
+            np.clip((sxy_c * sxy_c) / (sxx_c * syy_c), 0.0, 1.0),
+            np.nan,
+        )
+    return r2
+
+
+def _window_decades(x: np.ndarray, start: int, stops: np.ndarray) -> np.ndarray:
+    """Span of ``x`` (= log10|i|) covered by every window ``[start, stop)``.
+
+    Running extrema rather than ``x[stop] - x[start]``: log10|i| is only
+    *roughly* monotonic along a real sweep, so the endpoint difference
+    misreports the span wherever noise puts a local reversal in.
+    """
+    tail = x[start:]
+    hi = np.maximum.accumulate(tail)
+    lo = np.minimum.accumulate(tail)
+    idx = stops - start - 1
+    return hi[idx] - lo[idx]
+
+
+def _pick_by_decades(r2: np.ndarray, decades: np.ndarray,
+                     r2_threshold: float, min_decades: float) -> int | None:
+    """Index of the widest-in-decades window that is still linear.
+
+    Walks :func:`_r2_ladder` from the caller's threshold downwards and returns
+    the first floor's best window that reaches ``min_decades``. When no floor
+    gets there, the *strictest* floor's best window is returned rather than
+    the loosest -- if a decade is unreachable, nothing is bought by accepting
+    a worse fit for it. ``None`` when no window passes any floor.
+    """
+    fallback = None
+    for floor in _r2_ladder(r2_threshold):
+        ok = np.isfinite(r2) & (r2 >= floor)
+        if not ok.any():
+            continue
+        best = int(np.argmax(np.where(ok, decades, -np.inf)))
+        if fallback is None:
+            fallback = best
+        if decades[best] >= min_decades:
+            return best
+    return fallback
+
+
 def _grow_from_onset(x: np.ndarray, y: np.ndarray, onset_idx: int,
-                     min_points: int, r2_threshold: float, patience: int,
+                     min_points: int, r2_threshold: float, patience: int = 0,
                      e_eq: float | None = None,
-                     max_overpotential: float | None = None) -> int:
-    """Grow a fit window forward from ``onset_idx`` while it stays linear.
+                     max_overpotential: float | None = None,
+                     min_decades: float = MIN_TAFEL_DECADES) -> int:
+    """Choose the fit window's stop index, growing forward from ``onset_idx``.
 
-    Extends the window one point at a time and keeps the running best stop
-    index as long as R^2 >= ``r2_threshold``; gives up after ``patience``
-    consecutive points fail to meet it (this tolerates a little noise while
-    still stopping once real curvature — e.g. the mass-transport plateau —
-    sets in).
+    Every window from the ``min_points`` minimum out to the cap is scored, and
+    the widest one in decades of current that still meets an R^2 floor wins --
+    see :func:`_pick_by_decades`.
 
-    When ``e_eq`` and ``max_overpotential`` are both given, growth also stops
-    once the window reaches ``max_overpotential`` from ``e_eq`` (the
-    reaction's equilibrium potential) — a genuine activation-controlled
-    Tafel region rarely extends past a few hundred mV of overpotential, so
-    this keeps a reaction-appropriate default even when a wider window
-    still happens to pass the R^2 test (e.g. a long, accidentally-linear
-    mass-transport-limited stretch).
+    This replaces a greedy scan that grew while R^2 >= ``r2_threshold`` and
+    abandoned growth after ``patience`` consecutive misses. That scan armed
+    its patience counter from the very first candidate, so a window whose R^2
+    was still *climbing* out of the noise of its own minimum width -- 0.845,
+    0.906, 0.938, 0.957 on the bundled LSV sample -- exhausted the counter and
+    returned the 5-point minimum, when R^2 = 0.992 lay eleven points further
+    on. A rising R^2 means the window is still improving, which is the
+    opposite of the curvature the counter existed to detect. Scoring every
+    candidate removes the failure mode rather than retuning it, and is faster
+    besides (one vectorised pass, no Python loop over n).
 
-    Runs in O(n) via :func:`_regression_prefix_sums`.
+    ``patience`` is retained for backward compatibility and is unused: the
+    scan is exhaustive, so there is no growth to abandon early.
+
+    When ``e_eq`` and ``max_overpotential`` are both given, candidates are
+    capped at ``max_overpotential`` from ``e_eq`` -- a genuine activation-
+    controlled Tafel region rarely extends further. A cap that excludes the
+    onset itself (mis-assigned reaction, or an ``e_eq`` belonging to another
+    couple) is inapplicable and is dropped rather than pinning the window to
+    its minimum width.
     """
     n = len(x)
-    stop = min(onset_idx + min_points, n)
-    if stop - onset_idx < 3:
-        return stop
+    stop0 = min(onset_idx + min_points, n)
+    if stop0 - onset_idx < 3:
+        return stop0
 
-    # Hard cap from the overpotential limit, resolved up front so the scan
-    # below is a single pass with no per-step branching.
     limit = n
     if e_eq is not None and max_overpotential is not None:
         beyond = np.flatnonzero(np.abs(y[onset_idx:] - e_eq) > max_overpotential)
         if len(beyond):
             limit = onset_idx + int(beyond[0])
-        # The cap assumes the onset lies on the faradaic side of e_eq, within
-        # max_overpotential of it. When it does not -- the reaction was
-        # mis-assigned, or e_eq belongs to a different couple than the one
-        # actually running -- the *first* point is already past the cap and
-        # this would pin the window to its minimum width, quietly reporting a
-        # slope fitted to five points. An inapplicable cap should not truncate
-        # the fit: drop it and let the R^2 test alone decide the extent.
         if limit <= onset_idx:
             limit = n
-        elif limit < stop:
-            limit = stop
+        elif limit < stop0:
+            limit = stop0
 
+    stops = np.arange(stop0, limit + 1)
+    if len(stops) == 0:
+        return stop0
     sums = _regression_prefix_sums(x, y)
-    best_stop = stop
-    bad_streak = 0
-    for candidate_stop in range(stop, limit + 1):
-        stats = _stats_from_sums(sums, onset_idx, candidate_stop)
-        if stats is None:
-            continue
-        if stats[2] >= r2_threshold:
-            best_stop = candidate_stop
-            bad_streak = 0
-        else:
-            bad_streak += 1
-            if bad_streak >= patience:
-                break
-    return best_stop
+    r2 = _window_r2(sums, onset_idx, stops)
+    decades = _window_decades(x, onset_idx, stops)
+    best = _pick_by_decades(r2, decades, r2_threshold, min_decades)
+    return stop0 if best is None else int(stops[best])
 
 
-def _best_r2_window(x: np.ndarray, y: np.ndarray, min_frac: float) -> tuple[int, int]:
-    """Fallback: scan candidate windows (coarse grid) and score each by
-    R^2 * window_size, favouring windows that are both linear and wide.
-    Uses the same O(1)-per-window prefix sums as :func:`_grow_from_onset`."""
+def _best_r2_window(x: np.ndarray, y: np.ndarray, min_frac: float,
+                    r2_threshold: float = 0.98,
+                    min_decades: float = MIN_TAFEL_DECADES) -> tuple[int, int]:
+    """Global fallback: scan candidate windows on a coarse grid and keep the
+    one covering the most decades while staying linear.
+
+    Used when no onset can be found (a sweep that never shows a quiet
+    pre-onset baseline), or when the onset-anchored window cannot reach
+    ``min_decades``. Scored on the same decade-first basis as
+    :func:`_grow_from_onset`; the previous ``R^2 * point-count`` score
+    rewarded windows that were wide in *points*, which on a densely-sampled
+    plateau is not the same thing as wide in current at all.
+    """
     n = len(x)
     min_size = max(4, int(round(min_frac * n)))
+    if n < min_size:
+        return 0, n
     step = max(1, n // 40)
     sums = _regression_prefix_sums(x, y)
 
-    best_start, best_stop, best_score = 0, n, -np.inf
+    starts, stops, r2s, decs = [], [], [], []
     for start in range(0, n - min_size + 1, step):
-        for stop in range(start + min_size, n + 1, step):
-            stats = _stats_from_sums(sums, start, stop)
-            if stats is None:
-                continue
-            score = stats[2] * (stop - start)
-            if score > best_score:
-                best_start, best_stop, best_score = start, stop, score
-    return best_start, best_stop
+        cand = np.arange(start + min_size, n + 1, step)
+        if len(cand) == 0:
+            continue
+        r2s.append(_window_r2(sums, start, cand))
+        decs.append(_window_decades(x, start, cand))
+        starts.append(np.full(len(cand), start))
+        stops.append(cand)
+    if not stops:
+        return 0, n
+    all_starts = np.concatenate(starts)
+    all_stops = np.concatenate(stops)
+    r2 = np.concatenate(r2s)
+    decades = np.concatenate(decs)
+    best = _pick_by_decades(r2, decades, r2_threshold, min_decades)
+    if best is None:
+        return 0, n
+    return int(all_starts[best]), int(all_stops[best])
 
 
 def _onset_index(current: np.ndarray, baseline_frac: float,
@@ -642,7 +748,8 @@ def auto_tafel_range(potential: np.ndarray, log_i: np.ndarray,
                      min_points: int = 5, patience: int = 4,
                      min_frac: float = 0.2,
                      e_eq: float | None = None,
-                     max_overpotential: float = 0.35) -> tuple[int, int]:
+                     max_overpotential: float = 0.35,
+                     min_decades: float = MIN_TAFEL_DECADES) -> tuple[int, int]:
     """Auto-detect the linear Tafel (kinetic) region.
 
     When ``current`` is supplied, the region is chosen the way it would be
@@ -665,9 +772,17 @@ def auto_tafel_range(potential: np.ndarray, log_i: np.ndarray,
     default anchored to the selected reaction rather than to the raw
     current shape alone.
 
-    Falls back to a coarse global best-R^2-times-width window search (the
-    original heuristic) if ``current`` is omitted, if no clear onset is
-    found, or if the onset-grown window is degenerately small.
+    Among the windows that stay linear, the one covering the most **decades
+    of current** wins (``min_decades``, default 1.0 — the literature
+    convention that :attr:`TafelResult.quality_warnings` also grades by).
+    Optimising R^2 alone reliably picked a handful of points just past the
+    onset, where any smooth curve looks perfectly straight: on the bundled
+    ORR sample that returned 491 mV/dec over 0.18 decades, against 130
+    mV/dec over 2.6 decades for the region that is actually the Tafel line.
+
+    Falls back to a coarse global window search if ``current`` is omitted, if
+    no clear onset is found, or if the onset-anchored window cannot reach
+    ``min_decades`` and the global scan can.
     """
     x = np.asarray(log_i, dtype=float)
     y = np.asarray(potential, dtype=float)
@@ -695,15 +810,37 @@ def auto_tafel_range(potential: np.ndarray, log_i: np.ndarray,
         if onset_idx is not None:
             stop = _grow_from_onset(x, y, onset_idx, min_points,
                                     r2_threshold, patience,
-                                    e_eq=e_eq, max_overpotential=max_overpotential)
+                                    e_eq=e_eq, max_overpotential=max_overpotential,
+                                    min_decades=min_decades)
             if stop - onset_idx >= max(3, min_points):
+                # Accept the onset-anchored window only when it covers the
+                # conventional decade of current. The old test was on point
+                # *count* alone, so a five-point, 0.02-decade window was
+                # returned as a confident answer and the global scan -- which
+                # can start further along the sweep and often does reach a
+                # decade -- was never consulted. Where neither reaches a
+                # decade the onset-anchored window still wins: it is anchored
+                # to real physics rather than to whatever stretch of the curve
+                # happened to score best.
+                onset_dec = float(np.ptp(x[onset_idx:stop]))
+                if onset_dec >= min_decades:
+                    if reversed_input:
+                        return n - stop, n - onset_idx
+                    return onset_idx, stop
+                fallback = _best_r2_window(x, y, min_frac,
+                                           min_decades=min_decades)
+                fb_dec = float(np.ptp(x[fallback[0]:fallback[1]]))
+                if fb_dec > onset_dec:
+                    if reversed_input:
+                        return n - fallback[1], n - fallback[0]
+                    return fallback
                 if reversed_input:
                     return n - stop, n - onset_idx
                 return onset_idx, stop
         if reversed_input:  # restore for the fallback scan below
             x, y = x[::-1], y[::-1]
 
-    return _best_r2_window(x, y, min_frac)
+    return _best_r2_window(x, y, min_frac, min_decades=min_decades)
 
 
 def fit_tafel(

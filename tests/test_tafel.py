@@ -300,3 +300,78 @@ def test_exchange_current_refuses_a_potential_axis():
     # The slope itself is unaffected by the declaration.
     assert on_potential.slope_v_per_dec == pytest.approx(
         on_overpotential.slope_v_per_dec)
+
+
+# --------------------------------------------------------------------------- #
+# Decade-aware auto range                                                     #
+# --------------------------------------------------------------------------- #
+def test_auto_range_prefers_a_decade_over_a_locally_perfect_short_window():
+    """The regression that motivated the decade-first score.
+
+    A curve that is *very* slightly curved near the onset and cleanly linear
+    over the decades that follow. Maximising R^2 alone locks onto a handful
+    of points at the start (any smooth curve is straight over five points);
+    the fit that means anything is the wide one.
+    """
+    rng = np.random.default_rng(11)
+    log_i = np.linspace(-6.0, -1.0, 600)          # five decades
+    pot = 1.30 + 0.120 * log_i                     # 120 mV/dec, the true slope
+    pot += 0.004 * np.exp(-(log_i + 6.0) / 0.15)   # curvature confined to onset
+    pot += rng.normal(0, 2e-4, len(pot))
+    cur = 10.0 ** log_i
+
+    a0, a1 = tafel.auto_tafel_range(pot, log_i, current=cur)
+    r = tafel.fit_tafel(pot, log_i, a0, a1)
+    assert r.decades >= tafel.MIN_TAFEL_DECADES
+    assert r.slope_mv_per_dec == pytest.approx(120.0, abs=8.0)
+    assert not any("decade" in w for w in r.quality_warnings)
+
+
+def test_grow_from_onset_does_not_abandon_a_still_improving_window():
+    """A window whose R^2 climbs out of the noise of its own minimum width
+    used to exhaust the old patience counter and return the 5-point minimum,
+    even though a far better window lay just beyond it."""
+    rng = np.random.default_rng(5)
+    log_i = np.linspace(-5.0, -1.0, 400)
+    pot = 0.9 - 0.07 * log_i
+    # Noise that dies away, so short windows at the start score poorly and
+    # R^2 rises monotonically as the window widens.
+    pot += rng.normal(0, 1.0, len(pot)) * 0.004 * np.exp(-np.arange(400) / 25)
+
+    stop = tafel._grow_from_onset(log_i, pot, 0, 5, 0.99)
+    assert stop > 5 + 40, f"growth abandoned at {stop}"
+
+
+def test_auto_range_consults_the_global_scan_when_onset_window_is_too_narrow():
+    """A sweep whose onset sits very late leaves no room for a decade-wide
+    window anchored there; the global scan starts earlier and does reach one.
+    The old acceptance test was on point count alone, so the narrow
+    onset-anchored window was returned and the global scan never ran."""
+    log_i = np.linspace(-6.0, -1.0, 500)
+    pot = 1.25 + 0.100 * log_i
+    cur = 10.0 ** log_i
+    a0, a1 = tafel.auto_tafel_range(pot, log_i, current=cur)
+    assert float(np.ptp(log_i[a0:a1])) >= tafel.MIN_TAFEL_DECADES
+
+
+def test_window_r2_matches_the_scalar_form():
+    """The vectorised scan must be arithmetically identical to the scalar
+    prefix-sum stats it replaced -- it is 12x faster, not different."""
+    rng = np.random.default_rng(7)
+    x = np.sort(rng.uniform(0, 10, 300))
+    y = 2.5 * x - 4.0 + rng.normal(0, 0.4, 300)
+    sums = tafel._regression_prefix_sums(x, y)
+    stops = np.arange(20, 301, 7)
+    vec = tafel._window_r2(sums, 5, stops)
+    for i, stop in enumerate(stops):
+        scalar = tafel._stats_from_sums(sums, 5, int(stop))
+        assert vec[i] == pytest.approx(scalar[2], abs=1e-12)
+
+
+def test_window_decades_handles_a_non_monotonic_log_current():
+    """log10|i| is only roughly monotonic on a real sweep; the span must be
+    the true peak-to-peak over the window, not the endpoint difference."""
+    x = np.array([0.0, 1.0, 3.0, 2.0, 2.5, 5.0])
+    stops = np.array([3, 4, 6])
+    got = tafel._window_decades(x, 0, stops)
+    assert got == pytest.approx([3.0, 3.0, 5.0])

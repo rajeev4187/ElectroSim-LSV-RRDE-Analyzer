@@ -178,3 +178,66 @@ def test_bundled_eis_workbook_still_fits_the_same_ru():
     d = data_io.load_eis_datasets(EIS_XLSX, sheet=0)[0]
     assert eis.auto_arc_range(d.z_real, d.z_imag) == (0, 18)
     assert eis.fit_ru_circle(d.z_real, d.z_imag).ru == pytest.approx(27.5336, abs=1e-3)
+
+
+def test_plateau_averaged_n_is_stable_where_the_single_point_read_off_is_not():
+    """The app reports n / %H2O2 averaged over the diffusion-limited plateau,
+    not read off at the single potential E1/2.
+
+    E1/2 itself is method-dependent -- the three methods the ORR tab offers
+    disagree by ~65 mV on this file -- and a single-point read-off inherits
+    that spread in full. The plateau average must not.
+    """
+    disk_path = [f for f in _disk_files() if "1600" in f.name][0]
+    ring_path = disk_path.with_name(
+        disk_path.name.replace("Disk Current", "Ring Current")
+    )
+    if not ring_path.exists():
+        pytest.skip("no matching ring file")
+    pot, disk = _load(disk_path)
+    _, ring = _load(ring_path)
+    p, j_d, j_r = sweep.clean_sweep(pot, disk / AREA_CM2 * 1000.0,
+                                    ring / AREA_CM2 * 1000.0)
+
+    n_arr = orr.electron_number(j_d, j_r, 0.222)
+    singles, averages = [], []
+    for method in ("interpolated", "steepest", "second_derivative"):
+        res = orr.onset_and_half_wave(p, j_d, half_wave_search_range=(0.4, 0.8),
+                                      method=method)
+        singles.append(float(sweep.interp_at(res.half_wave_potential, p, n_arr)))
+        n_mean, _pct, n_pts = orr.ring_disk_average(
+            p, j_d, j_r, 0.222, window=(0.2, 0.6)
+        )
+        assert n_pts > 20
+        averages.append(n_mean)
+
+    # The three E1/2 methods really do disagree on this file.
+    assert max(singles) - min(singles) > 0.02
+    # The plateau average does not depend on E1/2 at all, so it is identical
+    # across methods -- that independence is the point of using it.
+    assert max(averages) - min(averages) == pytest.approx(0.0, abs=1e-12)
+    assert 0.0 <= averages[0] <= 4.0
+
+
+def test_auto_tafel_window_reaches_a_decade_on_the_bundled_orr_sample():
+    """Regression: the auto window used to return 18 points spanning 0.18
+    decades and a slope of 491 mV/dec -- physically impossible for ORR, and
+    flagged unreliable by the module's own decade criterion. Optimising
+    decades instead recovers ~130 mV/dec over ~2.6 decades.
+    """
+    pot, cur = _load([f for f in _disk_files() if "1600" in f.name][0])
+    p, j = sweep.clean_sweep(pot, cur / AREA_CM2 * 1000.0)
+    res = orr.onset_and_half_wave(p, j, half_wave_search_range=(0.4, 0.8),
+                                  method="interpolated")
+    jk = orr.mass_transport_corrected_current(j, res.limiting_current)
+    valid = np.isfinite(jk) & (jk != 0)
+    log_jk = tafel.log_current(jk[valid])
+
+    a0, a1 = tafel.auto_tafel_range(
+        p[valid], log_jk, current=jk[valid],
+        e_eq=tafel.REACTION_E_EQ_V_RHE["ORR"],
+    )
+    fit = tafel.fit_tafel(p[valid], log_jk, a0, a1)
+    assert fit.decades >= tafel.MIN_TAFEL_DECADES
+    # An ORR Tafel slope in the physically meaningful band, not 491 mV/dec.
+    assert 60.0 <= abs(fit.slope_mv_per_dec) <= 200.0

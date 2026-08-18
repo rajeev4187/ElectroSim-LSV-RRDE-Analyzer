@@ -1624,7 +1624,7 @@ def _legend_layout(style: dict, font: dict) -> dict | None:
     if position == "hidden":
         return None
     return dict(**_LEGEND_ANCHORS[position], font=font,
-               bgcolor="rgba(255,255,255,0.7)", tracegroupgap=18)
+                bgcolor="rgba(255,255,255,0.7)", tracegroupgap=18)
 
 
 def _legend_margin_extra(style: dict) -> dict:
@@ -3541,10 +3541,9 @@ def render_kl_tab() -> None:
         # rotation rate. Their ratio *is* n/4, so a row that reads e.g.
         # "2.8 vs 5.7" immediately explains an n of ~2 without any further
         # digging: the fit is faithfully reporting the current it was given.
-        b_4e_row = (0.62 * 4 * orr.FARADAY_C_PER_MOL * diff_coeff ** (2 / 3)
-                    * viscosity ** (-1 / 6) * bulk_c)
         ideal_4e = [
-            b_4e_row * np.sqrt(orr.angular_velocity(rv)) * _KL_PLOT_J_SCALE
+            orr.levich_current_density(4, rv, diff_coeff, viscosity, bulk_c)
+            * _KL_PLOT_J_SCALE
             for rv in omegas_rpm
         ]
         measured = [abs(v) * _KL_PLOT_J_SCALE for v in j_at_pot]
@@ -3583,9 +3582,9 @@ def render_kl_tab() -> None:
         # transport parameters in use -- the quickest sanity check there is:
         # if the measured |j| is nowhere near it, the problem is upstream of
         # the fit (wrong units, wrong area, or wrong electrolyte preset).
-        b_4e = (0.62 * 4 * orr.FARADAY_C_PER_MOL * diff_coeff ** (2 / 3)
-                * viscosity ** (-1 / 6) * bulk_c)
-        jlim_4e_ma = b_4e * np.sqrt(orr.angular_velocity(1600.0)) * _KL_PLOT_J_SCALE
+        jlim_4e_ma = orr.levich_current_density(
+            4, 1600.0, diff_coeff, viscosity, bulk_c
+        ) * _KL_PLOT_J_SCALE
         with st.expander("🔬 n diagnostics — intermediate values behind each fit"):
             st.caption(
                 f"Inputs in use: current read as **{current_unit}**"
@@ -4437,6 +4436,29 @@ def render_orr_tab() -> None:
         "E½ search window max (V vs RHE)", value=0.8, step=0.05, format="%.2f",
         key="orr_ehw_hi",
     )
+    # n and %H2O2 averaged across the diffusion-limited plateau, which is how
+    # ORR papers quote them. Reading them at the single potential E1/2 makes
+    # the answer inherit every uncertainty in E1/2 itself -- and the three E½
+    # methods above disagree by 65 mV on the bundled sample, which moves n by
+    # ~0.05 and the peroxide yield by ~3 points for no change in the data.
+    # Both are reported side by side so the plateau value can be quoted and
+    # the E½ value still cross-checked against it.
+    st.markdown("**n / %H₂O₂ averaging window** (diffusion-limited plateau)")
+    rda1, rda2 = st.columns(2)
+    n_win_lo = rda1.number_input(
+        "Plateau window min (V vs RHE)", value=0.2, step=0.05, format="%.2f",
+        key="orr_n_window_lo",
+        help="n and %H₂O₂ are averaged over this potential range — the "
+             "convention in the ORR literature (commonly ~0.2–0.6 V vs RHE), "
+             "which is far less sensitive than a single-point read-off at "
+             "E½. Points where the disk current has not yet reached 5 % of "
+             "its own peak are excluded automatically, so the pre-onset "
+             "region cannot pull the average toward a spurious 100 % H₂O₂.",
+    )
+    n_win_hi = rda2.number_input(
+        "Plateau window max (V vs RHE)", value=0.6, step=0.05, format="%.2f",
+        key="orr_n_window_hi",
+    )
     results_rows = []
     tafel_slider_specs = []  # (lbl, range_key, default_range, n_pts) — sliders
     # actually render further down, right above the Tafel plot they control
@@ -4496,12 +4518,38 @@ def render_orr_tab() -> None:
         if s["has_ring"]:
             n_arr = orr.electron_number(s["disk"], s["ring"], collection_efficiency)
             pct_arr = orr.peroxide_percent(s["disk"], s["ring"], collection_efficiency)
-            row["n @ E½"] = round(float(sweep.interp_at(
+            # Plateau average first: this is the number to quote.
+            n_mean, pct_mean, n_pts = orr.ring_disk_average(
+                s["potential"], s["disk"], s["ring"], collection_efficiency,
+                window=(n_win_lo, n_win_hi),
+            )
+            row["n (plateau avg)"] = (
+                round(n_mean, 2) if np.isfinite(n_mean) else None
+            )
+            row["%H₂O₂ (plateau avg)"] = (
+                round(pct_mean, 1) if np.isfinite(pct_mean) else None
+            )
+            row["n pts averaged"] = n_pts
+            if n_pts == 0:
+                st.warning(
+                    f"{lbl}: no valid ring/disk points in the "
+                    f"{n_win_lo:g}–{n_win_hi:g} V averaging window, so the "
+                    "plateau-averaged n and %H₂O₂ are blank. Move the window "
+                    "onto this sample's diffusion-limited plateau."
+                )
+            # Kept alongside for cross-checking against papers that quote the
+            # single-point value; nan when E½ falls in the masked pre-onset
+            # region, which is reported as blank rather than as a number.
+            n_at_half = float(sweep.interp_at(
                 onset_res.half_wave_potential, s["potential"], n_arr
-            )), 2)
-            row["%H₂O₂ @ E½"] = round(float(sweep.interp_at(
+            ))
+            pct_at_half = float(sweep.interp_at(
                 onset_res.half_wave_potential, s["potential"], pct_arr
-            )), 1)
+            ))
+            row["n @ E½"] = round(n_at_half, 2) if np.isfinite(n_at_half) else None
+            row["%H₂O₂ @ E½"] = (
+                round(pct_at_half, 1) if np.isfinite(pct_at_half) else None
+            )
 
         results_rows.append(row)
         s["onset"] = onset_res
