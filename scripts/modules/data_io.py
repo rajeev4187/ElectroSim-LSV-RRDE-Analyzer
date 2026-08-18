@@ -102,9 +102,15 @@ class LSVData:
 
 
 def list_sheets(path: str | Path) -> list[str]:
-    """Return the sheet names of an Excel workbook."""
+    """Return the sheet names of an Excel workbook.
+
+    Uses a context manager so the underlying zip handle is released; leaving
+    it to the garbage collector emitted a ``ResourceWarning`` per call and,
+    on Windows, kept a lock on the file.
+    """
     _guard_excel_archive(path)
-    return pd.ExcelFile(path).sheet_names
+    with pd.ExcelFile(path) as book:
+        return list(book.sheet_names)
 
 
 def _match_column(columns: list[str], hints: tuple[str, ...]) -> str | None:

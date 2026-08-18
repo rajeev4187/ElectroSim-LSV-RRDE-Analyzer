@@ -39,7 +39,7 @@ import streamlit as st
 from PIL import Image
 from plotly.subplots import make_subplots
 
-from scripts.modules import correction, data_io, eis, orr, tafel
+from scripts.modules import correction, data_io, eis, orr, sweep, tafel
 
 APP_NAME = "ElectroSim-LSV-RRDE-Analyzer"
 
@@ -115,9 +115,9 @@ def require_access() -> bool:
 def _figure_signature(fig) -> str:
     """Short fingerprint of a figure's current content.
 
-    Used to detect that a cached TIFF no longer matches the figure on screen
-    (e.g. the user moved a fit-range slider after preparing the export), so a
-    stale image is never handed out as a download.
+    Used to detect that a cached raster export no longer matches the figure on
+    screen (e.g. the user moved a fit-range slider after preparing the
+    export), so a stale image is never handed out as a download.
     """
     try:
         payload = fig.to_json()
@@ -171,94 +171,166 @@ def _export_size(fig, width: int | None, height: int | None) -> tuple[int, int]:
     return int(width), max(int(height), 200)
 
 
-def _render_tiff(export_fig, width: int, height: int) -> bytes:
-    """Render a figure to a 300 dpi, LZW-compressed TIFF — the raster format
-    most journals require for figure submission. Kaleido itself only
-    produces PNG/JPEG/WebP/SVG/PDF, so this renders a high-resolution PNG
-    first (scale=4, i.e. 4x the CSS pixel size) and converts it in-memory."""
+# Raster/vector formats offered for figure export. TIFF is what most journals
+# require for submission; the rest cover the common alternatives (SVG/PDF stay
+# vector, so they scale without resampling).
+_EXPORT_FORMATS: dict[str, tuple[str, str]] = {
+    "TIFF (300 dpi, LZW)": ("tiff", "image/tiff"),
+    "PNG": ("png", "image/png"),
+    "SVG (vector)": ("svg", "image/svg+xml"),
+    "PDF (vector)": ("pdf", "application/pdf"),
+    "JPEG": ("jpeg", "image/jpeg"),
+}
+_EXPORT_DPI_CHOICES = [150, 300, 600, 1200]
+
+
+def _render_export(export_fig, fmt: str, width: int, height: int,
+                   dpi: int = 300) -> bytes:
+    """Render a figure to ``fmt`` at ``dpi``.
+
+    Kaleido rasterises at a CSS-pixel size scaled by ``scale``; converting the
+    requested dpi into that scale factor (relative to the nominal 96 dpi of a
+    CSS pixel) is what makes the dpi selector actually change the pixel count
+    rather than only the metadata. TIFF is not a Kaleido output format, so it
+    is rendered as a high-resolution PNG and converted in-memory by Pillow,
+    which is also where the dpi tag and LZW compression are applied.
+    """
+    if fmt in ("svg", "pdf"):  # vector: dpi is meaningless, size is in points
+        return export_fig.to_image(format=fmt, width=width, height=height)
+
+    scale = max(1.0, float(dpi) / 96.0)
+    if fmt != "tiff":
+        return export_fig.to_image(format=fmt, width=width, height=height,
+                                   scale=scale)
+
     png_bytes = export_fig.to_image(format="png", width=width, height=height,
-                                    scale=4)
+                                    scale=scale)
     image = Image.open(io.BytesIO(png_bytes))
     buffer = io.BytesIO()
-    image.save(buffer, format="TIFF", dpi=(300, 300), compression="tiff_lzw")
+    image.save(buffer, format="TIFF", dpi=(dpi, dpi), compression="tiff_lzw")
     return buffer.getvalue()
+
+
+def _render_tiff(export_fig, width: int, height: int, dpi: int = 300) -> bytes:
+    """Back-compatible shim for the TIFF path (see :func:`_render_export`)."""
+    return _render_export(export_fig, "tiff", width, height, dpi)
 
 
 def figure_downloads(fig, stem: str, key: str, what: str = "figure",
                      width: int | None = None, height: int | None = None,
                      data: pd.DataFrame | None = None) -> None:
-    """Render the download controls for one figure: TIFF, interactive HTML
-    and (optionally) the plotted data as CSV.
+    """Render the download controls for one figure: a chosen image format,
+    interactive HTML, and (optionally) the plotted data as CSV.
 
-    TIFF rendering is server-side (kaleido + Pillow), which launches a
-    headless browser per call — too slow/fragile to run on *every* script
-    rerun (it would fire on every unrelated widget interaction, e.g.
-    dragging a slider). It only happens when the user clicks "Prepare"; the
-    bytes are cached in session_state together with a signature of the
-    figure, so the download button persists across reruns but is withdrawn
-    as soon as the figure itself changes. The HTML and CSV exports need no
-    external renderer and are therefore always available — they are the
-    fallback when kaleido/Chrome is unavailable on the host (e.g. a slim
-    cloud container).
+    Image rendering is server-side (kaleido + Pillow), which launches a
+    headless browser per call -- too slow/fragile to run on *every* script
+    rerun (it would fire on every unrelated widget interaction, e.g. dragging
+    a slider). It only happens when the user clicks "Prepare"; the bytes are
+    cached in session_state together with a signature of the figure, so the
+    download button persists across reruns but is withdrawn as soon as the
+    figure itself changes.
+
+    The HTML and CSV exports need no external renderer and are therefore
+    always available -- they are the fallback when kaleido/Chrome is
+    unavailable on the host (e.g. a slim cloud container). Both are built
+    **only when the user opens the download expander**: serialising a
+    multi-thousand-point figure to a self-contained HTML page on every rerun
+    of every figure was costing far more than the charts themselves.
     """
     state_key = f"_export_{key}"
-    export_fig = _export_figure(fig)
-    sig = _figure_signature(export_fig)
-    cols = st.columns(3 if data is not None else 2)
+    with st.expander(f"⬇️ Download {what}"):
+        export_fig = _export_figure(fig)
+        cols = st.columns(3 if data is not None else 2)
 
-    with cols[0]:
-        if st.button(f"🖼️ Prepare {what} (TIFF)", key=f"_tiff_prep_{key}",
-                     use_container_width=True):
-            w, h = _export_size(export_fig, width, height)
+        with cols[0]:
+            fmt_label = st.selectbox(
+                "Image format", list(_EXPORT_FORMATS), index=0,
+                key=f"_fmt_{key}",
+                help="TIFF at 300 dpi is the usual journal submission "
+                     "requirement; SVG/PDF stay vector and rescale cleanly.",
+            )
+            fmt, mime = _EXPORT_FORMATS[fmt_label]
+            dpi = 300
+            if fmt not in ("svg", "pdf"):
+                dpi = st.selectbox(
+                    "Resolution (dpi)", _EXPORT_DPI_CHOICES,
+                    index=_EXPORT_DPI_CHOICES.index(300), key=f"_dpi_{key}",
+                    help="300 dpi is the common minimum for halftone figures; "
+                         "600+ for line art in high-quality journals.",
+                )
+            base_w, base_h = _export_size(export_fig, width, height)
+            sc1, sc2 = st.columns(2)
+            out_w = sc1.number_input(
+                "Width (px)", min_value=200, max_value=4000, value=int(base_w),
+                step=20, key=f"_w_{key}",
+            )
+            out_h = sc2.number_input(
+                "Height (px)", min_value=200, max_value=4000, value=int(base_h),
+                step=20, key=f"_h_{key}",
+            )
+            if st.button(f"🖼️ Prepare {what}", key=f"_img_prep_{key}",
+                         width="stretch"):
+                try:
+                    st.session_state[state_key] = {
+                        "sig": _figure_signature(export_fig),
+                        "bytes": _render_export(export_fig, fmt, int(out_w),
+                                                int(out_h), int(dpi)),
+                        "ext": fmt, "mime": mime, "error": None,
+                    }
+                except Exception as exc:  # kaleido missing / no Chrome
+                    st.session_state[state_key] = {
+                        "sig": _figure_signature(export_fig), "bytes": None,
+                        "ext": fmt, "mime": mime, "error": str(exc),
+                    }
+            cached = st.session_state.get(state_key) or {}
+            if cached.get("bytes") or cached.get("error"):
+                # Only now is the signature worth computing -- it serialises
+                # the whole figure, so doing it unconditionally on every rerun
+                # was pure overhead for figures nobody exports.
+                sig = _figure_signature(export_fig)
+                if cached.get("bytes") and cached.get("sig") == sig:
+                    st.download_button(
+                        f"⬇️ {what} ({cached['ext'].upper()})",
+                        data=cached["bytes"],
+                        file_name=f"{stem}.{cached['ext']}",
+                        mime=cached["mime"], key=f"_img_dl_{key}",
+                        width="stretch",
+                    )
+                elif cached.get("bytes"):
+                    st.caption("↻ Figure changed — press Prepare again.")
+                elif cached.get("error"):
+                    st.caption(
+                        f"Image export unavailable ({cached['error']}). Use "
+                        "the HTML download beside this button, or the 📷 icon "
+                        "on the chart."
+                    )
+
+        with cols[1]:
             try:
-                st.session_state[state_key] = {
-                    "sig": sig, "bytes": _render_tiff(export_fig, w, h),
-                    "error": None,
-                }
-            except Exception as exc:  # kaleido missing / no Chrome / render error
-                st.session_state[state_key] = {
-                    "sig": sig, "bytes": None, "error": str(exc),
-                }
-        cached = st.session_state.get(state_key) or {}
-        if cached.get("bytes") and cached.get("sig") == sig:
-            st.download_button(
-                f"⬇️ {what} (TIFF)", data=cached["bytes"],
-                file_name=f"{stem}.tiff", mime="image/tiff", key=f"_tiff_dl_{key}",
-                use_container_width=True,
-            )
-        elif cached.get("bytes"):
-            st.caption("↻ Figure changed — press Prepare again.")
-        elif cached.get("error"):
-            st.caption(
-                f"TIFF export unavailable ({cached['error']}). Use the HTML "
-                "download beside this button, or the 📷 icon on the chart."
-            )
+                html = export_fig.to_html(include_plotlyjs="cdn", full_html=True)
+                st.download_button(
+                    f"⬇️ {what} (HTML)", data=html.encode("utf-8"),
+                    file_name=f"{stem}.html", mime="text/html",
+                    key=f"_html_dl_{key}", width="stretch",
+                    help="Interactive page — opens in any browser (needs "
+                         "internet the first time, it loads plotly.js from a "
+                         "CDN) and can be saved as an image from there. "
+                         "Always available, even when the server-side image "
+                         "renderer is not.",
+                )
+            except Exception as exc:
+                st.caption(f"HTML export unavailable ({exc}).")
 
-    with cols[1]:
-        try:
-            html = export_fig.to_html(include_plotlyjs="cdn", full_html=True)
-            st.download_button(
-                f"⬇️ {what} (HTML)", data=html.encode("utf-8"),
-                file_name=f"{stem}.html", mime="text/html",
-                key=f"_html_dl_{key}", use_container_width=True,
-                help="Interactive page — opens in any browser (needs internet "
-                     "the first time, it loads plotly.js from a CDN) and can "
-                     "be saved as an image from there. Always available, even "
-                     "when the server-side TIFF renderer is not.",
-            )
-        except Exception as exc:
-            st.caption(f"HTML export unavailable ({exc}).")
-
-    if data is not None:
-        with cols[2]:
-            st.download_button(
-                "⬇️ Plotted data (CSV)",
-                data=data.to_csv(index=False).encode("utf-8"),
-                file_name=f"{stem}_data.csv", mime="text/csv",
-                key=f"_csv_dl_{key}", use_container_width=True,
-                help="Exactly the series drawn above, for replotting in "
-                     "Origin/Excel.",
-            )
+        if data is not None:
+            with cols[2]:
+                st.download_button(
+                    "⬇️ Plotted data (CSV)",
+                    data=data.to_csv(index=False).encode("utf-8"),
+                    file_name=f"{stem}_data.csv", mime="text/csv",
+                    key=f"_csv_dl_{key}", width="stretch",
+                    help="Exactly the series drawn above, for replotting in "
+                         "Origin/Excel.",
+                )
 
 
 def _padded_frame(columns: dict[str, list]) -> pd.DataFrame:
@@ -274,6 +346,42 @@ def _padded_frame(columns: dict[str, list]) -> pd.DataFrame:
 # --------------------------------------------------------------------------- #
 # Data loading                                                                #
 # --------------------------------------------------------------------------- #
+# Parsing is cached on the file's *content*, not on the widget: Streamlit
+# re-runs this whole script on every interaction (each slider drag, each
+# checkbox), and without a cache every rerun re-parsed every uploaded
+# workbook from scratch. Hashing the bytes means an unchanged upload is
+# parsed exactly once no matter how much the user fiddles with the controls,
+# while genuinely new content still invalidates immediately.
+_CACHE_TTL_S = 3600
+
+
+@st.cache_data(ttl=_CACHE_TTL_S, show_spinner=False, max_entries=64)
+def _cached_sheets(payload: bytes) -> list[str]:
+    return data_io.list_sheets(io.BytesIO(payload))
+
+
+@st.cache_data(ttl=_CACHE_TTL_S, show_spinner=False, max_entries=64)
+def _cached_eis_datasets(payload: bytes, sheet):
+    return data_io.load_eis_datasets(io.BytesIO(payload), sheet=sheet)
+
+
+@st.cache_data(ttl=_CACHE_TTL_S, show_spinner=False, max_entries=64)
+def _cached_lsv_datasets(payload: bytes, sheet):
+    return data_io.load_lsv_datasets(io.BytesIO(payload), sheet=sheet)
+
+
+@st.cache_data(ttl=_CACHE_TTL_S, show_spinner=False, max_entries=64)
+def _cached_table(payload: bytes, sheet) -> pd.DataFrame:
+    return data_io.read_table(io.BytesIO(payload), sheet=sheet)
+
+
+@st.cache_data(ttl=_CACHE_TTL_S, show_spinner=False, max_entries=8)
+def _cached_sample_bytes(path: str) -> bytes:
+    """Read a bundled sample file once per session rather than per rerun."""
+    with open(path, "rb") as fh:
+        return fh.read()
+
+
 def _clear_reset_control():
     """Sidebar button to wipe all uploaded data / session state.
 
@@ -307,7 +415,7 @@ def eis_data_loader():
     nonce = st.session_state.get("uploader_nonce", 0)
     source = st.radio(
         "Choose input", ["Upload Excel workbook", "Upload CSV file",
-                          "Use bundled sample"],
+                         "Use bundled sample"],
         horizontal=True, key="eis_source",
         help="Z', Z'' pairs. Several datasets may sit side-by-side as "
              "repeated column pairs.",
@@ -315,7 +423,7 @@ def eis_data_loader():
     try:
         if source in ("Use bundled sample", "Upload Excel workbook"):
             if source == "Use bundled sample":
-                src, name = EIS_SAMPLE_PATH, EIS_SAMPLE_PATH
+                payload, name = _cached_sample_bytes(EIS_SAMPLE_PATH), EIS_SAMPLE_PATH
             else:
                 up = st.file_uploader(
                     "Excel (.xlsx)", type=["xlsx", "xls"], key=f"eis_xlsx_{nonce}"
@@ -323,15 +431,10 @@ def eis_data_loader():
                 if up is None:
                     st.info("⬆️ Upload an Excel workbook to begin.")
                     return None, None
-                src, name = io.BytesIO(up.read()), up.name
-            sheets = data_io.list_sheets(src)
-            if hasattr(src, "seek"):
-                src.seek(0)
+                payload, name = up.getvalue(), up.name
+            sheets = _cached_sheets(payload)
             sheet = st.selectbox("EIS sheet", sheets, index=0, key="eis_sheet")
-            if hasattr(src, "seek"):
-                src.seek(0)
-            eis_list = data_io.load_eis_datasets(src, sheet=sheet)
-            return eis_list, name
+            return _cached_eis_datasets(payload, sheet), name
 
         up = st.file_uploader(
             "EIS CSV (Z', Z'')", type=["csv", "txt"], key=f"eis_csv_{nonce}"
@@ -339,8 +442,7 @@ def eis_data_loader():
         if up is None:
             st.info("⬆️ Upload a CSV file to begin.")
             return None, None
-        eis_list = data_io.load_eis_datasets(io.BytesIO(up.read()), sheet=None)
-        return eis_list, up.name
+        return _cached_eis_datasets(up.getvalue(), None), up.name
 
     except Exception as exc:  # surface loader errors instead of a stack trace
         st.error(f"Could not load EIS data: {exc}")
@@ -361,7 +463,7 @@ def lsv_data_loader():
     nonce = st.session_state.get("uploader_nonce", 0)
     source = st.radio(
         "Choose input", ["Upload Excel workbook", "Upload CSV file",
-                          "Use bundled sample"],
+                         "Use bundled sample"],
         horizontal=True, key="lsv_source",
         help="Potential, Current pairs. Several datasets may sit side-by-side "
              "as repeated column pairs.",
@@ -369,7 +471,7 @@ def lsv_data_loader():
     try:
         if source in ("Use bundled sample", "Upload Excel workbook"):
             if source == "Use bundled sample":
-                src, name = LSV_SAMPLE_PATH, LSV_SAMPLE_PATH
+                payload, name = _cached_sample_bytes(LSV_SAMPLE_PATH), LSV_SAMPLE_PATH
             else:
                 up = st.file_uploader(
                     "Excel (.xlsx)", type=["xlsx", "xls"], key=f"lsv_xlsx_{nonce}"
@@ -377,17 +479,12 @@ def lsv_data_loader():
                 if up is None:
                     st.info("⬆️ Upload an Excel workbook to begin.")
                     return None, None
-                src, name = io.BytesIO(up.read()), up.name
-            sheets = data_io.list_sheets(src)
-            if hasattr(src, "seek"):
-                src.seek(0)
+                payload, name = up.getvalue(), up.name
+            sheets = _cached_sheets(payload)
             sheet = st.selectbox(
                 "LSV sheet", sheets, index=min(1, len(sheets) - 1), key="lsv_sheet"
             )
-            if hasattr(src, "seek"):
-                src.seek(0)
-            lsv_list = data_io.load_lsv_datasets(src, sheet=sheet)
-            return lsv_list, name
+            return _cached_lsv_datasets(payload, sheet), name
 
         up = st.file_uploader(
             "LSV CSV (Potential, Current)", type=["csv", "txt"],
@@ -396,8 +493,7 @@ def lsv_data_loader():
         if up is None:
             st.info("⬆️ Upload a CSV file to begin.")
             return None, None
-        lsv_list = data_io.load_lsv_datasets(io.BytesIO(up.read()), sheet=None)
-        return lsv_list, up.name
+        return _cached_lsv_datasets(up.getvalue(), None), up.name
 
     except Exception as exc:  # surface loader errors instead of a stack trace
         st.error(f"Could not load LSV data: {exc}")
@@ -556,11 +652,8 @@ def render_eis_tab(eis_d, eis_list, sel, ru_unit: str = "Ω",
             f"ℹ️ Impedance reported in **{disp_unit}**: raw Z (Ω) × electrode "
             f"area {area_cm2:g} cm² (current is a density)."
         )
-    font_size = st.selectbox(
-        "Figure/table export font size (pt)", _JOURNAL_FONT_SIZES, index=0,
-        key="eis_font_size",
-        help="Font is fixed to Arial for publication-style export.",
-    )
+    style = plot_style_controls("eis", show_markers=True)
+    font_size = style["font_size"]
 
     n = len(eis_d)
     auto_start, auto_stop = eis.auto_arc_range(zr, zi)
@@ -614,7 +707,8 @@ def render_eis_tab(eis_d, eis_list, sel, ru_unit: str = "Ω",
                 y=np.abs(zi)[start:stop],
                 mode="markers",
                 name="Fitted arc",
-                marker={"size": 10, "color": "#ff7f0e", "symbol": "circle-open", "line": {"width": 2}},
+                marker={"size": 10, "color": "#ff7f0e",
+                        "symbol": "circle-open", "line": {"width": 2}},
             )
         )
         if ru_result is not None and ru_result.center is not None:
@@ -639,9 +733,10 @@ def render_eis_tab(eis_d, eis_list, sel, ru_unit: str = "Ω",
                 showarrow=False, yshift=-18,
                 font={"color": "red"},
             )
-        _journal_axes_style(fig, f"Z′ / {disp_unit}", f"−Z″ / {disp_unit}", font_size)
+        _journal_axes_style(fig, f"Z′ / {disp_unit}", f"−Z″ / {disp_unit}",
+                            font_size, style=style)
         fig.update_yaxes(scaleanchor="x", scaleratio=1)  # equal aspect -> true circle
-        st.plotly_chart(fig, use_container_width=True, config=_PLOTLY_EDIT_CONFIG)
+        st.plotly_chart(fig, width="stretch", config=_PLOTLY_EDIT_CONFIG)
         nyquist_data = _padded_frame({
             f"Z′ ({disp_unit})": zr,
             f"−Z″ ({disp_unit})": np.abs(zi),
@@ -706,7 +801,7 @@ def render_eis_tab(eis_d, eis_list, sel, ru_unit: str = "Ω",
                     row[f"RMSE ({disp_unit})"] = f"fit failed: {exc}"
                     rows.append(row)
             batch_df = pd.DataFrame(rows)
-            st.dataframe(batch_df, use_container_width=True, hide_index=True)
+            st.dataframe(batch_df, width="stretch", hide_index=True)
             st.download_button(
                 "⬇️ Download batch Ru table (CSV)",
                 data=batch_df.to_csv(index=False).encode("utf-8"),
@@ -715,6 +810,7 @@ def render_eis_tab(eis_d, eis_list, sel, ru_unit: str = "Ω",
             )
             _journal_table_figure(
                 batch_df, font_size, "eis_ru_batch_table", key="png_eis_table",
+                style=style,
             )
 
     return chosen_ru
@@ -805,11 +901,8 @@ def render_lsv_tab(lsv_d, ru: float | None, current_unit: str = "mA",
         if not factors:
             st.info("Select at least one compensation factor.")
             return
-        font_size = st.selectbox(
-            "Figure/table export font size (pt)", _JOURNAL_FONT_SIZES, index=0,
-            key="lsv_font_size",
-            help="Font is fixed to Arial for publication-style export.",
-        )
+        style = plot_style_controls("lsvir", show_markers=False)
+        font_size = style["font_size"]
         st.caption(
             "E_corrected = E_measured − (factor) · I · Ru. 100 % is full "
             "correction; partial compensation (≤ 85 %) guards against "
@@ -947,9 +1040,10 @@ def render_lsv_tab(lsv_d, ru: float | None, current_unit: str = "mA",
             font={"family": "Arial", "size": font_size},
             title={"y": 0.97, "yanchor": "top"},
             legend={"orientation": "h", "yanchor": "top", "y": -0.18,
-                        "xanchor": "center", "x": 0.5,
-                        "font": {"family": "Arial", "size": max(11, round(font_size * 0.55))},
-                        "bgcolor": "rgba(255,255,255,0.7)"},
+                    "xanchor": "center", "x": 0.5,
+                    "font": {"family": "Arial",
+                             "size": max(11, round(font_size * 0.55))},
+                    "bgcolor": "rgba(255,255,255,0.7)"},
             margin={"l": 10, "r": 10, "t": 60, "b": 90},
             hovermode="x unified",
             hoverlabel={"font": {"family": "Arial", "size": 12}},
@@ -958,7 +1052,7 @@ def render_lsv_tab(lsv_d, ru: float | None, current_unit: str = "mA",
                          spikethickness=1, spikedash="dot",
                          spikecolor="#888", **_BOX_AXIS_STYLE)
         fig.update_yaxes(**_BOX_AXIS_STYLE)
-        st.plotly_chart(fig, use_container_width=True, config=_PLOTLY_EDIT_CONFIG)
+        st.plotly_chart(fig, width="stretch", config=_PLOTLY_EDIT_CONFIG)
         fac_png = "-".join(str(int(r.factor_percent)) for r in results)
         slug = re.sub(r"\W+", "_", sample_label).strip("_").lower()
         plotted = {
@@ -1013,7 +1107,7 @@ def render_lsv_tab(lsv_d, ru: float | None, current_unit: str = "mA",
     summary = pd.DataFrame(cols)
     st.markdown("**Results summary**")
     st.dataframe(
-        summary, use_container_width=True, hide_index=True,
+        summary, width="stretch", hide_index=True,
         column_config={
             c: st.column_config.NumberColumn(format=fmt)
             for c, fmt in numeric_fmt.items()
@@ -1030,7 +1124,8 @@ def render_lsv_tab(lsv_d, ru: float | None, current_unit: str = "mA",
     for c, fmt in numeric_fmt.items():
         display[c] = [fmt % v for v in summary[c]]
     _journal_table_figure(  # CSV of this table is the results button above
-        display, font_size, f"ir_results_table_{slug}_Ru{ru:.1f}", key="png_lsv_table",
+        display, font_size, f"ir_results_table_{slug}_Ru{ru:.1f}",
+        key="png_lsv_table", style=style,
     )
 
     # Warn if any selected factor over-compensates, and recommend a safe one.
@@ -1101,6 +1196,218 @@ _TAFEL_REACTIONS = [
 # Publication-style export settings shared by every tab: a selectable Arial
 # font size and a closed box border (mirrored axis lines) with no interior
 # gridlines.
+# Font families that are safe for journal submission: each is either a
+# standard PostScript/PDF base font or metric-compatible with one, so the
+# figure renders identically on a typesetter that lacks the exact face.
+_JOURNAL_FONTS = [
+    "Arial", "Helvetica", "Times New Roman", "Calibri", "Georgia",
+    "DejaVu Sans", "Courier New",
+]
+
+# Named colour sets. "Colourblind-safe" is Okabe-Ito, which stays
+# distinguishable under all three common forms of colour-vision deficiency and
+# is the set most journals recommend when they recommend one at all.
+# "Grayscale" exists because some journals still charge for colour figures.
+_PALETTES: dict[str, list[str]] = {
+    "Default (Plotly)": ["#d62728", "#2ca02c", "#9467bd", "#ff7f0e",
+                         "#8c564b", "#e377c2", "#17becf", "#bcbd22"],
+    "Colourblind-safe (Okabe-Ito)": ["#0072B2", "#D55E00", "#009E73", "#CC79A7",
+                                     "#E69F00", "#56B4E9", "#F0E442", "#000000"],
+    "Viridis": ["#440154", "#414487", "#2a788e", "#22a884",
+                "#7ad151", "#fde725", "#31688e", "#35b779"],
+    "Grayscale (print)": ["#000000", "#4d4d4d", "#7f7f7f", "#a6a6a6",
+                          "#1a1a1a", "#666666", "#999999", "#cccccc"],
+    "Nature-style": ["#E64B35", "#4DBBD5", "#00A087", "#3C5488",
+                     "#F39B7F", "#8491B4", "#91D1C2", "#DC0000"],
+}
+
+_LINE_DASHES = ["solid", "dot", "dash", "longdash", "dashdot"]
+_MARKER_SYMBOLS = ["circle", "square", "diamond", "triangle-up", "cross",
+                   "x", "star", "hexagon"]
+_LEGEND_POSITIONS = ["top-left", "top-right", "bottom-left", "bottom-right",
+                     "outside-right", "below", "hidden"]
+
+
+def plot_style_controls(key_prefix: str, *, default_palette: str = "Default (Plotly)",
+                        show_markers: bool = True) -> dict:
+    """Render the shared "Plot appearance" panel and return a style dict.
+
+    Every tab's figures read their fonts, colours, line/marker geometry, grid
+    and legend placement from this one dict, so a change here applies to what
+    is on screen *and* to whatever is exported from it -- the export is a
+    render of the same figure object, not a separately styled copy.
+
+    Returned keys are consumed by :func:`apply_plot_style` and by the
+    per-trace colour pickers each tab renders from ``palette``.
+    """
+    style: dict = {}
+    with st.expander("🎨 Plot appearance — fonts, colours, lines, legend"):
+        c1, c2, c3, c4 = st.columns(4)
+        style["font_family"] = c1.selectbox(
+            "Font", _JOURNAL_FONTS, index=0, key=f"{key_prefix}_font_family",
+            help="Kept to faces that are safe for journal submission.",
+        )
+        style["font_size"] = c2.number_input(
+            "Axis font size (pt)", min_value=8, max_value=48, value=28, step=1,
+            key=f"{key_prefix}_font_size",
+            help="Applies to axis titles and tick labels. Legend and "
+                 "annotations scale from this.",
+        )
+        style["palette_name"] = c3.selectbox(
+            "Colour palette", list(_PALETTES),
+            index=list(_PALETTES).index(default_palette),
+            key=f"{key_prefix}_palette",
+            help="Sets the default colour of each series; individual series "
+                 "can still be overridden below.",
+        )
+        style["legend_position"] = c4.selectbox(
+            "Legend", _LEGEND_POSITIONS, index=0,
+            key=f"{key_prefix}_legend_pos",
+        )
+
+        d1, d2, d3, d4 = st.columns(4)
+        style["line_width"] = d1.slider(
+            "Line width", 0.5, 6.0, 2.5, 0.5, key=f"{key_prefix}_line_width",
+        )
+        style["marker_size"] = d2.slider(
+            "Marker size", 0, 20, 8 if show_markers else 0, 1,
+            key=f"{key_prefix}_marker_size",
+            help="0 hides markers and draws lines only.",
+        )
+        style["marker_symbol"] = d3.selectbox(
+            "Marker symbol", _MARKER_SYMBOLS, index=0,
+            key=f"{key_prefix}_marker_symbol",
+        )
+        style["fit_dash"] = d4.selectbox(
+            "Fit-line style", _LINE_DASHES, index=1, key=f"{key_prefix}_fit_dash",
+            help="Dash pattern for fitted//derived lines, so they read as "
+                 "distinct from the measured data.",
+        )
+
+        e1, e2, e3, e4 = st.columns(4)
+        style["show_grid"] = e1.checkbox(
+            "Gridlines", value=False, key=f"{key_prefix}_grid",
+            help="Off by default — most journals prefer a clean plot frame.",
+        )
+        style["mirror_axes"] = e2.checkbox(
+            "Box frame", value=True, key=f"{key_prefix}_mirror",
+            help="Closed box (all four axis lines), the usual journal style.",
+        )
+        style["n_ticks"] = e3.slider(
+            "Approx. tick count", 3, 12, 5, 1, key=f"{key_prefix}_nticks",
+        )
+        style["show_title"] = e4.checkbox(
+            "Show plot title", value=True, key=f"{key_prefix}_show_title",
+            help="Off for figures destined for a caption instead.",
+        )
+
+    style["palette"] = _PALETTES[style["palette_name"]]
+    return style
+
+
+def _default_style() -> dict:
+    """Style dict matching the app's previous hard-coded look, for any code
+    path that has not been given one."""
+    return {
+        "font_family": "Arial", "font_size": 28,
+        "palette_name": "Default (Plotly)", "palette": _PALETTES["Default (Plotly)"],
+        "legend_position": "top-left", "line_width": 2.5, "marker_size": 8,
+        "marker_symbol": "circle", "fit_dash": "dot", "show_grid": False,
+        "mirror_axes": True, "n_ticks": 5, "show_title": True,
+    }
+
+
+def _axis_style(style: dict) -> dict:
+    """Axis keyword arguments implied by ``style`` (replaces the old fixed
+    ``_BOX_AXIS_STYLE`` so the frame, grid and tick density follow the user's
+    choices)."""
+    return {
+        "showgrid": bool(style.get("show_grid")),
+        "gridcolor": "#d9d9d9",
+        "zeroline": False,
+        "showline": True, "linewidth": 1.5, "linecolor": "black",
+        "mirror": bool(style.get("mirror_axes", True)),
+        "ticks": "outside",
+        "nticks": int(style.get("n_ticks", 5)),
+    }
+
+
+_LEGEND_ANCHORS = {
+    "top-left": {"x": 0.02, "y": 0.98, "xanchor": "left", "yanchor": "top"},
+    "top-right": {"x": 0.98, "y": 0.98, "xanchor": "right", "yanchor": "top"},
+    "bottom-left": {"x": 0.02, "y": 0.02, "xanchor": "left", "yanchor": "bottom"},
+    "bottom-right": {"x": 0.98, "y": 0.02, "xanchor": "right", "yanchor": "bottom"},
+    "outside-right": {"x": 1.02, "y": 1.0, "xanchor": "left", "yanchor": "top"},
+    "below": {"x": 0.5, "y": -0.18, "xanchor": "center", "yanchor": "top",
+              "orientation": "h"},
+}
+
+
+def apply_plot_style(fig, style: dict, xtitle: str, ytitle: str,
+                     height: int = 460, yrange: list | None = None,
+                     title: str | None = None) -> None:
+    """Apply a :func:`plot_style_controls` dict to ``fig`` in place.
+
+    The single place figure styling happens, so on-screen and exported
+    figures cannot drift apart.
+    """
+    style = {**_default_style(), **(style or {})}
+    family, size = style["font_family"], int(style["font_size"])
+    axis_font = {"family": family, "size": size}
+    small_font = {"family": family, "size": max(9, round(size * 0.55))}
+    position = style.get("legend_position", "top-left")
+
+    layout = {
+        "template": "plotly_white",
+        "height": height,
+        "font": axis_font,
+        "margin": {"l": 10, "r": 170 if position == "outside-right" else 10,
+                   "t": 60 if (title and style.get("show_title")) else 20,
+                   "b": 90 if position == "below" else 10},
+    }
+    if position == "hidden":
+        layout["showlegend"] = False
+    else:
+        layout["legend"] = dict(**_LEGEND_ANCHORS[position], font=small_font,
+                                bgcolor="rgba(255,255,255,0.7)",
+                                tracegroupgap=18)
+    if title and style.get("show_title"):
+        layout["title"] = {"text": title, "font": axis_font}
+    fig.update_layout(**layout)
+
+    axis_kwargs = _axis_style(style)
+    fig.update_xaxes(title={"text": xtitle, "font": axis_font},
+                     tickfont=axis_font, **axis_kwargs)
+    fig.update_yaxes(title={"text": ytitle, "font": axis_font},
+                     tickfont=axis_font, range=yrange, **axis_kwargs)
+
+
+def trace_color_pickers(labels: list[str], style: dict, key_prefix: str) -> dict:
+    """Per-series colour overrides, seeded from the chosen palette.
+
+    Returns ``{label: "#rrggbb"}``. Rendered as a row of colour pickers so a
+    user preparing a figure for a specific journal (or matching an existing
+    figure in the same paper) can set each series exactly, rather than being
+    limited to whichever palette happens to be selected.
+    """
+    palette = style.get("palette") or _PALETTES["Default (Plotly)"]
+    colors: dict[str, str] = {}
+    if not labels:
+        return colors
+    with st.expander(f"🎨 Series colours ({len(labels)})"):
+        cols = st.columns(min(4, len(labels)))
+        for i, label in enumerate(labels):
+            default = palette[i % len(palette)]
+            # Keyed on the palette name too, so switching palette re-seeds the
+            # pickers instead of leaving them stuck on the previous set.
+            widget_key = f"{key_prefix}_color_{i}_{style.get('palette_name', '')}"
+            colors[label] = cols[i % len(cols)].color_picker(
+                label if len(label) <= 18 else label[:17] + "…",
+                value=default, key=widget_key,
+            )
+    return colors
+
+
 _JOURNAL_FONT_SIZES = [28, 36]
 _BOX_AXIS_STYLE = {
     "showgrid": False, "zeroline": False,
@@ -1160,40 +1467,26 @@ def _range_controls(
 
 def _journal_axes_style(fig, xtitle: str, ytitle: str, font_size: int,
                         height: int = 460, yrange: list | None = None,
-                        legend_position: str = "top-left") -> None:
-    """Apply the shared journal look (Arial, box-border axes, a legend box)
-    to ``fig`` in place: ``plotly_white`` template, closed axis border, and a
-    bordered legend positioned inside the plot area."""
-    axis_font = {"family": "Arial", "size": font_size}
-    small_font = {"family": "Arial", "size": max(11, round(font_size * 0.55))}
-    positions = {
-        "top-left": {"x": 0.02, "y": 0.98, "xanchor": "left", "yanchor": "top"},
-        "bottom-left": {"x": 0.02, "y": 0.02, "xanchor": "left", "yanchor": "bottom"},
-        # Outside the plot area entirely (to the right) — for plots whose
-        # data can occupy any corner (e.g. many K-L analysis-potential
-        # entries), where an inside-corner legend would otherwise sit on
-        # top of the traces instead of beside them.
-        "outside-right": {"x": 1.02, "y": 1, "xanchor": "left", "yanchor": "top"},
-    }
-    right_margin = 170 if legend_position == "outside-right" else 10
-    fig.update_layout(
-        template="plotly_white", height=height, font=axis_font,
-        legend=dict(**positions[legend_position], font=small_font,
-                    bgcolor="rgba(255,255,255,0.7)"),
-        margin={"l": 10, "r": right_margin, "t": 20, "b": 10},
-    )
-    fig.update_xaxes(
-        title={"text": xtitle, "font": axis_font}, tickfont=axis_font,
-        **_BOX_AXIS_STYLE,
-    )
-    fig.update_yaxes(
-        title={"text": ytitle, "font": axis_font}, tickfont=axis_font,
-        range=yrange, **_BOX_AXIS_STYLE,
-    )
+                        legend_position: str = "top-left",
+                        style: dict | None = None) -> None:
+    """Apply the shared journal look to ``fig`` in place.
+
+    Thin wrapper over :func:`apply_plot_style`: callers that already hold a
+    user style dict pass it through, and callers that only know a font size
+    (the historical signature) get the same result as before. Keeping one
+    implementation is what stops the on-screen figure and the exported one
+    from diverging.
+    """
+    merged = {**_default_style(), **(style or {})}
+    merged["font_size"] = font_size
+    if style is None or "legend_position" not in style:
+        merged["legend_position"] = legend_position
+    apply_plot_style(fig, merged, xtitle, ytitle, height=height, yrange=yrange)
 
 
 def _journal_table_figure(display_df: pd.DataFrame, font_size: int, stem: str,
-                          key: str, what: str = "Results table") -> None:
+                          key: str, what: str = "Results table",
+                          style: dict | None = None) -> None:
     """Render ``display_df`` (already formatted to display-ready strings —
     e.g. numbers pre-rounded/pre-formatted by the caller) as an Arial,
     publication-style Plotly table figure, with TIFF/HTML downloads via
@@ -1204,6 +1497,8 @@ def _journal_table_figure(display_df: pd.DataFrame, font_size: int, stem: str,
     fixed-size export. Pair this with the caller's own CSV download of the
     underlying (full-precision) data.
     """
+    style = {**_default_style(), **(style or {})}
+    family = style["font_family"]
     cell_font = max(9.0, font_size * 0.4)
     header_font = max(10.0, font_size * 0.45)
     # Explicit NaN/None check before stringifying: a plain ``.astype(str)``
@@ -1230,14 +1525,24 @@ def _journal_table_figure(display_df: pd.DataFrame, font_size: int, stem: str,
         default=1,
     )
     row_h = int(cell_font * 1.5 * max(1, max_wrap)) + 8
+    # Journal table convention: a ruled header, no vertical rules, and faint
+    # zebra striping so a wide row stays readable across the page. Colours are
+    # neutral greys rather than the chosen palette -- a results table should
+    # not compete with the figures for colour.
+    n_rows = len(display_df)
+    row_fill = ["#ffffff" if i % 2 == 0 else "#f4f4f4" for i in range(n_rows)]
     table_fig = go.Figure(data=[go.Table(
         columnwidth=widths,
-        header={"values": list(display_df.columns),
-                    "font": {"family": "Arial", "size": header_font},
-                    "align": "left", "height": int(header_font * 1.6) + 10},
+        header={"values": [f"<b>{c}</b>" for c in display_df.columns],
+                "font": {"family": family, "size": header_font, "color": "#000000"},
+                "fill": {"color": "#e2e2e2"},
+                "line": {"color": "#000000", "width": 1},
+                "align": "left", "height": int(header_font * 1.6) + 10},
         cells={"values": [str_cols[c] for c in display_df.columns],
-                   "font": {"family": "Arial", "size": cell_font}, "align": "left",
-                   "height": row_h},
+               "font": {"family": family, "size": cell_font}, "align": "left",
+               "fill": {"color": [row_fill] * len(display_df.columns)},
+               "line": {"color": "#d0d0d0", "width": 0.5},
+               "height": row_h},
     )])
     table_height = int(header_font * 1.6) + 20 + row_h * len(display_df) + 20
     table_fig.update_layout(
@@ -1248,6 +1553,7 @@ def _journal_table_figure(display_df: pd.DataFrame, font_size: int, stem: str,
     figure_downloads(
         table_fig, stem, key=key, what=what,
         width=table_width, height=table_height,
+        data=display_df,
     )
 
 
@@ -1453,7 +1759,7 @@ def _tafel_data_loader() -> list[tuple[str, data_io.LSVData]]:
                 accept_multiple_files=True,
             )
             if ups:
-                first_sheets = data_io.list_sheets(io.BytesIO(ups[0].getvalue()))
+                first_sheets = _cached_sheets(ups[0].getvalue())
                 sheet = st.selectbox(
                     "Sheet (applied to every uploaded workbook)",
                     first_sheets, index=0, key="tafel_sheet",
@@ -1461,11 +1767,9 @@ def _tafel_data_loader() -> list[tuple[str, data_io.LSVData]]:
                 for up in ups:
                     base = up.name.rsplit(".", 1)[0]
                     try:
-                        sheets_here = data_io.list_sheets(io.BytesIO(up.getvalue()))
+                        sheets_here = _cached_sheets(up.getvalue())
                         use_sheet = sheet if sheet in sheets_here else sheets_here[0]
-                        ds = data_io.load_lsv_datasets(
-                            io.BytesIO(up.getvalue()), sheet=use_sheet
-                        )
+                        ds = _cached_lsv_datasets(up.getvalue(), use_sheet)
                     except Exception as exc:
                         st.warning(f"{up.name}: {exc}")
                         continue
@@ -1481,7 +1785,7 @@ def _tafel_data_loader() -> list[tuple[str, data_io.LSVData]]:
                 for up in ups:
                     base = up.name.rsplit(".", 1)[0]
                     try:
-                        ds = data_io.load_lsv_datasets(io.BytesIO(up.getvalue()), sheet=None)
+                        ds = _cached_lsv_datasets(up.getvalue(), None)
                     except Exception as exc:
                         st.warning(f"{up.name}: {exc}")
                         continue
@@ -1637,16 +1941,26 @@ def render_tafel_tab() -> None:
     )
 
     top1, top2, top3 = st.columns(3)
-    default_reaction = top1.selectbox(
-        "Default reaction (for newly added samples)", _TAFEL_REACTIONS, index=0,
-        help="Each sample gets its own reaction below (samples of different "
-             "reactions can share one overlay); this just sets the starting "
-             "value for samples you haven't set yet. The legend and "
-             "analysis are split by reaction type.",
+    _reaction_defaults = ["Auto-detect (recommended)"] + _TAFEL_REACTIONS
+    default_reaction_choice = top1.selectbox(
+        "Reaction for newly added samples", _reaction_defaults, index=0,
+        key="tafel_default_reaction",
+        help="**Auto-detect** reads each sample's own curve — the sign of the "
+             "faradaic current and where on the RHE scale it flows — and "
+             "assigns HER / HOR / OER / ORR accordingly, per sample. That "
+             "matters beyond labelling: the reaction sets the equilibrium "
+             "potential used for η, the mechanistic benchmark table, and the "
+             "overpotential cap on the auto-detected Tafel window. Pick a "
+             "fixed reaction here to override the detection for every "
+             "sample; each sample can still be changed individually below.",
     )
+    auto_reaction = default_reaction_choice.startswith("Auto-detect")
+    default_reaction = (_TAFEL_REACTIONS[0] if auto_reaction
+                        else default_reaction_choice)
     font_size = top2.selectbox(
-        "Figure/table export font size (pt)", _JOURNAL_FONT_SIZES, index=0,
-        help="Font is fixed to Arial for publication-style export.",
+        "Axis font size (pt)", _JOURNAL_FONT_SIZES, index=0,
+        key="tafel_font_size_quick",
+        help="Quick control; the full appearance panel below overrides it.",
     )
     vicinity_pct = top3.number_input(
         "Final-plot vicinity margin (%)", min_value=0, max_value=300,
@@ -1741,15 +2055,28 @@ def render_tafel_tab() -> None:
         if not tok:
             continue
         try:
-            target_js.append(float(tok))
+            value = float(tok)
         except ValueError:
             st.warning(f"Ignoring unparseable target current density {tok!r}.")
+            continue
+        # De-duplicate: each benchmark becomes a results column and a bar
+        # chart whose widget keys are derived from the value, so entering
+        # "10, 10" would raise a DuplicateWidgetID and take the whole tab
+        # down. Order is preserved so the columns stay in the order typed.
+        if not any(value == seen for seen in target_js):
+            target_js.append(value)
+        else:
+            st.caption(f"↪ Ignoring repeated target current density {value:g}.")
     if not convert_density and not correction.is_density_unit(current_unit):
         st.caption(
             "↪ Current is not a density — these benchmarks compare across "
             "samples most meaningfully when normalized by electrode area "
             "('Convert ... to current density' above)."
         )
+
+    style = plot_style_controls("tafel")
+    font_size = style["font_size"]
+    _PALETTE_T = style["palette"]
 
     labels = [lbl for lbl, _ in series]
     chosen = st.multiselect(
@@ -1799,19 +2126,37 @@ def render_tafel_tab() -> None:
             if not mask.any():
                 st.warning(f"{lbl}: all currents are zero — skipped.")
                 continue
-            pot = to_rhe_fn(d.potential[mask])
+            # Strip any approach/vertex leg before analysis: a raw export
+            # often ramps to the sweep's vertex first, and that leg would
+            # otherwise be treated as part of the scan (it breaks the
+            # baseline the onset detector reads, and puts two currents at
+            # the same potential).
+            pot_raw = to_rhe_fn(d.potential[mask])
             cur_scaled = _rescale_current(d.current[mask], native_unit, current_unit)
-            cur = cur_scaled / area_cm2 if convert_density else cur_scaled
+            cur_raw = cur_scaled / area_cm2 if convert_density else cur_scaled
+            pot, cur = sweep.clean_sweep(pot_raw, cur_raw)
+            trimmed = len(pot_raw) - len(pot)
             log_i = tafel.log_current(cur)
             n = len(pot)
-            # Read this sample's reaction choice (if the widget below has
-            # rendered before, on a prior run) so the auto-detected default
-            # range can be capped to a sensible overpotential for that
-            # reaction — falls back to the tab's default reaction the first
-            # time a sample is seen, before its own selectbox exists yet.
-            reaction_for_range = st.session_state.get(
-                f"tafel_reaction_{i}", default_reaction
-            )
+
+            # Infer the reaction from this sample's own curve, unless the
+            # user pinned one at the top of the tab. Done before the
+            # selectbox renders so the detection can seed its initial value.
+            guess = None
+            reaction_key = f"tafel_reaction_{i}"
+            if auto_reaction:
+                try:
+                    guess = tafel.infer_reaction(pot, cur)
+                except Exception:
+                    guess = None
+            seeded = guess.reaction if guess is not None else default_reaction
+            if seeded not in _TAFEL_REACTIONS:
+                seeded = default_reaction
+
+            # The reaction drives the overpotential cap on the auto window,
+            # so read whatever the widget currently holds (a user override
+            # from a previous run wins over the fresh guess).
+            reaction_for_range = st.session_state.get(reaction_key, seeded)
             e_eq_for_range = tafel.REACTION_E_EQ_V_RHE.get(reaction_for_range)
             a0, a1 = tafel.auto_tafel_range(
                 pot, log_i, current=cur, e_eq=e_eq_for_range
@@ -1846,13 +2191,20 @@ def render_tafel_tab() -> None:
                      "statistics** section below. Pre-filled only when the "
                      "sample was auto-detected as a repeat upload.",
             )
+            reaction_help = ("This sample's legend and analysis are grouped "
+                             "under this reaction.")
+            if guess is not None:
+                reaction_help += f" Auto-detected: {guess.reason}."
             sample_reaction = cr.selectbox(
                 "Reaction", _TAFEL_REACTIONS,
-                index=_TAFEL_REACTIONS.index(default_reaction),
-                key=f"tafel_reaction_{i}",
-                help="This sample's legend and analysis are grouped under "
-                     "this reaction.",
+                index=_TAFEL_REACTIONS.index(seeded),
+                key=reaction_key, help=reaction_help,
             )
+            if guess is not None and sample_reaction == guess.reaction:
+                badge = {"high": "✅", "medium": "🟡", "low": "⚠️"}[guess.confidence]
+                cr.caption(f"{badge} auto ({guess.confidence})")
+            elif guess is not None:
+                cr.caption(f"↪ overriding auto-detect ({guess.reaction})")
             slider_kwargs = ({} if range_key in st.session_state
                              else {"value": (int(a0), int(a1))})
             start, stop = c1.slider(
@@ -1867,13 +2219,20 @@ def render_tafel_tab() -> None:
                 f"{pot[min(stop, n - 1)]:.3f} V"
             )
             color = c2.color_picker(
-                "Color", value=_PALETTE[i % len(_PALETTE)], key=f"tafel_color_{i}"
+                "Color", value=_PALETTE_T[i % len(_PALETTE_T)],
+                key=f"tafel_color_{i}_{style['palette_name']}",
             )
+            if trimmed:
+                c1.caption(
+                    f"↪ {trimmed} point(s) of approach/vertex leg removed "
+                    "before analysis."
+                )
             fits.append({"label": display_name or lbl, "orig_label": lbl,
-                             "reaction": sample_reaction,
-                             "replicate_group": replicate_group or (display_name or lbl),
-                             "potential": pot, "current": cur, "log_i": log_i,
-                             "start": start, "stop": stop, "color": color})
+                         "reaction": sample_reaction,
+                         "reaction_guess": guess,
+                         "replicate_group": replicate_group or (display_name or lbl),
+                         "potential": pot, "current": cur, "log_i": log_i,
+                         "start": start, "stop": stop, "color": color})
 
     if not fits:
         st.error("No usable samples (all-zero current).")
@@ -1933,8 +2292,9 @@ def render_tafel_tab() -> None:
         lsv_fig.update_layout(
             title={"text": "Original LSV", "font": {"family": "Arial", "size": font_size}},
             template="plotly_white", height=460, font=axis_font,
-            legend={"x": 0.02, "y": 0.98, "xanchor": "left", "yanchor": "top", "font": small_font,
-                        "bgcolor": "rgba(255,255,255,0.7)", "tracegroupgap": 18},
+            legend={"x": 0.02, "y": 0.98, "xanchor": "left",
+                    "yanchor": "top", "font": small_font,
+                    "bgcolor": "rgba(255,255,255,0.7)", "tracegroupgap": 18},
             margin={"l": 10, "r": 10, "t": 60, "b": 10},
         )
         lsv_fig.update_xaxes(
@@ -1942,14 +2302,15 @@ def render_tafel_tab() -> None:
             tickfont={"family": "Arial", "size": font_size}, **_BOX_AXIS_STYLE,
         )
         lsv_fig.update_yaxes(
-            title={"text": f"Current ({display_unit})", "font": {"family": "Arial", "size": font_size}},
+            title={"text": f"Current ({display_unit})",
+                   "font": {"family": "Arial", "size": font_size}},
             tickfont={"family": "Arial", "size": font_size}, **_BOX_AXIS_STYLE,
         )
         if lsv_x_range is not None:
             lsv_fig.update_xaxes(range=lsv_x_range)
         if lsv_y_range is not None:
             lsv_fig.update_yaxes(range=lsv_y_range)
-        st.plotly_chart(lsv_fig, use_container_width=True, config=_PLOTLY_EDIT_CONFIG)
+        st.plotly_chart(lsv_fig, width="stretch", config=_PLOTLY_EDIT_CONFIG)
         figure_downloads(
             lsv_fig, "original_lsv_plot", key="png_lsv_original",
             what="LSV plot", data=_padded_frame(lsv_plotted),
@@ -2058,8 +2419,9 @@ def render_tafel_tab() -> None:
         template="plotly_white",
         height=560,
         font=axis_font,  # baseline (inherited by legend/annotations unless overridden)
-        legend={"x": 0.02, "y": 0.98, "xanchor": "left", "yanchor": "top", "font": small_font,
-                    "bgcolor": "rgba(255,255,255,0.7)", "tracegroupgap": 18},
+        legend={"x": 0.02, "y": 0.98, "xanchor": "left",
+                "yanchor": "top", "font": small_font,
+                "bgcolor": "rgba(255,255,255,0.7)", "tracegroupgap": 18},
         margin={"l": 10, "r": 10, "t": 60, "b": 10},
         dragmode="select",
     )
@@ -2068,7 +2430,7 @@ def render_tafel_tab() -> None:
     # style plot uncluttered.
     fig.update_xaxes(
         title={"text": f"log₁₀ |Current| ({display_unit})",
-                   "font": {"family": "Arial", "size": font_size}},
+               "font": {"family": "Arial", "size": font_size}},
         tickfont={"family": "Arial", "size": font_size}, range=tafel_x_range,
         **_BOX_AXIS_STYLE,
     )
@@ -2084,7 +2446,7 @@ def render_tafel_tab() -> None:
         "the legend or a slope label to reposition it before exporting."
     )
     st.plotly_chart(
-        fig, use_container_width=True, key="tafel_plot_select",
+        fig, width="stretch", key="tafel_plot_select",
         on_select="rerun", selection_mode=["box"],
         config=_PLOTLY_EDIT_CONFIG,
     )
@@ -2094,6 +2456,7 @@ def render_tafel_tab() -> None:
     )
 
     rows = []
+    fit_warnings: list[str] = []
     for f, r in results:
         slope_abs = abs(r.slope_mv_per_dec)
         ref = tafel.nearest_reference(slope_abs, f["reaction"])
@@ -2102,12 +2465,27 @@ def render_tafel_tab() -> None:
             "Replicate group": f["replicate_group"],
             "Reaction": f["reaction"],
             "Tafel slope (mV/dec)": round(slope_abs, 1),
+            # A slope with no uncertainty cannot be compared against another
+            # lab's number, so the fit's own standard error travels with it.
+            "± 95% CI (mV/dec)": (
+                round(r.slope_ci95_mv_per_dec, 1)
+                if np.isfinite(r.slope_ci95_mv_per_dec) else None
+            ),
             "R2": round(r.r_squared, 4),
             "Fit points": f["stop"] - f["start"],
+            # Decades of current spanned: the usual reason a Tafel slope is
+            # wrong is a window too short to be a Tafel region at all, and
+            # R² cannot show that (a few adjacent points on any smooth curve
+            # fit a line beautifully).
+            "Decades fitted": (
+                round(r.decades, 2) if np.isfinite(r.decades) else None
+            ),
             "Nearest mechanistic benchmark": (
                 f"~{ref[0]:.0f} mV/dec ({ref[1]})" if ref else "—"
             ),
         }
+        for issue in r.quality_warnings:
+            fit_warnings.append(f"**{f['label']}** — {issue}")
         try:
             row["E_onset (V vs RHE)"] = round(
                 tafel.onset_potential(f["potential"], f["current"]), 3
@@ -2139,7 +2517,12 @@ def render_tafel_tab() -> None:
     ]
 
     st.markdown("**Results summary**")
-    st.dataframe(summary, use_container_width=True, hide_index=True)
+    st.dataframe(summary, width="stretch", hide_index=True)
+    if fit_warnings:
+        st.warning(
+            "**Fit-quality notes** (the slope is still reported, but treat "
+            "these with care):\n\n- " + "\n- ".join(fit_warnings)
+        )
     st.download_button(
         "⬇️ Download Tafel fit summary (CSV)",
         data=summary.to_csv(index=False).encode("utf-8"),
@@ -2154,6 +2537,7 @@ def render_tafel_tab() -> None:
     display["R2"] = [f"{v:.4f}" for v in summary["R2"]]
     _journal_table_figure(  # CSV of this table is the summary button above
         display, font_size, "tafel_results_table", key="png_tafel_table",
+        style=style,
     )
 
     if has_replicates:
@@ -2190,7 +2574,7 @@ def render_tafel_tab() -> None:
                     rep_row[c] = f"{np.mean(vals):.4g} ± {np.std(vals, ddof=1):.4g}"
             rep_rows.append(rep_row)
         replicate_summary = pd.DataFrame(rep_rows)
-        st.dataframe(replicate_summary, use_container_width=True, hide_index=True)
+        st.dataframe(replicate_summary, width="stretch", hide_index=True)
         st.download_button(
             "⬇️ Download replicate statistics (CSV)",
             data=replicate_summary.to_csv(index=False).encode("utf-8"),
@@ -2200,6 +2584,7 @@ def render_tafel_tab() -> None:
         _journal_table_figure(
             replicate_summary, font_size, "tafel_replicate_stats_table",
             key="png_tafel_replicate_table", what="Replicate statistics table",
+            style=style,
         )
 
     if len(results) >= 2 and target_js:
@@ -2238,7 +2623,7 @@ def render_tafel_tab() -> None:
             means = grouped.mean()
             stds = grouped.std(ddof=1).fillna(0.0)
             ylabel = target_cols[0] if len(target_cols) == 1 else f"Value @ j={target_j:g}"
-            bar_colors = [_PALETTE[i % len(_PALETTE)] for i in range(len(means))]
+            bar_colors = [_PALETTE_T[i % len(_PALETTE_T)] for i in range(len(means))]
             fig_bar = go.Figure(go.Bar(
                 x=list(means.index), y=means.to_numpy(),
                 error_y={"type": "data", "array": stds.to_numpy(), "visible": True},
@@ -2246,7 +2631,7 @@ def render_tafel_tab() -> None:
             ))
             fig_bar.update_layout(
                 title={"text": f"Benchmark @ j = {target_j:g} {display_unit}",
-                           "font": {"family": "Arial", "size": font_size}},
+                       "font": {"family": "Arial", "size": font_size}},
                 template="plotly_white", height=420,
                 font={"family": "Arial", "size": font_size},
                 margin={"l": 10, "r": 10, "t": 60, "b": 10},
@@ -2258,7 +2643,7 @@ def render_tafel_tab() -> None:
                 title={"text": ylabel, "font": {"family": "Arial", "size": font_size}},
                 tickfont={"family": "Arial", "size": font_size}, **_BOX_AXIS_STYLE,
             )
-            st.plotly_chart(fig_bar, use_container_width=True, config=_PLOTLY_EDIT_CONFIG)
+            st.plotly_chart(fig_bar, width="stretch", config=_PLOTLY_EDIT_CONFIG)
             figure_downloads(
                 fig_bar, f"overpotential_bar_j{target_j:g}",
                 key=f"png_tafel_bar_{target_j:g}",
@@ -2322,14 +2707,13 @@ def render_kl_tab() -> None:
     )
     df = dict(samples)[active_label]
 
-    font_size = st.selectbox(
-        "Figure export font size (pt)", _JOURNAL_FONT_SIZES, index=0,
-        key="kl_font_size",
-        help="Font is fixed to Arial for publication-style export.",
-    )
+    style = plot_style_controls("kl", show_markers=True)
+    font_size = style["font_size"]
+    _PALETTE_K = style["palette"]
 
     def _style_axes(fig, xtitle, ytitle, legend_position="top-left"):
-        _journal_axes_style(fig, xtitle, ytitle, font_size, legend_position=legend_position)
+        _journal_axes_style(fig, xtitle, ytitle, font_size,
+                            legend_position=legend_position, style=style)
 
     st.markdown("**Current unit & electrode area**")
     # The uploaded column may hold either an absolute current (the usual RDE
@@ -2415,6 +2799,9 @@ def render_kl_tab() -> None:
 
     pot_rhe = to_rhe_fn(df["potential"].to_numpy(dtype=float))
     disk_raw = df["disk_current"].to_numpy(dtype=float)
+    # NOTE: cleaning happens per rotation rate below, not here — this frame
+    # concatenates every rpm, so a global monotonic-segment search would
+    # treat the joins between them as sweep reversals.
     # Display series, in whatever unit the RDE plot is set to. An upload that
     # is already a density is only rescaled between per-area units; an
     # absolute upload is rescaled then divided by the electrode area.
@@ -2454,20 +2841,28 @@ def render_kl_tab() -> None:
     curves_a_cm2: dict[float, tuple[np.ndarray, np.ndarray]] = {}
     for i, rv in enumerate(rpm_values):
         m = np.isclose(rpm_arr, rv)
-        order = np.argsort(pot_rhe[m])
-        p, j = pot_rhe[m][order], disk[m][order]
+        # Strip this rotation rate's approach/vertex leg before sorting: the
+        # leg revisits potentials the main sweep also covers, and the
+        # np.interp below (which the K-L fit reads its currents from) then
+        # sees duplicated x values and silently mixes the two legs.
+        p_clean, j_clean, j_a_clean = sweep.clean_sweep(
+            pot_rhe[m], disk[m], disk_a_cm2[m]
+        )
+        order = np.argsort(p_clean)
+        p, j = p_clean[order], j_clean[order]
         curves[rv] = (p, j)
-        curves_a_cm2[rv] = (p, disk_a_cm2[m][order])
+        curves_a_cm2[rv] = (p, j_a_clean[order])
         fig_rde.add_trace(go.Scatter(
             x=p, y=j, mode="lines", name=f"{rv:g} rpm",
-            line={"color": _PALETTE[i % len(_PALETTE)], "width": 2.5},
+            line={"color": _PALETTE_K[i % len(_PALETTE_K)],
+                  "width": style["line_width"]},
         ))
     _style_axes(fig_rde, "Potential vs RHE / V", f"Disk current ({display_unit})")
     if rde_x_range is not None:
         fig_rde.update_xaxes(range=rde_x_range)
     if rde_y_range is not None:
         fig_rde.update_yaxes(range=rde_y_range)
-    st.plotly_chart(fig_rde, use_container_width=True, config=_PLOTLY_EDIT_CONFIG)
+    st.plotly_chart(fig_rde, width="stretch", config=_PLOTLY_EDIT_CONFIG)
     rde_cols = {}
     for rv, (p, j) in curves.items():
         rde_cols[f"{rv:g}rpm — Potential vs RHE (V)"] = list(p)
@@ -2554,7 +2949,7 @@ def render_kl_tab() -> None:
         n_val = orr.levich_slope_to_n(fit.slope, diff_coeff, viscosity, bulk_c)
         if n_val is not None and not (-0.5 <= n_val <= 4.5):
             n_out_of_range = True
-        color = _PALETTE[idx % len(_PALETTE)]
+        color = _PALETTE_K[idx % len(_PALETTE_K)]
         # x = omega^-1/2 with omega = 2*pi*rpm/60 in rad/s -- the units the
         # 0.62 Levich prefactor is defined for (the alternative 0.201 form
         # takes rpm directly; 0.62*sqrt(2*pi/60) = 0.201 reconciles them).
@@ -2567,13 +2962,15 @@ def render_kl_tab() -> None:
         y = invj / _KL_PLOT_J_SCALE
         fig_kl.add_trace(go.Scatter(
             x=x, y=y, mode="markers", name=f"{ap:.3f} V",
-            marker={"color": color, "size": 9},
+            marker={"color": color, "size": max(4, style["marker_size"]),
+                    "symbol": style["marker_symbol"]},
         ))
         xline = np.array([float(np.min(x)), float(np.max(x))])
         yline = (fit.slope * xline + fit.intercept) / _KL_PLOT_J_SCALE
         fig_kl.add_trace(go.Scatter(
             x=xline, y=yline, mode="lines", showlegend=False,
-            line={"color": _darken(color), "width": 2.5, "dash": "dot"},
+            line={"color": _darken(color), "width": style["line_width"],
+                  "dash": style["fit_dash"]},
         ))
         kl_data[f"{ap:.3f}V — omega^-1/2 (rad^-1/2 s^1/2)"] = list(x)
         kl_data[f"{ap:.3f}V — 1/j (cm²/mA)"] = list(y)
@@ -2581,6 +2978,10 @@ def render_kl_tab() -> None:
             "Potential (V vs RHE)": round(float(ap), 3),
             "KL slope": float(fit.slope),
             "R²": round(fit.r_squared, 4),
+            # A K-L fit through near-zero currents (just past onset) produces
+            # an arithmetically valid but physically meaningless n; surfacing
+            # the reliability test keeps such rows from being read as results.
+            "Reliable?": "yes" if fit.is_reliable else "no — low R²",
             # Reported as its positive magnitude (0-4), matching literature
             # convention -- the sign otherwise just tracks the disk current's
             # own recorded sign (negative for a cathodic/reduction sweep).
@@ -2614,6 +3015,17 @@ def render_kl_tab() -> None:
             "n (raw, unrounded)": f"{n_val:.4f}" if n_val is not None else "—",
         })
 
+    unreliable = [r for r in kl_rows if r.get("Reliable?", "").startswith("no")]
+    if unreliable:
+        st.warning(
+            f"{len(unreliable)} of {len(kl_rows)} analysis potentials gave a "
+            "poorly-conditioned Koutecky-Levich fit (R² < 0.95), marked "
+            "**no** in the *Reliable?* column. This is normal for potentials "
+            "close to the onset, where the current is near zero and 1/j "
+            "amplifies noise without limit — narrow the analysis window to "
+            "the mass-transport-limited region and they should disappear. "
+            "Do not quote n from those rows."
+        )
     if n_out_of_range:
         st.warning(
             "One or more analysis potentials gave n well outside the "
@@ -2643,7 +3055,7 @@ def render_kl_tab() -> None:
                 "parameters, not the fit itself."
             )
             st.dataframe(
-                pd.DataFrame(kl_diagnostics), use_container_width=True, hide_index=True,
+                pd.DataFrame(kl_diagnostics), width="stretch", hide_index=True,
             )
 
     if not kl_rows:
@@ -2659,7 +3071,7 @@ def render_kl_tab() -> None:
         "j<sup>−1</sup> (cm² mA<sup>−1</sup>)",
         legend_position="outside-right",
     )
-    st.plotly_chart(fig_kl, use_container_width=True, config=_PLOTLY_EDIT_CONFIG)
+    st.plotly_chart(fig_kl, width="stretch", config=_PLOTLY_EDIT_CONFIG)
     st.caption(
         "Koutecký–Levich: 1/j = 1/j_k + 1/(B·ω^½), with "
         "B = 0.62·n·F·D^(2/3)·ν^(−1/6)·C and ω = 2π·rpm/60 (rad/s). "
@@ -2674,7 +3086,7 @@ def render_kl_tab() -> None:
 
     kl_summary = pd.DataFrame(kl_rows)
     st.markdown("**Results summary**")
-    st.dataframe(kl_summary, use_container_width=True, hide_index=True)
+    st.dataframe(kl_summary, width="stretch", hide_index=True)
     st.download_button(
         "⬇️ Download K-L summary (CSV)",
         data=kl_summary.to_csv(index=False).encode("utf-8"),
@@ -2685,7 +3097,7 @@ def render_kl_tab() -> None:
     kl_display["KL slope"] = [f"{v:.3e}" for v in kl_summary["KL slope"]]
     _journal_table_figure(  # CSV of this table is the summary button above
         kl_display, font_size, f"kl_results_table_{active_label}",
-        key="png_kl_table",
+        key="png_kl_table", style=style,
     )
 
 
@@ -2741,15 +3153,15 @@ def _orr_read_file(up, key_prefix: str = "orr") -> pd.DataFrame | None:
     """Read one uploaded file's raw table (no column interpretation yet)."""
     try:
         if up.name.lower().endswith((".xlsx", ".xls")):
-            sheets = data_io.list_sheets(io.BytesIO(up.getvalue()))
+            sheets = _cached_sheets(up.getvalue())
             sheet = sheets[0]
             if len(sheets) > 1:
                 sheet = st.selectbox(
                     f"Sheet for {up.name}", sheets,
                     key=f"{key_prefix}_sheet_{up.name}",
                 )
-            return data_io.read_table(io.BytesIO(up.getvalue()), sheet=sheet)
-        return data_io.read_table(io.BytesIO(up.getvalue()), sheet=None)
+            return _cached_table(up.getvalue(), sheet)
+        return _cached_table(up.getvalue(), None)
     except Exception as exc:
         st.warning(f"{up.name}: {exc}")
         return None
@@ -2809,6 +3221,21 @@ def _orr_table_to_entry(
         (c for c, name in lowered.items() if any(h in name for h in _ORR_POT_HINTS)),
         cols[0],
     )
+    if len(cols) == 3:
+        # Potential, Disk, Ring on one shared potential grid. Without this
+        # branch a 3-column export fell through to the 2-column path, which
+        # takes cols[-1] as "the current" — silently reading the *ring* column
+        # as the disk current and discarding the disk entirely.
+        others = [c for c in cols if c != pot_col]
+        disk_col, ring_col = others[0], others[1]
+        # Disambiguate by header where the file says which is which.
+        if "ring" in str(disk_col).lower() and "ring" not in str(ring_col).lower():
+            disk_col, ring_col = ring_col, disk_col
+        pot = coerced[pot_col].to_numpy(dtype=float)
+        disk = coerced[disk_col].to_numpy(dtype=float)
+        ring = coerced[ring_col].to_numpy(dtype=float)
+        mask = np.isfinite(pot) & np.isfinite(disk) & np.isfinite(ring)
+        return pot[mask], disk[mask], ring[mask], rpm_val
     if len(cols) >= 4:
         others = [c for c in cols if c != pot_col]
         disk_col, ring_pot_col, ring_col = others[0], others[1], others[2]
@@ -3081,11 +3508,9 @@ def render_orr_tab() -> None:
         return
     chosen_samples = {lbl: df for lbl, df in samples if lbl in chosen}
 
-    font_size = st.selectbox(
-        "Figure export font size (pt)", _JOURNAL_FONT_SIZES, index=0,
-        key="orr_font_size",
-        help="Font is fixed to Arial for publication-style export.",
-    )
+    style = plot_style_controls("orr", show_markers=True)
+    font_size = style["font_size"]
+    _PALETTE_O = style["palette"]
 
     st.markdown("**Current unit, electrode area & collection efficiency**")
     cur1, cur2, cur3, cur4, cur5 = st.columns(5)
@@ -3191,17 +3616,27 @@ def render_orr_tab() -> None:
                 f"↪ {lbl} has no {primary_rpm:g} rpm data — using its nearest "
                 f"available rotation rate, {sample_rpm:g} rpm, instead."
             )
+        # Clean this rotation rate's slice (drop any approach/vertex leg)
+        # before onset/E1/2/Tafel read anything off it.
+        _pot_c, _disk_c, _ring_c = sweep.clean_sweep(
+            p["potential"][idx], p["disk"][idx],
+            p["ring"][idx] if p["has_ring"] else None,
+        )
         slices[lbl] = {
-            "rpm": sample_rpm, "potential": p["potential"][idx], "disk": p["disk"][idx],
-            "ring": (p["ring"][idx] if p["has_ring"] else None), "has_ring": p["has_ring"],
+            "rpm": sample_rpm, "potential": _pot_c, "disk": _disk_c,
+            "ring": (_ring_c if p["has_ring"] else None),
+            "has_ring": p["has_ring"],
         }
     if not slices:
         return
 
-    palette_for = {lbl: _PALETTE[i % len(_PALETTE)] for i, lbl in enumerate(chosen)}
+    palette_for = {lbl: _PALETTE_O[i % len(_PALETTE_O)]
+                   for i, lbl in enumerate(chosen)}
+    palette_for.update(trace_color_pickers(list(chosen), style, "orr_series"))
 
     def _style_axes(fig, xtitle, ytitle, yrange=None):
-        _journal_axes_style(fig, xtitle, ytitle, font_size, yrange=yrange)
+        _journal_axes_style(fig, xtitle, ytitle, font_size, yrange=yrange,
+                            style=style)
 
     def _zero_anchored_range(values: np.ndarray) -> list:
         """Default Y range anchored at 0, extending only in the direction
@@ -3362,7 +3797,7 @@ def render_orr_tab() -> None:
     # left too little room for the rotated axis title against the tick
     # numbers at larger export font sizes.
     st.plotly_chart(
-        fig_disk, use_container_width=not has_any_ring, config=_PLOTLY_EDIT_CONFIG
+        fig_disk, width=("content" if has_any_ring else "stretch"), config=_PLOTLY_EDIT_CONFIG
     )
     figure_downloads(
         fig_disk, f"orr_disk_curve_{int(primary_rpm)}rpm", key="png_orr_disk",
@@ -3376,8 +3811,28 @@ def render_orr_tab() -> None:
         "near the kinetic (low-overpotential) region of its mass-transport-"
         "corrected current."
     )
-    ehw_method = "steepest"
-    ehw1, ehw2 = st.columns(2)
+    # The literature-standard read-off is the half-limiting-current one, so
+    # that is the default here. "Steepest" (max |dI/dE|) was the only method
+    # the GUI exposed even though the analysis module implements all three;
+    # on the bundled sample the two disagree by 65 mV (0.517 V vs 0.583 V),
+    # which is a large discrepancy to have had no control over.
+    _EHW_METHODS = {
+        "j_lim/2 interpolation (literature standard)": "interpolated",
+        "Steepest point, max |dI/dE|": "steepest",
+        "Inflection via d²I/dE² zero-crossing": "second_derivative",
+    }
+    ehw0, ehw1, ehw2 = st.columns([1.6, 1, 1])
+    ehw_method = _EHW_METHODS[ehw0.selectbox(
+        "E½ method", list(_EHW_METHODS), index=0, key="orr_ehw_method",
+        help="**j_lim/2** interpolates where the disk current crosses the "
+             "midpoint between its pre-onset baseline and its plateau — the "
+             "convention most published ORR papers use, and directly "
+             "comparable to their numbers, but it needs a well-formed "
+             "plateau. **Steepest** takes the inflection point instead and "
+             "does not care whether the plateau is flat. **d²I/dE²** finds "
+             "that same inflection as a zero-crossing (sub-grid precision, "
+             "but more sensitive to noise).",
+    )]
     ehw_lo = ehw1.number_input(
         "E½ search window min (V vs RHE)", value=0.4, step=0.05, format="%.2f",
         key="orr_ehw_lo",
@@ -3506,7 +3961,7 @@ def render_orr_tab() -> None:
             y_lo, y_hi = np.percentile(np.concatenate(deriv_in_view), [1, 99])
             pad = (y_hi - y_lo) * 0.15 or abs(y_hi) * 0.15 or 1.0
             fig_deriv.update_yaxes(range=[y_lo - pad, y_hi + pad])
-        st.plotly_chart(fig_deriv, use_container_width=True, config=_PLOTLY_EDIT_CONFIG)
+        st.plotly_chart(fig_deriv, width="stretch", config=_PLOTLY_EDIT_CONFIG)
         figure_downloads(
             fig_deriv, f"orr_derivative_{int(primary_rpm)}rpm", key="png_orr_deriv",
             what="dI/dE derivative plot", data=_padded_frame(deriv_data),
@@ -3514,7 +3969,7 @@ def render_orr_tab() -> None:
 
     if results_rows:
         summary_df = pd.DataFrame(results_rows)
-        st.dataframe(summary_df, use_container_width=True, hide_index=True)
+        st.dataframe(summary_df, width="stretch", hide_index=True)
         st.download_button(
             "⬇️ Download ORR summary (CSV)",
             data=summary_df.to_csv(index=False).encode("utf-8"),
@@ -3523,7 +3978,7 @@ def render_orr_tab() -> None:
         )
         _journal_table_figure(  # CSV of this table is the summary button above
             summary_df, font_size, f"orr_results_table_{int(primary_rpm)}rpm",
-            key="png_orr_table",
+            key="png_orr_table", style=style,
         )
 
     if tafel_slider_specs:
@@ -3587,7 +4042,7 @@ def render_orr_tab() -> None:
             fig_tafel.update_xaxes(range=orr_tafel_x_range)
         if orr_tafel_y_range is not None:
             fig_tafel.update_yaxes(range=orr_tafel_y_range)
-        st.plotly_chart(fig_tafel, use_container_width=True, config=_PLOTLY_EDIT_CONFIG)
+        st.plotly_chart(fig_tafel, width="stretch", config=_PLOTLY_EDIT_CONFIG)
         figure_downloads(
             fig_tafel, f"orr_tafel_{int(primary_rpm)}rpm", key="png_orr_tafel",
             what="Tafel plot",
@@ -3664,13 +4119,13 @@ def render_orr_tab() -> None:
 
         pc1, pc2 = st.columns(2)
         with pc1:
-            st.plotly_chart(fig_ho2, use_container_width=True, config=_PLOTLY_EDIT_CONFIG)
+            st.plotly_chart(fig_ho2, width="stretch", config=_PLOTLY_EDIT_CONFIG)
             figure_downloads(
                 fig_ho2, f"orr_ho2_{int(primary_rpm)}rpm", key="png_orr_ho2",
                 what="%H₂O₂ plot", data=_padded_frame(ho2_data),
             )
         with pc2:
-            st.plotly_chart(fig_n, use_container_width=True, config=_PLOTLY_EDIT_CONFIG)
+            st.plotly_chart(fig_n, width="stretch", config=_PLOTLY_EDIT_CONFIG)
             figure_downloads(
                 fig_n, f"orr_n_{int(primary_rpm)}rpm", key="png_orr_n",
                 what="n plot", data=_padded_frame(n_data),
@@ -3727,7 +4182,7 @@ def render_orr_tab() -> None:
             )
             for i, rv in enumerate(rpm_pick):
                 m = np.isclose(p["rpm"], rv)
-                color = _PALETTE[i % len(_PALETTE)]
+                color = _PALETTE_O[i % len(_PALETTE_O)]
                 fig_rrde.add_trace(go.Scatter(
                     x=p["potential"][m], y=p["ring"][m], mode="lines",
                     name=f"{rv:g} rpm", legendgroup=f"{rv:g}",
@@ -3789,7 +4244,8 @@ def render_orr_tab() -> None:
                 fig_rrde.add_trace(go.Scatter(
                     x=p["potential"][m], y=p["disk"][m], mode="lines",
                     name=f"{rv:g} rpm",
-                    line={"color": _PALETTE[i % len(_PALETTE)], "width": 2.5},
+                    line={"color": _PALETTE_O[i % len(_PALETTE_O)],
+                          "width": style["line_width"]},
                 ))
             _style_axes(fig_rrde, "Potential vs RHE / V", f"Disk current ({display_unit})")
             if rrde_x_range is not None:
@@ -3799,7 +4255,7 @@ def render_orr_tab() -> None:
                 else _zero_anchored_range(disk_sel)
             )
         st.plotly_chart(
-            fig_rrde, use_container_width=not p["has_ring"], config=_PLOTLY_EDIT_CONFIG
+            fig_rrde, width=("content" if p["has_ring"] else "stretch"), config=_PLOTLY_EDIT_CONFIG
         )
         rrde_cols: dict[str, list] = {}
         for rv in rpm_pick:

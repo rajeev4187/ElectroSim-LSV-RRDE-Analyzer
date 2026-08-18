@@ -210,7 +210,21 @@ def assess_correction(
     e_raw = np.asarray(raw_potential, dtype=float)
     e_cor = np.asarray(corrected_potential, dtype=float)
     n = len(e_cor)
-    direction = 1 if (n < 2 or e_raw[-1] >= e_raw[0]) else -1
+    # Sweep direction from the *net* travel of the whole record rather than
+    # the two endpoints: an LSV that begins with a short approach leg running
+    # the other way (a very common instrument export) would otherwise be
+    # classified backwards, and the fold-back detector below -- which is
+    # simply "does the potential ever reverse against this direction" -- would
+    # then report ~100 % fold-back on a perfectly good correction.
+    if n < 2:
+        direction = 1
+    else:
+        steps = np.diff(e_raw)
+        net = float(np.sum(steps))
+        if net != 0:
+            direction = 1 if net > 0 else -1
+        else:  # pure round trip: fall back to the dominant step direction
+            direction = 1 if float(np.sum(np.sign(steps))) >= 0 else -1
 
     span = float(np.ptp(e_raw)) or 1.0
     tol = 0.005 * span  # ignore reversals smaller than 0.5 % of the sweep span

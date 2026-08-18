@@ -1,0 +1,10 @@
+# Development / CI extras (installed on top of requirements.txt).
+-r requirements.txt
+
+pytest>=8.0
+flake8>=7.0
+
+# Used only by scripts/readme_to_pdf.py. These were imported by that script
+# but declared nowhere, so a fresh checkout could not run it.
+markdown>=3.5
+xhtml2pdf>=0.2.13

@@ -57,8 +57,17 @@ Cross-cutting features:
 - **Replicate groups** — repeat scans sharing a group name get every fitted
   value reported as **mean ± SD** in its own results section.
 - **Publication-styled export** — Arial fonts, selectable size, closed box
-  axes, draggable legends and slope labels; download every plot as 300 dpi
-  TIFF or interactive HTML, and every table as TIFF or CSV.
+  axes, draggable legends and slope labels.
+- **Figure styling, under your control.** A **Plot appearance** panel on every
+  tab sets the font family and size, the colour palette (including an
+  Okabe-Ito colourblind-safe set and a grayscale set for print-only figures),
+  per-series colours, line width, marker size and symbol, fit-line dash,
+  gridlines, box frame, tick density and legend placement. Exports render the
+  same figure object you see, so the two cannot drift apart.
+- **Dynamic export.** Every plot exports as TIFF, PNG, SVG, PDF or JPEG at
+  150-1200 dpi with adjustable pixel dimensions; every table exports as a
+  journal-styled figure (ruled header, zebra rows) or as CSV, plus interactive
+  HTML for any plot.
 
 ---
 
@@ -73,8 +82,23 @@ Open `http://localhost:8501`. Choose **Use bundled sample** in the sidebar to
 try the EIS/LSV tabs instantly, or load `sample-data/Example ORR 0-1 M KOH/`
 for a full five-rotation-rate RRDE dataset.
 
-TIFF export needs headless Chrome (via `kaleido`); if it is missing, run
-`plotly_get_chrome` or use the HTML/CSV downloads.
+Image export (TIFF/PNG/SVG/PDF/JPEG) needs headless Chrome via `kaleido`; if
+it is missing, run `plotly_get_chrome` or use the HTML/CSV downloads, which
+need no external renderer.
+
+### Development
+
+```bash
+pip install -r requirements-dev.txt
+pytest          # analysis modules + app smoke tests
+flake8 app.py scripts tests
+```
+
+CI runs the same checks on Python 3.12, 3.13 and 3.14 (see
+[`.github/workflows/ci.yml`](.github/workflows/ci.yml)). Dependency floors in
+`requirements.txt` are split by Python version, because a single low floor
+resolves on 3.14 to a release with no matching wheel and forces a source
+build.
 
 ---
 
@@ -113,6 +137,30 @@ RRDE             n = 4|Id| / (|Id| + |Ir|/N)
 - Koutecký, J.; Levich, V. G. *Zh. Fiz. Khim.* **1958**, *32*, 1565.
 - Bard, A. J.; Faulkner, L. R. *Electrochemical Methods*, 2nd ed.; Wiley,
   2001; Ch. 9 (Levich constant B, RRDE collection efficiency, `n` and %H₂O₂).
+
+### What the analysis does for you
+
+- **Sweep cleaning.** Instrument exports commonly open with an approach or
+  vertex leg running opposite to the real scan. It is detected and removed
+  before anything is measured — left in, it corrupts every derivative and
+  every interpolation on the curve.
+- **Direction independence.** Onset, E½, η@j and the auto Tafel window give
+  the same answer whether the file was recorded from the rest potential or
+  from the plateau.
+- **Automatic reaction assignment.** Each LSV sample's reaction (HER / HOR /
+  OER / ORR) is inferred from the sign of its faradaic current and where it
+  flows on the RHE scale, with a stated confidence and reason; it drives the
+  equilibrium potential used for η, the mechanistic benchmark, and the
+  overpotential cap on the auto Tafel window. Override per sample at any time.
+- **Uncertainties and honest flags.** Tafel slopes are reported with a 95 %
+  confidence interval and the number of current decades fitted, and are
+  flagged when the window is too short to be a Tafel region regardless of how
+  good R² looks. Koutecký-Levich rows carry a reliability verdict, since a fit
+  through near-zero currents yields an arithmetically valid but meaningless
+  `n`. Peroxide yield and `n` are blanked before the reaction onset instead of
+  pinning at 100 %.
+- **E½ method is yours to choose** — the literature-standard j_lim/2
+  interpolation (default), the steepest point, or the d²I/dE² inflection.
 
 Full technical notes — data formats, security hardening, and using the Python
 API without the GUI — are in the module docstrings under

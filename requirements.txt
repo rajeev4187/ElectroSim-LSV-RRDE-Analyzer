@@ -1,8 +1,25 @@
-numpy>=1.26
-scipy>=1.11
-pandas>=2.0
+# Runtime dependencies.
+#
+# Floors are split by Python version on purpose. A single low floor (the old
+# "numpy>=1.26") is satisfiable on 3.12 from existing wheels, but on 3.13/3.14
+# pip resolves to a release that predates those interpreters, finds no wheel,
+# and falls back to building from source — which is what makes a CI matrix
+# pass on 3.12 and fail on 3.14. Each marker below names the first release
+# that actually ships wheels for that interpreter.
+numpy>=1.26; python_version < "3.13"
+numpy>=2.1; python_version >= "3.13" and python_version < "3.14"
+numpy>=2.3; python_version >= "3.14"
+
+pandas>=2.0; python_version < "3.13"
+pandas>=2.2.3; python_version >= "3.13" and python_version < "3.14"
+pandas>=2.3.2; python_version >= "3.14"
+
+# scipy was listed here but is not imported anywhere in the project; carrying
+# it forced an extra (large, frequently version-pinned) build into every
+# install and every CI run for nothing.
+
 openpyxl>=3.1
-streamlit>=1.30
+streamlit>=1.59        # width= supersedes the removed use_container_width
 plotly>=5.18
-kaleido>=1.0
+kaleido>=1.0           # static image export (TIFF/PNG/SVG/PDF)
 Pillow>=10.0

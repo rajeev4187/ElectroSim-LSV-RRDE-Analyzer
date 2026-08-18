@@ -66,6 +66,12 @@ def monotonic_segments(potential) -> list[tuple[int, int]]:
     idx = np.where(nz, np.arange(len(sign)), 0)
     np.maximum.accumulate(idx, out=idx)
     filled = sign[idx]
+    # A record that *opens* with flat steps has no earlier direction to carry
+    # forward, so those entries stay 0 and would read as a direction change
+    # against the first real step -- splitting one sweep in two. Back-fill
+    # them with the first non-zero direction instead.
+    first = int(np.flatnonzero(nz)[0])
+    filled[:first] = sign[first]
 
     breaks = np.flatnonzero(np.diff(filled) != 0) + 1
     bounds = [0, *(int(b) + 1 for b in breaks), n]

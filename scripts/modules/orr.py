@@ -48,32 +48,99 @@ ELECTROLYTE_PRESETS: dict[str, tuple[float, float, float]] = {
 }
 
 
-def electron_number(disk_current, ring_current,
-                    collection_efficiency: float) -> np.ndarray:
-    """RRDE electron-transfer number ``n = 4|Id| / (|Id| + |Ir|/N)``, clipped
-    to its physically meaningful range [0, 4] (the formula is already
-    bounded there analytically; the clip only guards floating-point edge
-    cases at the extremes)."""
+# Below this fraction of the sweep's own peak |disk current|, the ring/disk
+# ratio stops meaning anything: before the ORR onset the disk carries only
+# capacitive/background current, so |Id| -> 0 while the ring keeps its own
+# small background, and n and %H2O2 collapse onto their limits (n -> 0,
+# %H2O2 -> 100) purely as an artifact of dividing by ~nothing. Masking that
+# region to nan is what keeps a plot of %H2O2 from showing a confident-looking
+# flat 100 % line across the entire pre-onset half of the sweep.
+#
+# 5 % is not an arbitrary cutoff: it is the same fraction of the limiting
+# current the ORR literature conventionally uses to define the onset potential
+# itself, so the masked region is exactly "before the reaction has started".
+# On the bundled sample this suppresses all 159 pre-onset points (at 2 % four
+# of them still leaked through, because the background sits right at that
+# level).
+MIN_DISK_FRACTION = 0.05
+
+
+def _ring_disk_terms(disk_current, ring_current, collection_efficiency: float,
+                     min_disk_fraction: float):
+    """Shared ``(|Id|, |Ir|/N, valid_mask)`` for the two ring-disk formulas."""
     id_ = np.abs(np.asarray(disk_current, dtype=float))
-    ir_n = np.abs(np.asarray(ring_current, dtype=float)) / collection_efficiency
+    ir = np.abs(np.asarray(ring_current, dtype=float))
+    if collection_efficiency <= 0:
+        raise ValueError("Ring collection efficiency N must be positive.")
+    ir_n = ir / float(collection_efficiency)
     denom = id_ + ir_n
+
+    peak = float(np.nanmax(id_)) if np.isfinite(id_).any() else 0.0
+    floor = float(min_disk_fraction) * peak
+    valid = np.isfinite(denom) & (denom > 0) & (id_ >= floor)
+    return id_, ir_n, denom, valid
+
+
+def electron_number(disk_current, ring_current,
+                    collection_efficiency: float,
+                    min_disk_fraction: float = MIN_DISK_FRACTION) -> np.ndarray:
+    """RRDE electron-transfer number ``n = 4|Id| / (|Id| + |Ir|/N)``.
+
+    Clipped to its physically meaningful range [0, 4] (the formula is already
+    bounded there analytically; the clip only guards floating-point edge
+    cases). Points where the disk current has not yet risen to
+    ``min_disk_fraction`` of its own peak return ``nan`` rather than a
+    meaningless number — see :data:`MIN_DISK_FRACTION`.
+    """
+    id_, ir_n, denom, valid = _ring_disk_terms(
+        disk_current, ring_current, collection_efficiency, min_disk_fraction
+    )
     with np.errstate(divide="ignore", invalid="ignore"):
-        n = np.where(denom > 0, 4.0 * id_ / denom, np.nan)
+        n = np.where(valid, 4.0 * id_ / denom, np.nan)
     return np.clip(n, 0.0, 4.0)
 
 
 def peroxide_percent(disk_current, ring_current,
-                     collection_efficiency: float) -> np.ndarray:
-    """Peroxide yield ``%H2O2 = 200(|Ir|/N) / (|Id| + |Ir|/N)``, clipped to
-    [0, 100] — near-zero disk current (e.g. close to open-circuit, before
-    the ORR onset) can otherwise push the raw ratio above the physically
-    meaningful 0-100 % range."""
-    id_ = np.abs(np.asarray(disk_current, dtype=float))
-    ir_n = np.abs(np.asarray(ring_current, dtype=float)) / collection_efficiency
-    denom = id_ + ir_n
+                     collection_efficiency: float,
+                     min_disk_fraction: float = MIN_DISK_FRACTION) -> np.ndarray:
+    """Peroxide yield ``%H2O2 = 200(|Ir|/N) / (|Id| + |Ir|/N)``.
+
+    Clipped to [0, 100]; points below ``min_disk_fraction`` of the peak disk
+    current return ``nan`` (see :data:`MIN_DISK_FRACTION`) instead of pinning
+    at exactly 100 % across the whole pre-onset region.
+    """
+    id_, ir_n, denom, valid = _ring_disk_terms(
+        disk_current, ring_current, collection_efficiency, min_disk_fraction
+    )
     with np.errstate(divide="ignore", invalid="ignore"):
-        pct = np.where(denom > 0, 200.0 * ir_n / denom, np.nan)
+        pct = np.where(valid, 200.0 * ir_n / denom, np.nan)
     return np.clip(pct, 0.0, 100.0)
+
+
+def ring_disk_average(potential, disk_current, ring_current,
+                      collection_efficiency: float,
+                      window: tuple[float, float] | None = None,
+                      min_disk_fraction: float = MIN_DISK_FRACTION):
+    """Mean ``(n, %H2O2)`` over a potential window, the way ORR papers quote
+    them.
+
+    A single-point read-off at E1/2 is sensitive to exactly where E1/2 landed;
+    the literature convention is an average across the diffusion-limited
+    plateau (commonly ~0.2-0.6 V vs RHE). Returns ``(n_mean, pct_mean,
+    n_points)``, with ``nan`` means when the window holds no valid points.
+    """
+    pot = np.asarray(potential, dtype=float)
+    n_arr = electron_number(disk_current, ring_current, collection_efficiency,
+                            min_disk_fraction)
+    pct_arr = peroxide_percent(disk_current, ring_current, collection_efficiency,
+                               min_disk_fraction)
+    mask = np.isfinite(n_arr) & np.isfinite(pct_arr)
+    if window is not None:
+        lo, hi = sorted(window)
+        mask &= (pot >= lo) & (pot <= hi)
+    if not mask.any():
+        return float("nan"), float("nan"), 0
+    return float(np.mean(n_arr[mask])), float(np.mean(pct_arr[mask])), int(mask.sum())
 
 
 @dataclass
@@ -98,7 +165,13 @@ def _smoothed_derivative(pot: np.ndarray, cur: np.ndarray, smooth_window: int) -
         cur_smooth = np.convolve(padded, np.ones(w) / w, mode="valid")
     else:
         cur_smooth = cur
-    return np.gradient(cur_smooth, pot)
+    # sweep.safe_gradient, not np.gradient: np.gradient divides by the
+    # potential step, so any repeated potential divides by zero and any
+    # direction reversal (an approach/vertex leg the caller did not strip)
+    # divides by a negative step while the current keeps rising. On the
+    # bundled ORR sample that alone produced a dI/dE spike ~26x the true
+    # maximum, right where the E1/2 search looks for its peak.
+    return sweep.safe_gradient(cur_smooth, pot)
 
 
 def half_wave_derivative(potential, disk_current,
@@ -112,10 +185,10 @@ def half_wave_derivative(potential, disk_current,
 
     Returns ``(potential, deriv)``, same length and order.
     """
-    pot = np.asarray(potential, dtype=float)
-    cur = np.asarray(disk_current, dtype=float)
-    if abs(cur[-1]) < abs(cur[0]):
-        pot, cur = pot[::-1], cur[::-1]
+    pot, cur = sweep.clean_sweep(potential, disk_current)
+    if len(pot) < 2:
+        return pot, np.zeros_like(pot)
+    pot, cur = sweep.orient_rest_first(pot, cur)
     return pot, _smoothed_derivative(pot, cur, smooth_window)
 
 
@@ -147,13 +220,11 @@ def half_wave_potential_interpolated(potential, disk_current,
     steepest-point (or :func:`half_wave_potential_second_derivative`'s
     inflection-point) methods for sweeps where it isn't.
     """
-    pot = np.asarray(potential, dtype=float)
-    cur = np.asarray(disk_current, dtype=float)
+    pot, cur = sweep.clean_sweep(potential, disk_current)
     n = len(pot)
     if n < 5:
         raise ValueError("Need at least 5 points to locate E1/2.")
-    if abs(cur[-1]) < abs(cur[0]):
-        pot, cur = pot[::-1], cur[::-1]
+    pot, cur = sweep.orient_rest_first(pot, cur)
     tail_n = max(3, int(round(0.05 * n)))
     limiting_current = float(np.median(cur[-tail_n:]))
     baseline_n = max(3, int(round(baseline_frac * n)))
@@ -189,12 +260,12 @@ def half_wave_potential_second_derivative(
     actual noise level. Falls back to the first-derivative argmax (within
     the same search window) if no sign change is found.
     """
-    pot = np.asarray(potential, dtype=float)
-    cur = np.asarray(disk_current, dtype=float)
-    if abs(cur[-1]) < abs(cur[0]):
-        pot, cur = pot[::-1], cur[::-1]
+    pot, cur = sweep.clean_sweep(potential, disk_current)
+    if len(pot) < 5:
+        raise ValueError("Need at least 5 points to locate E1/2.")
+    pot, cur = sweep.orient_rest_first(pot, cur)
     deriv = _smoothed_derivative(pot, cur, smooth_window)
-    second_deriv = np.gradient(deriv, pot)
+    second_deriv = sweep.safe_gradient(deriv, pot)
     lo_idx, hi_idx = _search_window_indices(pot, onset_idx, half_wave_search_range)
     window_sd = second_deriv[lo_idx:hi_idx]
     window_d = deriv[lo_idx:hi_idx]
@@ -266,17 +337,18 @@ def onset_and_half_wave(potential, disk_current,
     """
     if method not in _HALF_WAVE_METHODS:
         raise ValueError(f"Unknown method {method!r}; expected one of {_HALF_WAVE_METHODS}.")
-    pot = np.asarray(potential, dtype=float)
-    cur = np.asarray(disk_current, dtype=float)
+    pot, cur = sweep.clean_sweep(potential, disk_current)
     n = len(pot)
     if n < 5:
         raise ValueError("Need at least 5 points to locate onset/E1/2.")
 
     # Orient the arrays so index 0 is the rest-potential end and -1 is deep
     # into the mass-transport plateau (largest |current|), regardless of the
-    # sweep direction the file was recorded in.
-    if abs(cur[-1]) < abs(cur[0]):
-        pot, cur = pot[::-1], cur[::-1]
+    # sweep direction the file was recorded in. Compares a short block at each
+    # end rather than the two single endpoints, so one noisy final sample
+    # cannot flip the whole record; clean_sweep above has already dropped any
+    # approach/vertex leg, which would otherwise put a non-plateau point last.
+    pot, cur = sweep.orient_rest_first(pot, cur)
 
     tail_n = max(3, int(round(0.05 * n)))
     limiting_current = float(np.median(cur[-tail_n:]))
@@ -314,19 +386,49 @@ def onset_and_half_wave(potential, disk_current,
     )
 
 
-def mass_transport_corrected_current(disk_current, limiting_current: float):
+# How close to the plateau j is still allowed to get. j_k = j*jd/(jd - j) has
+# a pole at j = jd, so the last few percent before the plateau amplify ordinary
+# measurement noise without limit: on the bundled ORR sample the raw formula
+# returned |j_k| up to 169 against a |j_d| of 1.34 (a factor of 126), and 63
+# points came out with the *opposite sign* to the current that produced them —
+# because plateau noise pushed |j| past |jd| and flipped the denominator.
+# Feeding those into a log10|j_k| Tafel fit is what makes an ORR Tafel slope
+# depend on where the plateau noise happened to land.
+MAX_PLATEAU_APPROACH = 0.95
+
+
+def mass_transport_corrected_current(disk_current, limiting_current: float,
+                                     max_plateau_approach: float = MAX_PLATEAU_APPROACH):
     """Kinetic current density ``j_k = j * j_d / (j_d - j)``.
 
     Removes the mass-transport contribution from a mixed kinetic-diffusion
     RDE curve so the low-overpotential (kinetic) region can be Tafel-fit;
     ``limiting_current`` is the plateau value from :func:`onset_and_half_wave`.
+
+    Two guards keep the result physical (see :data:`MAX_PLATEAU_APPROACH`):
+    points closer to the plateau than ``max_plateau_approach`` of ``j_d``, and
+    points whose corrected current would come out with a different sign from
+    ``j_d``, both return ``nan`` instead of a huge or sign-flipped value.
+    ``nan`` (rather than a clipped number) is deliberate — it propagates
+    through ``log10`` and is dropped by the caller's ``isfinite`` filter, so a
+    guarded point is excluded from the Tafel fit rather than silently biasing
+    it.
     """
     j = np.asarray(disk_current, dtype=float)
     jd = float(limiting_current)
+    if jd == 0 or not np.isfinite(jd):
+        return np.full_like(j, np.nan)
+
     denom = jd - j
     with np.errstate(divide="ignore", invalid="ignore"):
         jk = np.where(denom != 0, j * jd / denom, np.nan)
-    return jk
+
+    # |j| must stay clear of the plateau, on the same side of zero as jd.
+    frac = j / jd  # 0 at rest, 1 at the plateau
+    usable = np.isfinite(jk) & (frac < float(max_plateau_approach))
+    # A physical kinetic current runs the same direction as the limiting one.
+    usable &= np.sign(jk) == np.sign(jd)
+    return np.where(usable, jk, np.nan)
 
 
 # --------------------------------------------------------------------------- #
@@ -361,29 +463,72 @@ def angular_velocity(rpm) -> np.ndarray:
     return 2.0 * np.pi * np.asarray(rpm, dtype=float) / 60.0
 
 
+# A K-L fit needs |j| well clear of zero: 1/j has a pole there, so at an
+# analysis potential near the current's zero-crossing (just past the ORR
+# onset) an ordinary noise-level current becomes an enormous 1/j that
+# dominates the least-squares fit. On the bundled sample this produced
+# n = 19.9 with R2 = 0.0007 at E = 0.70 V -- inside the app's own default
+# 0.3-0.8 V window, so it was a value users actually saw. Points below this
+# fraction of the largest |j| in the same fit are dropped.
+MIN_KL_CURRENT_FRACTION = 0.05
+
+
 @dataclass
 class KoutieckyLevichFit:
-    """One potential's Koutecky-Levich fit: 1/j vs omega^-0.5."""
+    """One potential's Koutecky-Levich fit: 1/|j| vs omega^-0.5."""
 
     potential: float
-    slope: float          # d(1/j) / d(omega^-0.5)
-    intercept: float       # 1/j_k
+    slope: float          # d(1/|j|) / d(omega^-0.5)
+    intercept: float       # 1/|j_k|
     r_squared: float
     n_rotation_rates: int
+    slope_stderr: float = float("nan")
+    intercept_stderr: float = float("nan")
 
     @property
     def kinetic_current_density(self) -> float | None:
-        """j_k, the mass-transport-free (kinetic) current density."""
+        """|j_k|, the mass-transport-free (kinetic) current density.
+
+        Positive by construction: the fit runs on |j|, so j_k is a magnitude
+        and does not inherit the cathodic sweep's negative sign.
+        """
         return None if self.intercept == 0 else float(1.0 / self.intercept)
 
+    @property
+    def is_reliable(self) -> bool:
+        """Whether this fit is worth quoting.
 
-def fit_koutecky_levich(rpm, j, min_points: int = 3) -> KoutieckyLevichFit:
-    """Fit ``1/j`` vs ``omega^-0.5`` at one potential across several rotation
-    rates. ``rpm``/``j`` are parallel arrays (one entry per rotation rate);
-    non-finite or zero ``j`` values are dropped."""
+        A Koutecky-Levich plot with only three rotation rates and a poor R^2
+        gives an ``n`` that is arithmetic, not evidence.
+        """
+        return (self.n_rotation_rates >= 3 and np.isfinite(self.r_squared)
+                and self.r_squared >= 0.95 and self.intercept != 0)
+
+
+def fit_koutecky_levich(rpm, j, min_points: int = 3,
+                        min_current_fraction: float = MIN_KL_CURRENT_FRACTION,
+                        ) -> KoutieckyLevichFit:
+    """Fit ``1/|j|`` vs ``omega^-0.5`` at one potential across several
+    rotation rates.
+
+    ``rpm``/``j`` are parallel arrays (one entry per rotation rate).
+    Non-finite, zero, and negligibly small ``|j|`` values are dropped (see
+    :data:`MIN_KL_CURRENT_FRACTION`).
+
+    The fit uses **|j|**, not the signed current. An ORR sweep records a
+    cathodic (negative) current, which would otherwise make the slope,
+    intercept and hence both ``j_k`` and ``n`` come out negative -- quantities
+    the literature always reports as positive magnitudes, and which the
+    caller then has to remember to ``abs()`` at every use. Taking the
+    magnitude once, here, also keeps the fit meaningful for a data set whose
+    sign convention is inconsistent between rotation rates.
+    """
     rpm_arr = np.asarray(rpm, dtype=float)
-    j_arr = np.asarray(j, dtype=float)
-    mask = np.isfinite(rpm_arr) & np.isfinite(j_arr) & (rpm_arr > 0) & (j_arr != 0)
+    j_arr = np.abs(np.asarray(j, dtype=float))
+    mask = np.isfinite(rpm_arr) & np.isfinite(j_arr) & (rpm_arr > 0) & (j_arr > 0)
+    if mask.any():
+        floor = float(min_current_fraction) * float(np.max(j_arr[mask]))
+        mask &= j_arr > floor
     rpm_arr, j_arr = rpm_arr[mask], j_arr[mask]
     if len(rpm_arr) < min_points:
         raise ValueError(
@@ -392,14 +537,26 @@ def fit_koutecky_levich(rpm, j, min_points: int = 3) -> KoutieckyLevichFit:
         )
     x = 1.0 / np.sqrt(angular_velocity(rpm_arr))
     y = 1.0 / j_arr
+    k = len(x)
     slope, intercept = np.polyfit(x, y, 1)
     pred = slope * x + intercept
-    ss_res = float(np.sum((y - pred) ** 2))
+    resid = y - pred
+    ss_res = float(np.sum(resid ** 2))
     ss_tot = float(np.sum((y - np.mean(y)) ** 2))
     r_squared = 1.0 - ss_res / ss_tot if ss_tot > 0 else 0.0
+
+    sxx = float(np.sum((x - np.mean(x)) ** 2))
+    if k > 2 and sxx > 0:
+        resid_var = ss_res / (k - 2)
+        slope_se = float(np.sqrt(resid_var / sxx))
+        intercept_se = float(np.sqrt(resid_var * (1.0 / k + np.mean(x) ** 2 / sxx)))
+    else:
+        slope_se = intercept_se = float("nan")
+
     return KoutieckyLevichFit(
         potential=float("nan"), slope=float(slope), intercept=float(intercept),
-        r_squared=r_squared, n_rotation_rates=len(rpm_arr),
+        r_squared=r_squared, n_rotation_rates=k,
+        slope_stderr=slope_se, intercept_stderr=intercept_se,
     )
 
 
@@ -410,9 +567,30 @@ def levich_slope_to_n(kl_slope: float, diffusion_coeff_cm2_s: float,
     """Electron-transfer number ``n`` from a Koutecky-Levich slope
     (``1/B``) and the electrolyte's O2 transport parameters:
     ``n = B / (0.62 * F * D^(2/3) * nu^(-1/6) * C)``."""
-    if kl_slope == 0:
+    if kl_slope == 0 or not np.isfinite(kl_slope):
         return None
     b = 1.0 / kl_slope
     denom = (0.62 * faraday_c_per_mol * diffusion_coeff_cm2_s ** (2 / 3)
              * kinematic_viscosity_cm2_s ** (-1 / 6) * bulk_concentration_mol_cm3)
-    return None if denom == 0 else float(b / denom)
+    # Magnitude: fit_koutecky_levich already works on |j|, so a negative n
+    # here could only come from a caller passing a signed slope. n is an
+    # electron count and is always reported positive.
+    return None if denom == 0 else float(abs(b / denom))
+
+
+def levich_current_density(n_electrons: float, rpm: float,
+                           diffusion_coeff_cm2_s: float,
+                           kinematic_viscosity_cm2_s: float,
+                           bulk_concentration_mol_cm3: float,
+                           faraday_c_per_mol: float = FARADAY_C_PER_MOL) -> float:
+    """Ideal Levich (fully mass-transport-limited) current density in A/cm^2:
+    ``j_lim = B * omega^0.5`` with ``B = 0.62 n F D^(2/3) nu^(-1/6) C``.
+
+    The quickest sanity check on an RDE data set: if the measured plateau at
+    1600 rpm is nowhere near the 4-electron value, the discrepancy is in the
+    units, the electrode area, or the electrolyte parameters -- not in the fit.
+    """
+    b = (0.62 * float(n_electrons) * faraday_c_per_mol
+         * diffusion_coeff_cm2_s ** (2 / 3)
+         * kinematic_viscosity_cm2_s ** (-1 / 6) * bulk_concentration_mol_cm3)
+    return float(b * np.sqrt(angular_velocity(rpm)))

@@ -425,17 +425,27 @@ def infer_reaction(potential: np.ndarray, current: np.ndarray,
     if len(pot) < 3:
         return ReactionGuess(default, "low", "too few points to judge")
 
-    # Judge the sign where current is genuinely flowing: the top decile of
-    # |current| avoids the near-OCP region, where noise and capacitive
-    # charging flip the sign at random.
     mag = np.abs(cur)
     if not np.isfinite(mag).any() or float(np.max(mag)) <= 0:
         return ReactionGuess(default, "low", "current is zero throughout")
-    active = mag >= np.nanpercentile(mag, 90)
-    signed = float(np.nanmedian(cur[active]))
-    cathodic = signed < 0
+    peak = float(np.nanmax(mag))
 
-    # The potential range over which the reaction is actually running.
+    # Sign is judged on the top decile of |current| only: near the
+    # open-circuit crossover, noise and capacitive charging flip the sign at
+    # random, so anywhere else risks reading the wrong direction entirely.
+    strong = mag >= np.nanpercentile(mag, 90)
+    cathodic = float(np.nanmedian(cur[strong])) < 0
+
+    # The *window* uses a much lower bar — everything above 5 % of the peak.
+    # The two thresholds answer different questions: an exponential Tafel
+    # branch spends most of its potential range at small current, so the top
+    # decile is only its extreme tip. Using that tip as the window put an HOR
+    # sweep's apparent range up at the end of the scan instead of at the
+    # H2/H+ equilibrium it starts from, and the reaction came out
+    # unidentified. 5 % of peak captures the branch from its onset.
+    active = mag >= 0.05 * peak
+    if not active.any():
+        active = strong
     e_active = pot[active]
     e_lo, e_hi = float(np.nanmin(e_active)), float(np.nanmax(e_active))
     e_mid = float(np.nanmedian(e_active))
@@ -477,10 +487,14 @@ def infer_reaction(potential: np.ndarray, current: np.ndarray,
             "OER", "medium",
             f"anodic current reaching {e_hi:.2f} V vs RHE — past the OER onset",
         )
-    if e_mid <= 0.25:
+    # HOR is identified by where the current *starts*, not where it peaks:
+    # it is the only anodic reaction already passing current at the H2/H+
+    # equilibrium, and its branch then climbs well past 0 V.
+    if e_lo <= 0.25:
         return ReactionGuess(
             "HOR", "high",
-            f"anodic current at {window}, at/just above the H₂/H⁺ equilibrium (0 V)",
+            f"anodic current from {e_lo:.2f} V vs RHE — already flowing at "
+            "the H₂/H⁺ equilibrium (0 V), which only H₂ oxidation does",
         )
     return ReactionGuess(
         default, "low",
