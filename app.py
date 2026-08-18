@@ -69,19 +69,19 @@ CITATION_BIBTEX = (
 
 
 def render_citation() -> None:
-    """Show a 'cite this app' block in the sidebar."""
+    """Show an always-visible 'cite this app' block in the sidebar."""
     st.sidebar.divider()
-    with st.sidebar.expander("📚 Cite this app"):
-        st.markdown(
-            "If this tool supports your work, please cite it "
-            f"([repository]({REPO_URL})):"
-        )
-        st.markdown(f"> {CITATION_TEXT}")
-        st.code(CITATION_BIBTEX, language="bibtex")
-        st.caption(
-            "Machine-readable metadata: CITATION.cff. A versioned release can "
-            "be archived on Zenodo to obtain a citable DOI."
-        )
+    st.sidebar.header("📚 Cite this app")
+    st.sidebar.markdown(
+        "If this tool supports your work, please cite it "
+        f"([repository]({REPO_URL})):"
+    )
+    st.sidebar.markdown(f"> {CITATION_TEXT}")
+    st.sidebar.code(CITATION_BIBTEX, language="bibtex")
+    st.sidebar.caption(
+        "Machine-readable metadata: CITATION.cff. A versioned release can "
+        "be archived on Zenodo to obtain a citable DOI."
+    )
 
 
 def require_access() -> bool:
@@ -1157,7 +1157,7 @@ def render_lsv_tab(lsv_d, ru: float | None, current_unit: str = "mA",
         if not factors:
             st.info("Select at least one compensation factor.")
             return
-        style = plot_style_controls("lsvir", show_markers=False)
+        style = plot_style_controls("lsvir", show_markers=False, default_n_ticks=4)
         font_size = style["font_size"]
         st.caption(
             "E_corrected = E_measured − (factor) · I · Ru. 100 % is full "
@@ -1285,29 +1285,32 @@ def render_lsv_tab(lsv_d, ru: float | None, current_unit: str = "mA",
         fig.update_xaxes(range=x_range)
         fig.update_yaxes(range=y_range)
 
-        # Legend at the bottom so it never overlaps the title / subplot titles.
+        # Legend position follows the "Legend" control above (default
+        # outside-right, clear of the title / subplot titles / traces) and
+        # stays draggable in the browser either way (_PLOTLY_EDIT_CONFIG).
         # Journal style (Arial, box-border axes) applied globally, which
         # works for both the single-axes overlay and the two-panel
         # side-by-side view (update_xaxes/update_yaxes with no row/col
         # target every axis in the figure).
+        lsvir_small_font = {"family": "Arial", "size": max(11, round(font_size * 0.55))}
+        lsvir_legend = _legend_layout(style, lsvir_small_font)
+        lsvir_position = style.get("legend_position", "outside-right")
         fig.update_layout(
             template="plotly_white",
             height=470,
             font={"family": "Arial", "size": font_size},
             title={"y": 0.97, "yanchor": "top"},
-            legend={"orientation": "h", "yanchor": "top", "y": -0.18,
-                    "xanchor": "center", "x": 0.5,
-                    "font": {"family": "Arial",
-                             "size": max(11, round(font_size * 0.55))},
-                    "bgcolor": "rgba(255,255,255,0.7)"},
-            margin=_journal_margin(font_size, legend_below=True),
+            showlegend=lsvir_legend is not None,
+            **({"legend": lsvir_legend} if lsvir_legend is not None else {}),
+            margin={**_journal_margin(font_size, legend_below=(lsvir_position == "below")),
+                    **_legend_margin_extra(style)},
             hovermode="x unified",
             hoverlabel={"font": {"family": "Arial", "size": 12}},
         )
         fig.update_xaxes(showspikes=True, spikemode="across",
                          spikethickness=1, spikedash="dot",
-                         spikecolor="#888", **_BOX_AXIS_STYLE)
-        fig.update_yaxes(**_BOX_AXIS_STYLE)
+                         spikecolor="#888", **_axis_style(style))
+        fig.update_yaxes(**_axis_style(style))
         st.plotly_chart(fig, width="stretch", config=_PLOTLY_EDIT_CONFIG)
         fac_png = "-".join(str(int(r.factor_percent)) for r in results)
         slug = re.sub(r"\W+", "_", sample_label).strip("_").lower()
@@ -1485,7 +1488,9 @@ _LEGEND_POSITIONS = ["top-left", "top-right", "bottom-left", "bottom-right",
 
 
 def plot_style_controls(key_prefix: str, *, default_palette: str = "Default (Plotly)",
-                        show_markers: bool = True) -> dict:
+                        show_markers: bool = True,
+                        default_legend: str = "outside-right",
+                        default_n_ticks: int = 5) -> dict:
     """Render the shared "Plot appearance" panel and return a style dict.
 
     Every tab's figures read their fonts, colours, line/marker geometry, grid
@@ -1517,8 +1522,12 @@ def plot_style_controls(key_prefix: str, *, default_palette: str = "Default (Plo
                  "can still be overridden below.",
         )
         style["legend_position"] = c4.selectbox(
-            "Legend", _LEGEND_POSITIONS, index=0,
+            "Legend", _LEGEND_POSITIONS,
+            index=_LEGEND_POSITIONS.index(default_legend),
             key=f"{key_prefix}_legend_pos",
+            help="Drag the legend on the chart itself to fine-tune; this "
+                 "only sets where it starts. 'outside-right' (default) sits "
+                 "clear of the data so nothing is hidden behind it.",
         )
 
         d1, d2, d3, d4 = st.columns(4)
@@ -1550,7 +1559,7 @@ def plot_style_controls(key_prefix: str, *, default_palette: str = "Default (Plo
             help="Closed box (all four axis lines), the usual journal style.",
         )
         style["n_ticks"] = e3.slider(
-            "Approx. tick count", 3, 12, 5, 1, key=f"{key_prefix}_nticks",
+            "Approx. tick count", 3, 12, default_n_ticks, 1, key=f"{key_prefix}_nticks",
         )
         style["show_title"] = e4.checkbox(
             "Show plot title", value=True, key=f"{key_prefix}_show_title",
@@ -1567,7 +1576,7 @@ def _default_style() -> dict:
     return {
         "font_family": "Arial", "font_size": 28,
         "palette_name": "Default (Plotly)", "palette": _PALETTES["Default (Plotly)"],
-        "legend_position": "top-left", "line_width": 2.5, "marker_size": 8,
+        "legend_position": "outside-right", "line_width": 2.5, "marker_size": 8,
         "marker_symbol": "circle", "fit_dash": "dot", "show_grid": False,
         "mirror_axes": True, "n_ticks": 5, "show_title": True,
     }
@@ -1601,6 +1610,33 @@ _LEGEND_ANCHORS = {
 }
 
 
+def _legend_layout(style: dict, font: dict) -> dict | None:
+    """Legend kwargs for one figure, from a :func:`plot_style_controls` dict.
+
+    ``None`` means "hidden" (caller should set ``showlegend=False``).
+    Shared by :func:`apply_plot_style` and the few hand-built figures (LSV
+    iR Correction, LSV Analysis' Original LSV and Tafel plots) that set
+    their own ``fig.update_layout`` for hover/dragmode reasons -- so every
+    figure's legend obeys the same "Legend" dropdown and stays draggable
+    (see ``_PLOTLY_EDIT_CONFIG``) instead of only some of them.
+    """
+    position = style.get("legend_position", "outside-right")
+    if position == "hidden":
+        return None
+    return dict(**_LEGEND_ANCHORS[position], font=font,
+               bgcolor="rgba(255,255,255,0.7)", tracegroupgap=18)
+
+
+def _legend_margin_extra(style: dict) -> dict:
+    """Extra right margin so an "outside-right" legend is never clipped.
+
+    Mirrors the fixed 170 px :func:`apply_plot_style` reserves; a separate
+    helper so the hand-built figures listed in :func:`_legend_layout` above
+    reserve the same room without going through that function.
+    """
+    return {"r": 170} if style.get("legend_position") == "outside-right" else {}
+
+
 def apply_plot_style(fig, style: dict, xtitle: str, ytitle: str,
                      height: int = 460, yrange: list | None = None,
                      title: str | None = None) -> None:
@@ -1613,12 +1649,14 @@ def apply_plot_style(fig, style: dict, xtitle: str, ytitle: str,
     family, size = style["font_family"], int(style["font_size"])
     axis_font = {"family": family, "size": size}
     small_font = {"family": family, "size": max(9, round(size * 0.55))}
-    position = style.get("legend_position", "top-left")
+    position = style.get("legend_position", "outside-right")
 
+    legend_kwargs = _legend_layout(style, small_font)
     layout = {
         "template": "plotly_white",
         "height": height,
         "font": axis_font,
+        "showlegend": legend_kwargs is not None,
         # 10 px is not enough room for a tick label, let alone an axis title:
         # every exported figure came out with its y-axis numbers and both axis
         # titles clipped at the edge. One derivation for every figure, so the
@@ -1627,14 +1665,10 @@ def apply_plot_style(fig, style: dict, xtitle: str, ytitle: str,
         "margin": {**_journal_margin(
             size, legend_below=(position == "below"),
             titled=bool(title and style.get("show_title"))),
-            **({"r": 170} if position == "outside-right" else {})},
+            **_legend_margin_extra(style)},
     }
-    if position == "hidden":
-        layout["showlegend"] = False
-    else:
-        layout["legend"] = dict(**_LEGEND_ANCHORS[position], font=small_font,
-                                bgcolor="rgba(255,255,255,0.7)",
-                                tracegroupgap=18)
+    if legend_kwargs is not None:
+        layout["legend"] = legend_kwargs
     if title and style.get("show_title"):
         layout["title"] = {"text": title, "font": axis_font}
     fig.update_layout(**layout)
@@ -2489,7 +2523,7 @@ def render_tafel_tab() -> None:
             "('Convert ... to current density' above)."
         )
 
-    style = plot_style_controls("tafel")
+    style = plot_style_controls("tafel", default_n_ticks=4)
     font_size = style["font_size"]
     _PALETTE_T = style["palette"]
 
@@ -2528,6 +2562,65 @@ def render_tafel_tab() -> None:
     # visually above the sliders while the sliders themselves render closer
     # to the Tafel plot they actually control.
     lsv_plot_slot = st.container()
+
+    # Shared default Tafel window: every sample's fit range starts at
+    # [E_onset, E_onset + span], anchored on the onset of the *least active*
+    # sample in the current selection (whichever one needs the largest
+    # overpotential -- the biggest |E_onset - E_rest| -- before current
+    # departs from baseline) rather than each sample's own onset. That keeps
+    # every default window over the same absolute potentials, so overlaid
+    # curves are compared on a common footing instead of each drifting to
+    # wherever its own kinetics happen to start. "Above" onset means further
+    # in the direction the sweep actually grows the overpotential (works the
+    # same for a cathodic HER/ORR curve, where that is *more negative*
+    # potential, and an anodic OER/HOR one, where it is more positive) --
+    # not necessarily numerically larger. Still just a default: the
+    # per-sample slider below, or a box-select on the Tafel plot, overrides
+    # it exactly as before.
+    span_col, _ = st.columns([1, 3])
+    tafel_span_v = span_col.number_input(
+        "Default Tafel window span above onset (V)",
+        min_value=0.02, max_value=1.0, value=0.20, step=0.01, format="%.2f",
+        key="tafel_default_span_v",
+        help="Each sample's default fit range is [E_onset, E_onset + this "
+             "span], with E_onset taken from the least active sample in the "
+             "current selection (the one needing the largest overpotential "
+             "to turn on) so every default window sits over the same "
+             "potentials. Only sets the starting point -- drag a slider "
+             "below, or box-select on the Tafel plot, to fine-tune any one "
+             "sample.",
+    )
+    ref_window = None
+    _onset_candidates = []
+    for lbl, d in chosen_series:
+        mask = d.current != 0
+        if not mask.any():
+            continue
+        pot_raw = to_rhe_fn(d.potential[mask])
+        cur_scaled = _rescale_current(d.current[mask], native_unit, current_unit)
+        cur_raw = cur_scaled / area_cm2 if convert_density else cur_scaled
+        pot_s, cur_s = sweep.clean_sweep(pot_raw, cur_raw)
+        if len(pot_s) < 4:
+            continue
+        pot_o, cur_o = sweep.orient_rest_first(pot_s, cur_s)
+        try:
+            onset_v = tafel.onset_potential(pot_o, cur_o)
+        except ValueError:
+            continue
+        rest_v = float(pot_o[0])
+        overpotential = abs(onset_v - rest_v)
+        direction = 1 if pot_o[-1] >= rest_v else -1
+        _onset_candidates.append((lbl, onset_v, overpotential, direction))
+    if _onset_candidates:
+        ref_lbl, ref_onset, _, ref_dir = max(_onset_candidates, key=lambda t: t[2])
+        ref_window = tuple(sorted([ref_onset, ref_onset + ref_dir * tafel_span_v]))
+        st.caption(
+            f"↳ Default Tafel window: **{ref_window[0]:.3f} – "
+            f"{ref_window[1]:.3f} V vs RHE** — onset of the least active "
+            f"sample (**{ref_lbl}**) + {tafel_span_v:g} V. Per-sample "
+            "sliders below start here; drag any of them, or a sample's own "
+            "reaction/range override, to change just that one."
+        )
 
     fits = []
     with st.expander(
@@ -2574,9 +2667,21 @@ def render_tafel_tab() -> None:
             # from a previous run wins over the fresh guess).
             reaction_for_range = st.session_state.get(reaction_key, seeded)
             e_eq_for_range = tafel.REACTION_E_EQ_V_RHE.get(reaction_for_range)
-            a0, a1 = tafel.auto_tafel_range(
-                pot, log_i, current=cur, e_eq=e_eq_for_range
-            )
+            # Map the shared [onset, onset + span] window (see above) onto
+            # this sample's own index space; only fall back to the old
+            # R^2-grown auto-detect when that window doesn't land on at
+            # least a handful of this sample's own points (e.g. a sample
+            # whose sweep never reaches that potential).
+            a0 = a1 = None
+            if ref_window is not None:
+                in_window = (pot >= ref_window[0]) & (pot <= ref_window[1])
+                idx = np.flatnonzero(in_window)
+                if len(idx) >= 3:
+                    a0, a1 = int(idx.min()), int(idx.max()) + 1
+            if a0 is None:
+                a0, a1 = tafel.auto_tafel_range(
+                    pot, log_i, current=cur, e_eq=e_eq_for_range
+                )
             range_key = f"tafel_range_{slug}"
             if apply_selection:
                 try:
@@ -2707,25 +2812,28 @@ def render_tafel_tab() -> None:
                 legendgroup=meta["reaction"],
                 line={"color": meta["color"], "width": 3},
             ))
+        orig_lsv_legend = _legend_layout(style, small_font)
+        orig_lsv_position = style.get("legend_position", "outside-right")
         lsv_fig.update_layout(
             title=({"text": "Original LSV",
                     "font": {"family": style["font_family"], "size": font_size}}
                    if style.get("show_title") else None),
             template="plotly_white", height=460, font=axis_font,
-            legend={"x": 0.02, "y": 0.98, "xanchor": "left",
-                    "yanchor": "top", "font": small_font,
-                    "bgcolor": "rgba(255,255,255,0.7)", "tracegroupgap": 18},
-            margin=_journal_margin(font_size,
-                                   titled=bool(style.get("show_title"))),
+            showlegend=orig_lsv_legend is not None,
+            **({"legend": orig_lsv_legend} if orig_lsv_legend is not None else {}),
+            margin={**_journal_margin(
+                font_size, legend_below=(orig_lsv_position == "below"),
+                titled=bool(style.get("show_title"))),
+                **_legend_margin_extra(style)},
         )
         lsv_fig.update_xaxes(
             title={"text": "Potential vs RHE / V", "font": {"family": "Arial", "size": font_size}},
-            tickfont={"family": "Arial", "size": font_size}, **_BOX_AXIS_STYLE,
+            tickfont={"family": "Arial", "size": font_size}, **_axis_style(style),
         )
         lsv_fig.update_yaxes(
             title={"text": f"Current ({display_unit})",
                    "font": {"family": "Arial", "size": font_size}},
-            tickfont={"family": "Arial", "size": font_size}, **_BOX_AXIS_STYLE,
+            tickfont={"family": "Arial", "size": font_size}, **_axis_style(style),
         )
         if lsv_x_range is not None:
             lsv_fig.update_xaxes(range=lsv_x_range)
@@ -2839,6 +2947,8 @@ def render_tafel_tab() -> None:
         f"Tafel plot — {' & '.join(distinct_reactions)}" if multi_reaction
         else "Tafel plot"
     )
+    tafel_legend = _legend_layout(style, small_font)
+    tafel_legend_position = style.get("legend_position", "outside-right")
     fig.update_layout(
         title=({"text": title_text,
                 "font": {"family": style["font_family"], "size": font_size}}
@@ -2846,26 +2956,28 @@ def render_tafel_tab() -> None:
         template="plotly_white",
         height=560,
         font=axis_font,  # baseline (inherited by legend/annotations unless overridden)
-        legend={"x": 0.02, "y": 0.98, "xanchor": "left",
-                "yanchor": "top", "font": small_font,
-                "bgcolor": "rgba(255,255,255,0.7)", "tracegroupgap": 18},
-        margin=_journal_margin(font_size,
-                               titled=bool(style.get("show_title"))),
+        showlegend=tafel_legend is not None,
+        **({"legend": tafel_legend} if tafel_legend is not None else {}),
+        margin={**_journal_margin(
+            font_size, legend_below=(tafel_legend_position == "below"),
+            titled=bool(style.get("show_title"))),
+            **_legend_margin_extra(style)},
         dragmode="select",
     )
     # Axis titles/ticks are the "axes" text: always the full 28/36 pt Arial.
-    # A sparse tick count (~4-5, via _BOX_AXIS_STYLE) keeps a publication-
-    # style plot uncluttered.
+    # Tick density and box-frame follow the shared style (see _axis_style) --
+    # a sparse count (default 4 for this tab) keeps a publication-style plot
+    # uncluttered.
     fig.update_xaxes(
         title={"text": f"log₁₀ |Current| ({display_unit})",
                "font": {"family": "Arial", "size": font_size}},
         tickfont={"family": "Arial", "size": font_size}, range=tafel_x_range,
-        **_BOX_AXIS_STYLE,
+        **_axis_style(style),
     )
     fig.update_yaxes(
         title={"text": "Potential vs RHE / V", "font": {"family": "Arial", "size": font_size}},
         tickfont={"family": "Arial", "size": font_size}, range=tafel_y_range,
-        **_BOX_AXIS_STYLE,
+        **_axis_style(style),
     )
     st.caption(
         "🖱️ Drag a box around a sample's linear region to set its fit range "
@@ -3068,11 +3180,11 @@ def render_tafel_tab() -> None:
                     font_size, titled=bool(style.get("show_title"))),
             )
             fig_bar.update_xaxes(
-                tickfont={"family": "Arial", "size": font_size}, **_BOX_AXIS_STYLE,
+                tickfont={"family": "Arial", "size": font_size}, **_axis_style(style),
             )
             fig_bar.update_yaxes(
                 title={"text": ylabel, "font": {"family": "Arial", "size": font_size}},
-                tickfont={"family": "Arial", "size": font_size}, **_BOX_AXIS_STYLE,
+                tickfont={"family": "Arial", "size": font_size}, **_axis_style(style),
             )
             st.plotly_chart(fig_bar, width="stretch", config=_PLOTLY_EDIT_CONFIG)
             figure_downloads(
@@ -4767,6 +4879,207 @@ def render_orr_tab() -> None:
 
 
 # --------------------------------------------------------------------------- #
+# Tutorials / key equations / references                                      #
+# --------------------------------------------------------------------------- #
+def render_tutorials_tab() -> None:
+    """Static reference material: what each tab computes, the equation
+    behind it, and where it comes from in the literature.
+
+    Content-only — no data, no widgets that feed the analysis tabs — kept in
+    its own tab so a reader can check a formula or a citation without
+    hunting through the module docstrings.
+    """
+    st.subheader("Tutorials & key equations")
+    st.caption(
+        "What each tab computes and the equation behind it, for citing your "
+        "own methods section or sanity-checking a fitted value by hand."
+    )
+
+    with st.expander("Overall workflow", expanded=True):
+        st.markdown(
+            "1. **EIS / Ru Analysis** — fit the Nyquist arc's high-frequency "
+            "intercept to get the uncompensated resistance Ru (and Rct).\n"
+            "2. **LSV iR Correction** — apply Ru to a polarization curve: "
+            "`E_corrected = E_measured − factor · I · Ru`.\n"
+            "3. **LSV Analysis** — onset potential, benchmark overpotentials, "
+            "and the Tafel slope of the (iR-corrected, if you ran step 2) "
+            "curve.\n"
+            "4. **K-L Analysis** — Koutecký–Levich fit across ≥ 3 rotation "
+            "rates for the kinetic current density and electron number n.\n"
+            "5. **ORR / RRDE Analysis** — onset, E½, mass-transport-"
+            "corrected Tafel slope, and (with ring data) n and %H₂O₂ "
+            "directly from one rotation rate."
+        )
+
+    with st.expander("EIS / Ru Analysis — extracting Ru from the Nyquist arc"):
+        st.markdown(
+            "In a Nyquist plot (−Z″ vs Z′) a charge-transfer process appears "
+            "as a semicircle. Its **high-frequency real-axis intercept is "
+            "Ru** (the uncompensated / solution resistance); the "
+            "low-frequency intercept is Ru + Rct. This tab fits a circle to "
+            "the arc you select and extrapolates it to the real axis — the "
+            "reported Ru is that crossing, not necessarily a measured "
+            "point."
+        )
+        st.caption(
+            "Reference: A. J. Bard, L. R. Faulkner, *Electrochemical "
+            "Methods: Fundamentals and Applications*, 2nd ed., Wiley, 2001, "
+            "Ch. 10."
+        )
+
+    with st.expander("LSV iR Correction — removing the ohmic drop"):
+        st.markdown("The measured potential includes an ohmic loss I·Ru:")
+        st.latex(r"E_{\text{applied}} = E_{\text{true}} + I \cdot R_u")
+        st.markdown("so the corrected potential is")
+        st.latex(
+            r"E_{\text{corrected}} = E_{\text{measured}} - "
+            r"\text{factor} \cdot I \cdot R_u"
+        )
+        st.markdown(
+            "`factor` is the compensation fraction (5–100 %; 85 % is the "
+            "recommended default). 100 % is full correction; partial "
+            "compensation emulates safe positive-feedback compensation and "
+            "guards against over-correction/oscillation when Ru is "
+            "uncertain. `I·Ru` must resolve to volts — either absolute "
+            "current (A) with Ru in Ω, or current density (A/cm²) with Ru "
+            "in Ω·cm²; the electrode area reconciles the two when they "
+            "don't match."
+        )
+        st.caption("Reference: Bard & Faulkner, *op. cit.*, Ch. 1, §1.3.4.")
+
+    with st.expander("LSV Analysis — onset, benchmarks, and the Tafel slope"):
+        st.markdown(
+            "The Tafel equation relates potential to the log of current in "
+            "the activation-controlled (kinetic) region of a polarization "
+            "curve:"
+        )
+        st.latex(r"E = a + b \cdot \log_{10}|i|")
+        st.markdown(
+            "`b` — the **Tafel slope** (mV/decade) — comes from a linear "
+            "regression of E against log₁₀|i| restricted to that kinetic "
+            "region; mass-transport limitation at high current and "
+            "background/capacitive noise near the rest potential both curve "
+            "away from the line and must be excluded. This tab's fit-range "
+            "sliders default to **[E_onset, E_onset + span]**, where "
+            "E_onset is the onset potential of the *least active* sample in "
+            "the current selection (the one needing the largest "
+            "overpotential to turn on) and *span* is user-set — so every "
+            "sample's default window sits over the same potentials before "
+            "you fine-tune any one of them."
+        )
+        st.markdown(
+            "**Onset potential** is where |current| first departs from the "
+            "flat pre-onset baseline. **Overpotential at a benchmark "
+            "current density** (e.g. η at j = 10 mA/cm², the standard "
+            "OER/HER activity metric) is η = |E − E_eq| at the interpolated "
+            "potential where |j| first reaches the target, using each "
+            "sample's own reaction equilibrium potential E_eq."
+        )
+        st.markdown(
+            "The fitted slope is matched against canonical mechanistic "
+            "values (e.g. ~30/40/120 mV/dec for HER's Volmer–Heyrovsky–"
+            "Tafel steps; ~40/60/120 mV/dec for OER) as a guide to the "
+            "likely rate-determining step — a guide, not proof, since real "
+            "catalysts often show intermediate or potential-dependent "
+            "slopes."
+        )
+        st.caption(
+            "References: J. Tafel, *Z. Phys. Chem.* **1905**, *50*, 641 "
+            "(original relation); Bard & Faulkner, *op. cit.*, Ch. 3, "
+            "§3.4; C. C. L. McCrory et al., *J. Am. Chem. Soc.* **2013**, "
+            "*135*, 16977, and **2015**, *137*, 4347 (HER/OER/ORR "
+            "benchmarking practice — target current densities, RHE "
+            "conversion, iR correction)."
+        )
+
+    with st.expander("K-L Analysis — Koutecký–Levich fit"):
+        st.markdown(
+            "At a fixed potential, the reciprocal current density across "
+            "several rotation rates ω (rad/s) follows:"
+        )
+        st.latex(
+            r"\frac{1}{j} = \frac{1}{j_k} + "
+            r"\frac{1}{B \cdot \omega^{1/2}}"
+        )
+        st.markdown(
+            "A linear fit of 1/j vs ω⁻¹ᐟ² gives the intercept 1/j_k (the "
+            "kinetic current density, free of mass-transport limitation) "
+            "and the slope 1/B, where the Levich constant is"
+        )
+        st.latex(
+            r"B = 0.62 \, n \, F \, D^{2/3} \, \nu^{-1/6} \, C"
+        )
+        st.markdown(
+            "with n the electron-transfer number, F the Faraday constant, "
+            "D the O₂ diffusion coefficient, ν the kinematic viscosity, and "
+            "C the bulk O₂ solubility — so once D, ν, C are set for the "
+            "electrolyte, the fitted slope gives n directly. ω = 2π·rpm/60."
+        )
+        st.caption(
+            "References: J. Koutecký, V. G. Levich, *Zh. Fiz. Khim.* "
+            "**1958**, *32*, 1565 (original derivation); V. G. Levich, "
+            "*Physicochemical Hydrodynamics*, Prentice-Hall, 1962; Bard & "
+            "Faulkner, *op. cit.*, Ch. 9, §9.3."
+        )
+
+    with st.expander("ORR / RRDE Analysis — E½, electron number, %H₂O₂"):
+        st.markdown(
+            "**Half-wave potential** E½ is the steepest point of the disk "
+            "current vs potential curve (max |dI/dE|), searched within a "
+            "window past onset. From simultaneous ring and disk current at "
+            "one rotation rate:"
+        )
+        st.latex(
+            r"n = \frac{4\,|I_d|}{|I_d| + |I_r| / N}"
+            r"\qquad\qquad"
+            r"\%\mathrm{H_2O_2} = \frac{200\,(|I_r| / N)}"
+            r"{|I_d| + |I_r| / N}"
+        )
+        st.markdown(
+            "where I_d, I_r are the disk and ring currents (or current "
+            "densities — the ratio is scale-invariant) and N is the ring "
+            "collection efficiency, determined separately (e.g. from a "
+            "ferro-/ferricyanide redox couple) and specific to each RRDE "
+            "tip geometry. n = 4 and %H₂O₂ = 0 correspond to the ideal "
+            "4-electron pathway (water); n = 2 corresponds to the "
+            "2-electron peroxide pathway."
+        )
+        st.caption(
+            "Reference: Bard & Faulkner, *op. cit.*, Ch. 9, §9.4; O₂/"
+            "electrolyte transport parameter defaults (D, ν, C) after "
+            "Zhou et al., *J. Mater. Chem. A* **2016**, *4*, 1810, and "
+            "Bard & Faulkner Table 9.3.1 — check against your own "
+            "electrolyte when precision matters."
+        )
+
+    with st.expander("Reference electrodes & the RHE conversion"):
+        st.markdown(
+            "Every tab that plots potential converts to the reversible "
+            "hydrogen electrode (RHE) scale, which removes the pH "
+            "dependence of the reference and is the community convention "
+            "for comparing HER/OER/ORR data across labs and electrolytes:"
+        )
+        st.latex(
+            r"E_{\text{RHE}} = E_{\text{measured}} + "
+            r"E^{\circ}_{\text{ref vs. NHE}} + 0.0592 \times \text{pH}"
+        )
+        st.markdown(
+            "(0.0592 V/pH at 25 °C = RT·ln10/F; see the sidebar's Nernst "
+            "slope note for other temperatures.) If your reference is "
+            "already reported vs. RHE directly, use the SHE/NHE option "
+            "with pH = 0 rather than double-converting."
+        )
+        st.caption("Reference: Bard & Faulkner, *op. cit.*, Ch. 2, §2.1.")
+
+    st.divider()
+    st.caption(
+        "This tab is a working reference, not a substitute for reading the "
+        "primary literature above — always check a formula or benchmark "
+        "against the source before quoting it in a manuscript."
+    )
+
+
+# --------------------------------------------------------------------------- #
 # Main                                                                         #
 # --------------------------------------------------------------------------- #
 def main():
@@ -4781,9 +5094,9 @@ def main():
 
     _clear_reset_control()
 
-    tab_eis, tab_lsv, tab_tafel, tab_kl, tab_orr = st.tabs(
+    tab_eis, tab_lsv, tab_tafel, tab_kl, tab_orr, tab_tutorials = st.tabs(
         ["📈 EIS / Ru Analysis", "🔬 LSV iR Correction", "📐 LSV Analysis",
-         "📉 K-L Analysis", "⚛️ ORR / RRDE Analysis"]
+         "📉 K-L Analysis", "⚛️ ORR / RRDE Analysis", "🎓 Tutorials"]
     )
 
     with tab_eis:
@@ -4866,6 +5179,9 @@ def main():
 
     with tab_orr:
         render_orr_tab()
+
+    with tab_tutorials:
+        render_tutorials_tab()
 
     render_citation()
     st.divider()
