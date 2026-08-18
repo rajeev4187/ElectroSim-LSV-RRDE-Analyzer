@@ -346,19 +346,15 @@ def figure_downloads(fig, stem: str, key: str, what: str = "figure",
 
     Image rendering is server-side (kaleido + Pillow) and launches a headless
     browser per call, so it must not run on every script rerun -- it would
-    fire on every unrelated widget interaction, e.g. dragging a slider. It is
-    therefore deferred into the download button's own ``data`` callable, which
-    Streamlit runs on click (on its own thread) rather than while laying the
-    page out.
+    fire on every unrelated widget interaction, e.g. dragging a slider. It
+    runs when the user presses "Render", and the bytes are held in
+    session_state for the download button beside it.
 
-    That deferral replaced a two-step "Prepare, then download" flow whose
-    prepared bytes lived in session_state behind a figure signature. The cache
-    had to be invalidated whenever the figure or the render settings changed,
-    which is *most* interactions in this app -- so the download button
-    routinely vanished between preparing a figure and clicking it, and the
-    only way back was to render the whole thing again. Rendering at click time
-    has no cache to go stale: the bytes are always the figure currently on
-    screen, at the settings currently chosen.
+    That button is never withdrawn once something has been rendered. It used
+    to disappear as soon as the figure or the render settings changed, which
+    is most interactions here, so it routinely vanished in the gap between
+    rendering a figure and reaching for it; now a caption says the file is
+    behind and leaves the download in place.
 
     The HTML and CSV exports need no external renderer and are therefore
     always available -- they are the fallback when kaleido/Chrome is
@@ -426,31 +422,64 @@ def figure_downloads(fig, stem: str, key: str, what: str = "figure",
                     "leaving little room for the plot itself — lower **Axis "
                     "font size** in the plot-appearance panel."
                 )
-            # Rendered on click, not on layout: kaleido spawns a headless
-            # browser and takes seconds, which is far too slow to repeat on
-            # every rerun of every figure on the page. The closure captures
-            # this rerun's figure and settings, so whatever is downloaded is
-            # what was on screen when the button was clicked.
-            def _render_now(_fig=export_fig, _fmt=fmt, _w=int(out_w),
-                            _h=int(out_h), _dpi=int(dpi), _what=what) -> bytes:
+            # Render on the button press, into session_state, and hand the
+            # finished bytes to a download button.
+            #
+            # Not st.download_button(data=<callable>): Streamlit defers such a
+            # callable through the media file manager, which mints a new
+            # placeholder id on *every script rerun*. In this app all but the
+            # rarest interaction reruns the script, so the id behind the button
+            # was routinely replaced between the page rendering and the click
+            # landing, and the download failed with nothing to show for it.
+            # Materialised bytes cannot be invalidated that way.
+            #
+            # Kaleido spawns a headless browser and takes seconds, which is why
+            # this cannot simply run on every rerun.
+            state_key = f"_export_{key}"
+            settings = (fmt, int(dpi), int(out_w), int(out_h))
+            if st.button(f"🖼️ Render {what} ({fmt.upper()})",
+                         key=f"_img_prep_{key}", width="stretch"):
                 try:
-                    return _render_export(_fig, _fmt, _w, _h, _dpi)
+                    with st.spinner(f"Rendering {fmt.upper()}…"):
+                        st.session_state[state_key] = {
+                            "bytes": _render_export(export_fig, fmt,
+                                                    int(out_w), int(out_h),
+                                                    int(dpi)),
+                            "sig": sig, "settings": settings,
+                            "ext": fmt, "mime": mime, "error": None,
+                        }
                 except Exception as exc:  # kaleido missing / no Chrome
-                    # Raising beats handing back a zero-byte file the user
-                    # only discovers is broken after opening it.
-                    raise RuntimeError(
-                        f"Could not render the {_what} as {_fmt.upper()}: "
-                        f"{exc}. The HTML download beside this button, and "
-                        "the 📷 icon on the chart itself, need no renderer."
-                    ) from exc
+                    st.session_state[state_key] = {
+                        "bytes": None, "sig": sig, "settings": settings,
+                        "ext": fmt, "mime": mime, "error": str(exc),
+                    }
 
-            st.download_button(
-                f"⬇️ {what} ({fmt.upper()})", data=_render_now,
-                file_name=f"{stem}.{fmt}", mime=mime,
-                key=f"_img_dl_{key}", width="stretch",
-                help="Rendered when you click, at the size and resolution "
-                     "set above — always the figure currently on screen.",
-            )
+            cached = st.session_state.get(state_key) or {}
+            if cached.get("bytes"):
+                # The button stays put once something has been rendered. It
+                # used to be withdrawn the moment the figure or the settings
+                # changed, which in practice meant it vanished between
+                # rendering a figure and reaching for it -- so say what the
+                # file holds instead of taking it away.
+                st.download_button(
+                    f"⬇️ {what} ({cached['ext'].upper()})",
+                    data=cached["bytes"],
+                    file_name=f"{stem}.{cached['ext']}",
+                    mime=cached["mime"], key=f"_img_dl_{key}",
+                    width="stretch",
+                )
+                if cached.get("sig") != sig:
+                    st.caption("↻ The figure has changed since this was "
+                               "rendered — press Render again to refresh it.")
+                elif cached.get("settings") != settings:
+                    st.caption("↻ Format or resolution changed since this was "
+                               "rendered — press Render again to refresh it.")
+            elif cached.get("error"):
+                st.caption(
+                    f"Image export unavailable ({cached['error']}). Use the "
+                    "HTML download beside this button, or the 📷 icon on the "
+                    "chart itself — neither needs a renderer."
+                )
 
         with cols[1]:
             try:
