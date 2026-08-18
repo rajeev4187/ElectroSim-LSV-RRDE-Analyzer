@@ -171,11 +171,73 @@ def _export_size(fig, width: int | None, height: int | None) -> tuple[int, int]:
     return int(width), max(int(height), 200)
 
 
+# A zip of a data folder holds tens of files, not thousands. The total
+# uncompressed size is already bounded, but a zip of a hundred thousand tiny
+# members passes that check and then makes the app parse each one -- so bound
+# the count too, and say so rather than grinding for minutes.
+MAX_ZIP_MEMBERS = 500
+
+
+# Journal figure widths. Almost every publisher specifies a figure by the
+# column width it must fit, in centimetres, and there was previously no way to
+# hit one: the size boxes are in pixels, and what they mean physically is not
+# obvious (the old 520 px square comes out 13.8 cm wide -- between a single and
+# a double column, matching neither).
+_JOURNAL_WIDTHS_CM: dict[str, float | None] = {
+    "As shown on screen": None,
+    "Single column (8.6 cm)": 8.6,
+    "1.5 column (12.0 cm)": 12.0,
+    "Double column (17.8 cm)": 17.8,
+}
+
+# Kaleido's width/height are **CSS pixels**, which are 1/96 inch by definition,
+# and it multiplies them by `scale` to get the output raster. Since
+# `_render_export` sets scale = dpi/96, the output is width*dpi/96 pixels =
+# width/96 inches at that dpi. So the physical size of a figure is fixed by its
+# CSS size alone, and dpi only buys resolution within it -- which is exactly
+# the separation a journal asks for ("8.6 cm wide, at least 300 dpi").
+# Converting cm to pixels *at dpi* here would therefore double-count the
+# resolution: a 150 dpi single-column figure came out 13.4 cm instead of 8.6.
+_CSS_PX_PER_INCH = 96
+
+
+def _margin_crowding(fig, out_w: int, out_h: int) -> tuple[str, float] | None:
+    """``(axis, fraction)`` when the margins eat too much of the canvas.
+
+    Returns the worse of the two axes when either loses more than 55 % of its
+    length to margins, else ``None``.
+    """
+    margin = getattr(fig.layout, "margin", None)
+    if margin is None:
+        return None
+
+    def _side(value, default):
+        return float(default if value is None else value)
+
+    horizontal = _side(margin.l, 0) + _side(margin.r, 0)
+    vertical = _side(margin.t, 0) + _side(margin.b, 0)
+    worst = max(
+        ("width", horizontal / out_w if out_w else 0.0),
+        ("height", vertical / out_h if out_h else 0.0),
+        key=lambda pair: pair[1],
+    )
+    return worst if worst[1] > 0.55 else None
+
+
+def _preset_export_size(width_cm: float,
+                        base_w: int, base_h: int) -> tuple[int, int]:
+    """CSS-pixel size for a ``width_cm``-wide figure, keeping the figure's own
+    aspect ratio so nothing is stretched. Independent of dpi -- see above."""
+    out_w = int(round(width_cm / 2.54 * _CSS_PX_PER_INCH))
+    aspect = (base_h / base_w) if base_w else 1.0
+    return out_w, int(round(out_w * aspect))
+
+
 # Raster/vector formats offered for figure export. TIFF is what most journals
 # require for submission; the rest cover the common alternatives (SVG/PDF stay
 # vector, so they scale without resampling).
 _EXPORT_FORMATS: dict[str, tuple[str, str]] = {
-    "TIFF (300 dpi, LZW)": ("tiff", "image/tiff"),
+    "TIFF (LZW)": ("tiff", "image/tiff"),
     "PNG": ("png", "image/png"),
     "SVG (vector)": ("svg", "image/svg+xml"),
     "PDF (vector)": ("pdf", "application/pdf"),
@@ -193,21 +255,33 @@ def _render_export(export_fig, fmt: str, width: int, height: int,
     CSS pixel) is what makes the dpi selector actually change the pixel count
     rather than only the metadata. TIFF is not a Kaleido output format, so it
     is rendered as a high-resolution PNG and converted in-memory by Pillow,
-    which is also where the dpi tag and LZW compression are applied.
+    which is also where the LZW compression is applied.
+
+    Every raster format goes back through Pillow to carry a **dpi tag**.
+    Kaleido writes none, so a 600-dpi PNG used to arrive claiming the
+    default 72 dpi -- which is the number the submission system and the
+    typesetter read, and the reason an otherwise correct figure comes back
+    flagged as too low-resolution.
     """
-    if fmt in ("svg", "pdf"):  # vector: dpi is meaningless, size is in points
+    if fmt in ("svg", "pdf"):
+        # Vector: dpi is meaningless. Kaleido sizes these in CSS pixels, the
+        # same unit as the raster paths (not in points, despite the sizes
+        # looking point-like at typical figure dimensions).
         return export_fig.to_image(format=fmt, width=width, height=height)
 
     scale = max(1.0, float(dpi) / 96.0)
-    if fmt != "tiff":
-        return export_fig.to_image(format=fmt, width=width, height=height,
-                                   scale=scale)
-
     png_bytes = export_fig.to_image(format="png", width=width, height=height,
                                     scale=scale)
     image = Image.open(io.BytesIO(png_bytes))
     buffer = io.BytesIO()
-    image.save(buffer, format="TIFF", dpi=(dpi, dpi), compression="tiff_lzw")
+    if fmt == "tiff":
+        image.save(buffer, format="TIFF", dpi=(dpi, dpi), compression="tiff_lzw")
+    elif fmt in ("jpeg", "jpg"):
+        # JPEG has no alpha channel; a transparent PNG would otherwise raise.
+        image.convert("RGB").save(buffer, format="JPEG", dpi=(dpi, dpi),
+                                  quality=95, subsampling=0)
+    else:
+        image.save(buffer, format="PNG", dpi=(dpi, dpi))
     return buffer.getvalue()
 
 
@@ -259,27 +333,78 @@ def figure_downloads(fig, stem: str, key: str, what: str = "figure",
                          "600+ for line art in high-quality journals.",
                 )
             base_w, base_h = _export_size(export_fig, width, height)
+            # A caller that pins its own width has a layout reason for it (a
+            # table sized by column count, a two-panel figure): re-flowing
+            # those to a column width clips their contents, so they default
+            # to their own size and the presets stay available but unchosen.
+            preset = st.selectbox(
+                "Figure width", list(_JOURNAL_WIDTHS_CM),
+                index=0 if width is not None else 1,
+                key=f"_wpreset_{key}",
+                help="Journals specify figures by the column width they must "
+                     "fit. The pixel size below follows from that width and "
+                     "the dpi; override it if you need an exact size.",
+            )
+            width_cm = _JOURNAL_WIDTHS_CM[preset]
+            if width_cm is not None:
+                base_w, base_h = _preset_export_size(width_cm, base_w, base_h)
+            # The preset is part of the widget key, not just its default:
+            # Streamlit keeps a number_input's stored value across reruns, so
+            # a changed default alone would never reach the widget and picking
+            # a preset would appear to do nothing.
             sc1, sc2 = st.columns(2)
             out_w = sc1.number_input(
-                "Width (px)", min_value=200, max_value=4000, value=int(base_w),
-                step=20, key=f"_w_{key}",
+                "Width (px)", min_value=200, max_value=4000,
+                value=int(base_w), step=20, key=f"_w_{key}_{preset}",
             )
             out_h = sc2.number_input(
-                "Height (px)", min_value=200, max_value=4000, value=int(base_h),
-                step=20, key=f"_h_{key}",
+                "Height (px)", min_value=200, max_value=4000,
+                value=int(base_h), step=20, key=f"_h_{key}_{preset}",
             )
+            scale = max(1.0, float(dpi) / _CSS_PX_PER_INCH)
+            st.caption(
+                f"↳ Figure size "
+                f"{out_w / _CSS_PX_PER_INCH * 2.54:.1f} × "
+                f"{out_h / _CSS_PX_PER_INCH * 2.54:.1f} cm; exported at "
+                f"{dpi} dpi that is "
+                f"{int(round(out_w * scale))} × {int(round(out_h * scale))} "
+                "pixels."
+            )
+            # Margins are in absolute pixels (they have to be: they hold text
+            # of a fixed point size). On a narrow canvas they can therefore
+            # take most of the figure, leaving a strip of plot inside a wide
+            # white border. That is a font/width mismatch, not a bug, but it
+            # is invisible until the file is opened -- so say it here.
+            crowding = _margin_crowding(export_fig, int(out_w), int(out_h))
+            if crowding is not None:
+                axis, used = crowding
+                st.warning(
+                    f"At this size the margins take {used:.0%} of the "
+                    f"figure's {axis}, leaving little room for the plot "
+                    "itself. The axis text is sized for a larger canvas: "
+                    "lower **Font size** in the plot-appearance panel, or "
+                    "choose a wider column."
+                )
+            # The prepared bytes depend on the render settings as much as on
+            # the figure, so they are part of the cache identity. Keying on
+            # the figure alone served stale bytes -- with the *old* format's
+            # extension and MIME type -- to anyone who changed format, dpi or
+            # size and downloaded without pressing Prepare again.
+            settings = (fmt, int(dpi), int(out_w), int(out_h))
             if st.button(f"🖼️ Prepare {what}", key=f"_img_prep_{key}",
                          width="stretch"):
                 try:
                     st.session_state[state_key] = {
                         "sig": _figure_signature(export_fig),
+                        "settings": settings,
                         "bytes": _render_export(export_fig, fmt, int(out_w),
                                                 int(out_h), int(dpi)),
                         "ext": fmt, "mime": mime, "error": None,
                     }
                 except Exception as exc:  # kaleido missing / no Chrome
                     st.session_state[state_key] = {
-                        "sig": _figure_signature(export_fig), "bytes": None,
+                        "sig": _figure_signature(export_fig),
+                        "settings": settings, "bytes": None,
                         "ext": fmt, "mime": mime, "error": str(exc),
                     }
             cached = st.session_state.get(state_key) or {}
@@ -288,7 +413,10 @@ def figure_downloads(fig, stem: str, key: str, what: str = "figure",
                 # the whole figure, so doing it unconditionally on every rerun
                 # was pure overhead for figures nobody exports.
                 sig = _figure_signature(export_fig)
-                if cached.get("bytes") and cached.get("sig") == sig:
+                stale_settings = cached.get("settings") != settings
+                fresh = (cached.get("bytes") and cached.get("sig") == sig
+                         and not stale_settings)
+                if fresh:
                     st.download_button(
                         f"⬇️ {what} ({cached['ext'].upper()})",
                         data=cached["bytes"],
@@ -297,7 +425,11 @@ def figure_downloads(fig, stem: str, key: str, what: str = "figure",
                         width="stretch",
                     )
                 elif cached.get("bytes"):
-                    st.caption("↻ Figure changed — press Prepare again.")
+                    st.caption(
+                        "↻ Export settings changed — press Prepare again."
+                        if stale_settings else
+                        "↻ Figure changed — press Prepare again."
+                    )
                 elif cached.get("error"):
                     st.caption(
                         f"Image export unavailable ({cached['error']}). Use "
@@ -617,6 +749,56 @@ def sidebar_units(current_default: str | None = None,
     return current_unit, ru_unit, area_cm2
 
 
+def render_manual_ru_section(ru_unit: str = "Ω",
+                             area_cm2: float | None = None) -> float | None:
+    """Let the user type a Ru value straight from the instrument.
+
+    Many potentiostats' own software already fits Ru (e.g. from a built-in
+    PEIS routine) — this skips re-fitting the Nyquist arc above and feeds
+    that value into the **LSV iR Correction** tab instead. Returns the value
+    reconciled into ``ru_unit`` (the same convention :func:`render_eis_tab`
+    returns), or ``None`` if the user hasn't opted to use one.
+    """
+    with st.expander("📥 Enter Ru directly (value from instrument)"):
+        st.caption(
+            "If your potentiostat already reports Ru — from a built-in EIS "
+            "routine, for instance — skip fitting the Nyquist arc above and "
+            "type the value here. It links straight into the **LSV iR "
+            "Correction** tab, just like the fitted value."
+        )
+        c1, c2, c3 = st.columns([2, 1, 2])
+        with c1:
+            manual_val = st.number_input(
+                "Ru value", min_value=0.0, value=0.0, step=0.1, format="%.3f",
+                key="manual_instrument_ru_val",
+            )
+        with c2:
+            unit_opts = list(correction.RU_UNITS)
+            unit_idx = unit_opts.index(ru_unit) if ru_unit in unit_opts else 0
+            manual_unit = st.selectbox(
+                "Unit", unit_opts, index=unit_idx, key="manual_instrument_ru_unit",
+                help="Ω for a raw resistance; Ω·cm² for an area-specific "
+                     "resistance. Converted automatically if it differs from "
+                     "the EIS resistance unit set in the sidebar.",
+            )
+        with c3:
+            st.markdown("&nbsp;")  # align checkbox with the inputs above
+            use_manual = st.checkbox(
+                "Use this value for iR correction",
+                key="manual_instrument_ru_use",
+                help="Overrides any circle-fit or in-tab manual Ru above with "
+                     "this instrument value on the LSV iR Correction tab.",
+            )
+        if not use_manual or manual_val <= 0:
+            return None
+        try:
+            return correction.convert_ru_unit(manual_val, manual_unit,
+                                              ru_unit, area_cm2)
+        except ValueError as exc:
+            st.error(f"Could not convert Ru unit: {exc}")
+            return None
+
+
 # --------------------------------------------------------------------------- #
 # EIS / Ru analysis tab                                                       #
 # --------------------------------------------------------------------------- #
@@ -682,6 +864,21 @@ def render_eis_tab(eis_d, eis_list, sel, ru_unit: str = "Ω",
                 ru_result = eis.fit_ru_circle(zr, zi, start=start, stop=stop)
             except Exception as exc:
                 st.error(f"Circle fit failed: {exc}")
+            if ru_result is not None and ru_result.arc_coverage_deg is not None:
+                st.caption(
+                    f"↳ Fitted arc covers "
+                    f"{ru_result.arc_coverage_deg:.0f}° of the circle. Ru is "
+                    "the *extrapolated* crossing of that circle with the real "
+                    "axis, not a measured point."
+                )
+                if ru_result.is_extrapolated:
+                    st.warning(
+                        f"Only {ru_result.arc_coverage_deg:.0f}° of arc is "
+                        "being fitted. Below about a quarter turn the "
+                        "extrapolated Ru is sensitive to small curvature "
+                        "errors — widen the fit range, or measure to a "
+                        "higher frequency, before quoting it."
+                    )
         else:
             quick = eis.fit_ru_circle(zr, zi, start=start, stop=stop)
             manual_ru_val = st.number_input(
@@ -1044,7 +1241,7 @@ def render_lsv_tab(lsv_d, ru: float | None, current_unit: str = "mA",
                     "font": {"family": "Arial",
                              "size": max(11, round(font_size * 0.55))},
                     "bgcolor": "rgba(255,255,255,0.7)"},
-            margin={"l": 10, "r": 10, "t": 60, "b": 90},
+            margin=_journal_margin(font_size, legend_below=True),
             hovermode="x unified",
             hoverlabel={"font": {"family": "Arial", "size": 12}},
         )
@@ -1325,9 +1522,11 @@ def _axis_style(style: dict) -> dict:
         "showgrid": bool(style.get("show_grid")),
         "gridcolor": "#d9d9d9",
         "zeroline": False,
-        "showline": True, "linewidth": 1.5, "linecolor": "black",
+        "showline": True, "linewidth": 2, "linecolor": "black",
         "mirror": bool(style.get("mirror_axes", True)),
-        "ticks": "outside",
+        # Plotly's default ticks are thin and grey, which all but vanish once
+        # a figure is downsampled into a journal column. Match the axis line.
+        "ticks": "outside", "tickwidth": 2, "ticklen": 7, "tickcolor": "black",
         "nticks": int(style.get("n_ticks", 5)),
     }
 
@@ -1361,9 +1560,15 @@ def apply_plot_style(fig, style: dict, xtitle: str, ytitle: str,
         "template": "plotly_white",
         "height": height,
         "font": axis_font,
-        "margin": {"l": 10, "r": 170 if position == "outside-right" else 10,
-                   "t": 60 if (title and style.get("show_title")) else 20,
-                   "b": 90 if position == "below" else 10},
+        # 10 px is not enough room for a tick label, let alone an axis title:
+        # every exported figure came out with its y-axis numbers and both axis
+        # titles clipped at the edge. One derivation for every figure, so the
+        # styled tabs and the hand-built ones cannot drift (see
+        # :func:`_journal_margin`).
+        "margin": {**_journal_margin(
+            size, legend_below=(position == "below"),
+            titled=bool(title and style.get("show_title"))),
+            **({"r": 170} if position == "outside-right" else {})},
     }
     if position == "hidden":
         layout["showlegend"] = False
@@ -1376,9 +1581,12 @@ def apply_plot_style(fig, style: dict, xtitle: str, ytitle: str,
     fig.update_layout(**layout)
 
     axis_kwargs = _axis_style(style)
-    fig.update_xaxes(title={"text": xtitle, "font": axis_font},
+    # Axis titles read one step up from the tick labels in most journal house
+    # styles; using one size for both made the titles disappear into the numbers.
+    title_font = {"family": family, "size": size + 8}
+    fig.update_xaxes(title={"text": xtitle, "font": title_font},
                      tickfont=axis_font, **axis_kwargs)
-    fig.update_yaxes(title={"text": ytitle, "font": axis_font},
+    fig.update_yaxes(title={"text": ytitle, "font": title_font},
                      tickfont=axis_font, range=yrange, **axis_kwargs)
 
 
@@ -1409,10 +1617,44 @@ def trace_color_pickers(labels: list[str], style: dict, key_prefix: str) -> dict
 
 
 _JOURNAL_FONT_SIZES = [28, 36]
+
+
+def _journal_margin(font_size: int, *, legend_below: bool = False,
+                    titled: bool = True) -> dict:
+    """Margins wide enough that tick labels and axis titles survive export.
+
+    Plotly's 10 px default (and the hard-coded 10 px dicts these figures used
+    to carry) clips the y-axis numbers and both axis titles the moment the
+    figure is rendered to TIFF/PNG at the size a journal wants.
+
+    The sizes are derived from the text each margin has to hold rather than
+    copied from the reference app's fixed 110/90 -- those were sized for its
+    ~930 px canvas, and a fixed 200 px of horizontal margin swallows 62 % of
+    an 8.6 cm single-column figure (325 CSS px), however small the font. Left
+    holds a rotated axis title plus a tick label; bottom holds a tick label
+    plus the axis title, which renders at ``font_size + 8`` (see
+    :func:`apply_plot_style`); right and top only need to keep the last tick
+    label and any title off the edge.
+    """
+    title_size = font_size + 8
+    tick_len = 7
+    return {
+        # rotated title + ~4 characters of tick label + tick + padding
+        "l": int(max(45, title_size * 1.2 + font_size * 2.4 + tick_len + 10)),
+        # half of the last x tick label, or room for an outside legend
+        "r": int(max(25, font_size * 1.5 + 10)),
+        "t": int(max(25, title_size * 1.8)) if titled else int(max(15, font_size)),
+        # x tick label + axis title + tick + padding (+ a legend strip below)
+        "b": int(max(40, font_size * 1.2 + title_size * 1.3 + tick_len + 10)
+                 + (font_size * 2.2 if legend_below else 0)),
+    }
+
+
 _BOX_AXIS_STYLE = {
     "showgrid": False, "zeroline": False,
-    "showline": True, "linewidth": 1.5, "linecolor": "black", "mirror": True,
-    "ticks": "outside", "nticks": 5,
+    "showline": True, "linewidth": 2, "linecolor": "black", "mirror": True,
+    "ticks": "outside", "tickwidth": 2, "ticklen": 7, "tickcolor": "black",
+    "nticks": 5,
 }
 # Every journal-style plot uses this so its legend and any text annotations
 # (slope labels, etc.) can be dragged to a better spot before export.
@@ -1517,7 +1759,9 @@ def _journal_table_figure(display_df: pd.DataFrame, font_size: int, stem: str,
         # a cap so one long sentence can't squeeze every other column.
         widths.append(min(max(len(str(c)), longest, 6) + 2, 46))
     char_px = cell_font * 0.66
-    table_width = int(sum(widths) * char_px + 60)
+    # Clamped to the same bounds the export size inputs accept, so a very wide
+    # table cannot produce a default the width widget then silently rejects.
+    table_width = int(min(max(sum(widths) * char_px + 60, 200), 4000))
     # Worst-case wrapped lines in any cell of a row -> uniform row height.
     max_wrap = max(
         (int(np.ceil(len(v) / w)) for col, w in zip(display_df.columns, widths)
@@ -1531,17 +1775,38 @@ def _journal_table_figure(display_df: pd.DataFrame, font_size: int, stem: str,
     # not compete with the figures for colour.
     n_rows = len(display_df)
     row_fill = ["#ffffff" if i % 2 == 0 else "#f4f4f4" for i in range(n_rows)]
+    # Numbers right-align so their decimal points line up down the column --
+    # the whole reason a results table is readable at a glance. Text stays
+    # left-aligned. A column counts as numeric when every entry that is not
+    # the em-dash placeholder parses as a number.
+
+    def _is_numeric_col(col: str) -> bool:
+        values = [v for v in str_cols[col] if v != "—"]
+        if not values:
+            return False
+        for v in values:
+            try:
+                float(v.replace("±", " ").split()[0])
+            except (ValueError, IndexError):
+                return False
+        return True
+
+    aligns = ["right" if _is_numeric_col(c) else "left"
+              for c in display_df.columns]
     table_fig = go.Figure(data=[go.Table(
         columnwidth=widths,
         header={"values": [f"<b>{c}</b>" for c in display_df.columns],
                 "font": {"family": family, "size": header_font, "color": "#000000"},
                 "fill": {"color": "#e2e2e2"},
                 "line": {"color": "#000000", "width": 1},
-                "align": "left", "height": int(header_font * 1.6) + 10},
+                "align": aligns, "height": int(header_font * 1.6) + 10},
         cells={"values": [str_cols[c] for c in display_df.columns],
-               "font": {"family": family, "size": cell_font}, "align": "left",
+               "font": {"family": family, "size": cell_font}, "align": aligns,
                "fill": {"color": [row_fill] * len(display_df.columns)},
-               "line": {"color": "#d0d0d0", "width": 0.5},
+               # No interior rules: the zebra striping already separates rows,
+               # and the grid of boxes this used to draw is exactly what the
+               # comment above says a journal table does not have.
+               "line": {"color": "rgba(0,0,0,0)", "width": 0},
                "height": row_h},
     )])
     table_height = int(header_font * 1.6) + 20 + row_h * len(display_df) + 20
@@ -1669,6 +1934,12 @@ def _tafel_extract_zip_samples(
     ]
     if not members:
         st.warning(f"{upload.name}: no CSV/Excel files found inside.")
+        return []
+    if len(members) > MAX_ZIP_MEMBERS:
+        st.error(
+            f"{upload.name}: contains {len(members)} data files, more than "
+            f"the {MAX_ZIP_MEMBERS}-file limit. Split it into smaller zips."
+        )
         return []
 
     default_sample = upload.name.rsplit(".", 1)[0]
@@ -1871,7 +2142,11 @@ def _render_rhe_conversion(key_prefix: str, default_ph: float = 13.0,
             "Calibrated offset (V)", value=0.926, step=0.001, format="%.3f",
             key=f"{key_prefix}_rhe_offset",
             help="0.926 V is a commonly cited Hg/HgO-vs-RHE offset in 1 M "
-                 "KOH — replace with your own electrode's measured value.",
+                 "KOH (pH 14) — the same number the formula mode gives for "
+                 "'Hg/HgO, 1 M KOH' at pH 14. In 0.1 M KOH (pH 13) the "
+                 "formula gives 0.867 V instead, so do not carry the 1 M "
+                 "value across electrolytes: replace it with your own "
+                 "electrode's measured value.",
         )
         return lambda pot: np.asarray(pot, dtype=float) + offset
 
@@ -1913,7 +2188,8 @@ def _render_rhe_conversion(key_prefix: str, default_ph: float = 13.0,
         ph = _ELECTROLYTE_PH_PRESETS[electrolyte_choice]
         pc2.metric("pH", f"{ph:g}")
     st.caption(
-        f"↪ E(RHE) = E(measured) + {e_ref:.3f} V + 0.0592 × {ph:g} = "
+        f"↪ E(RHE) = E(measured) + {e_ref:.3f} V + "
+        f"{tafel.NERNST_SLOPE_V_PER_PH:.4f} × {ph:g} = "
         f"E(measured) + {(e_ref + tafel.NERNST_SLOPE_V_PER_PH * ph):.3f} V. "
         "Electrolyte pH values above are literature-typical, not measured "
         "for your specific sample — check them (or use 'Direct calibration "
@@ -2060,10 +2336,13 @@ def render_tafel_tab() -> None:
             st.warning(f"Ignoring unparseable target current density {tok!r}.")
             continue
         # De-duplicate: each benchmark becomes a results column and a bar
-        # chart whose widget keys are derived from the value, so entering
+        # chart whose labels are derived from the value, so entering
         # "10, 10" would raise a DuplicateWidgetID and take the whole tab
-        # down. Order is preserved so the columns stay in the order typed.
-        if not any(value == seen for seen in target_js):
+        # down. De-duplicate on the *formatted* value, not the float: "%g"
+        # collapses to 6 significant figures, so 1000000 and 1000000.1 are
+        # distinct floats that both render "1e+06" and would collide just the
+        # same. Order is preserved so the columns stay in the order typed.
+        if not any(f"{value:g}" == f"{seen:g}" for seen in target_js):
             target_js.append(value)
         else:
             st.caption(f"↪ Ignoring repeated target current density {value:g}.")
@@ -2290,12 +2569,15 @@ def render_tafel_tab() -> None:
                 line={"color": meta["color"], "width": 3},
             ))
         lsv_fig.update_layout(
-            title={"text": "Original LSV", "font": {"family": "Arial", "size": font_size}},
+            title=({"text": "Original LSV",
+                    "font": {"family": style["font_family"], "size": font_size}}
+                   if style.get("show_title") else None),
             template="plotly_white", height=460, font=axis_font,
             legend={"x": 0.02, "y": 0.98, "xanchor": "left",
                     "yanchor": "top", "font": small_font,
                     "bgcolor": "rgba(255,255,255,0.7)", "tracegroupgap": 18},
-            margin={"l": 10, "r": 10, "t": 60, "b": 10},
+            margin=_journal_margin(font_size,
+                                   titled=bool(style.get("show_title"))),
         )
         lsv_fig.update_xaxes(
             title={"text": "Potential vs RHE / V", "font": {"family": "Arial", "size": font_size}},
@@ -2407,7 +2689,11 @@ def render_tafel_tab() -> None:
         fig.add_annotation(
             x=xmid, y=ymid, text=label_text,
             showarrow=False, yshift=16,
-            font={"family": "Arial", "color": fit_color, "size": 22},
+            # Sized off the chosen figure font rather than a fixed 22 pt,
+            # which was illegible next to a 36 pt axis and oversized next to
+            # a small one.
+            font={"family": style["font_family"], "color": fit_color,
+                  "size": max(11, round(font_size * 0.62))},
         )
 
     title_text = (
@@ -2415,14 +2701,17 @@ def render_tafel_tab() -> None:
         else "Tafel plot"
     )
     fig.update_layout(
-        title={"text": title_text, "font": {"family": "Arial", "size": font_size}},
+        title=({"text": title_text,
+                "font": {"family": style["font_family"], "size": font_size}}
+               if style.get("show_title") else None),
         template="plotly_white",
         height=560,
         font=axis_font,  # baseline (inherited by legend/annotations unless overridden)
         legend={"x": 0.02, "y": 0.98, "xanchor": "left",
                 "yanchor": "top", "font": small_font,
                 "bgcolor": "rgba(255,255,255,0.7)", "tracegroupgap": 18},
-        margin={"l": 10, "r": 10, "t": 60, "b": 10},
+        margin=_journal_margin(font_size,
+                               titled=bool(style.get("show_title"))),
         dragmode="select",
     )
     # Axis titles/ticks are the "axes" text: always the full 28/36 pt Arial.
@@ -2603,7 +2892,7 @@ def render_tafel_tab() -> None:
             g if g else s
             for g, s in zip(summary["Replicate group"], summary["Sample"])
         ]
-        for target_j in target_js:
+        for bar_i, target_j in enumerate(target_js):
             target_cols = [c for c in summary.columns if f"j={target_j:g}" in c]
             if not target_cols:
                 continue
@@ -2630,11 +2919,14 @@ def render_tafel_tab() -> None:
                 marker={"color": bar_colors},
             ))
             fig_bar.update_layout(
-                title={"text": f"Benchmark @ j = {target_j:g} {display_unit}",
-                       "font": {"family": "Arial", "size": font_size}},
+                title=({"text": f"Benchmark @ j = {target_j:g} {display_unit}",
+                        "font": {"family": style["font_family"],
+                                 "size": font_size}}
+                       if style.get("show_title") else None),
                 template="plotly_white", height=420,
                 font={"family": "Arial", "size": font_size},
-                margin={"l": 10, "r": 10, "t": 60, "b": 10},
+                margin=_journal_margin(
+                    font_size, titled=bool(style.get("show_title"))),
             )
             fig_bar.update_xaxes(
                 tickfont={"family": "Arial", "size": font_size}, **_BOX_AXIS_STYLE,
@@ -2646,7 +2938,7 @@ def render_tafel_tab() -> None:
             st.plotly_chart(fig_bar, width="stretch", config=_PLOTLY_EDIT_CONFIG)
             figure_downloads(
                 fig_bar, f"overpotential_bar_j{target_j:g}",
-                key=f"png_tafel_bar_{target_j:g}",
+                key=f"png_tafel_bar_{bar_i}",
                 what=f"Benchmark overpotential bar chart @ j={target_j:g}",
                 data=_padded_frame({
                     "Sample": list(means.index),
@@ -2760,7 +3052,7 @@ def render_kl_tab() -> None:
 
     to_rhe_fn = _render_rhe_conversion(
         "kl", default_ph=13.0,
-        default_ref_electrode="Hg/HgO, 1 M NaOH", default_electrolyte="0.1 M KOH",
+        default_ref_electrode="Hg/HgO, 1 M KOH", default_electrolyte="0.1 M KOH",
         default_mode="Reference electrode + electrolyte pH",
     )
 
@@ -3149,8 +3441,16 @@ def _guess_current_unit_from_cols(cols: list) -> str | None:
     return None
 
 
-def _orr_read_file(up, key_prefix: str = "orr") -> pd.DataFrame | None:
-    """Read one uploaded file's raw table (no column interpretation yet)."""
+def _orr_read_file(up, key_prefix: str = "orr",
+                   slot: str = "0") -> pd.DataFrame | None:
+    """Read one uploaded file's raw table (no column interpretation yet).
+
+    ``slot`` identifies the upload's position (sample index / file index) and
+    keys the sheet picker. Filenames cannot: uploading two files that happen
+    to share a name — routine in RRDE work, where disk and ring exports come
+    out of per-rpm folders with identical names — would build the same widget
+    key twice and crash the tab with ``DuplicateWidgetID``.
+    """
     try:
         if up.name.lower().endswith((".xlsx", ".xls")):
             sheets = _cached_sheets(up.getvalue())
@@ -3158,7 +3458,7 @@ def _orr_read_file(up, key_prefix: str = "orr") -> pd.DataFrame | None:
             if len(sheets) > 1:
                 sheet = st.selectbox(
                     f"Sheet for {up.name}", sheets,
-                    key=f"{key_prefix}_sheet_{up.name}",
+                    key=f"{key_prefix}_sheet_{slot}",
                 )
             return _cached_table(up.getvalue(), sheet)
         return _cached_table(up.getvalue(), None)
@@ -3201,8 +3501,12 @@ def _orr_merge_entries(
             if len(pot_r) == len(pot_d) and np.allclose(pot_r, pot_d, atol=1e-6):
                 frame["ring_current"] = cur_r
             elif len(pot_r) >= 2:
-                order = np.argsort(pot_r)
-                frame["ring_current"] = np.interp(pot_d, pot_r[order], cur_r[order])
+                # np.argsort alone is not enough: a ring export that repeats a
+                # potential (a vertex point, a quantised axis) leaves duplicate
+                # x, where np.interp's result depends on which duplicate came
+                # first. ascending_xy collapses them to their mean.
+                xr, yr = sweep.ascending_xy(pot_r, cur_r)
+                frame["ring_current"] = np.interp(pot_d, xr, yr)
         frames.append(frame)
     return pd.concat(frames, ignore_index=True) if frames else None
 
@@ -3250,8 +3554,8 @@ def _orr_table_to_entry(
         if len(pot_r) == len(pot) and np.allclose(pot_r, pot, atol=1e-6):
             ring_aligned = ring
         elif len(pot_r) >= 2:
-            order = np.argsort(pot_r)
-            ring_aligned = np.interp(pot, pot_r[order], ring[order])
+            xr, yr = sweep.ascending_xy(pot_r, ring)
+            ring_aligned = np.interp(pot, xr, yr)
         else:
             ring_aligned = None
         return pot, disk, ring_aligned, rpm_val
@@ -3302,6 +3606,12 @@ def _orr_extract_zip_samples(
     ]
     if not members:
         st.warning(f"{upload.name}: no CSV/Excel files found inside.")
+        return [], None
+    if len(members) > MAX_ZIP_MEMBERS:
+        st.error(
+            f"{upload.name}: contains {len(members)} data files, more than "
+            f"the {MAX_ZIP_MEMBERS}-file limit. Split it into smaller zips."
+        )
         return [], None
 
     default_sample = upload.name.rsplit(".", 1)[0]
@@ -3394,6 +3704,12 @@ def _orr_data_loader(
 
     samples: list[tuple[str, pd.DataFrame]] = []
     unit_hint: str | None = None
+    # Sample labels are the selector values *and* part of the per-sample
+    # widget keys, and callers index back into the list with dict(samples).
+    # Two zip subfolders, or a manual sample typed with the same name as a
+    # zip one, would otherwise silently collapse into one entry and collide
+    # on `orr_rrde_rpms_{label}`. Disambiguate exactly as the LSV tab does.
+    seen_labels: dict[str, int] = {}
 
     with st.expander("📦 Batch upload — a ZIP of a whole data folder"):
         st.caption(
@@ -3415,7 +3731,9 @@ def _orr_data_loader(
                     f"Loaded {len(zip_samples)} sample(s) from {zip_up.name}: "
                     + ", ".join(lbl for lbl, _ in zip_samples)
                 )
-            samples.extend(zip_samples)
+            samples.extend(
+                (_dedup_label(lbl, seen_labels), d) for lbl, d in zip_samples
+            )
             if unit_hint is None:
                 unit_hint = zip_unit_hint
 
@@ -3441,7 +3759,7 @@ def _orr_data_loader(
 
             entries = []  # (potential, disk_current, ring_current_or_None, rpm)
             for j, up in enumerate(ups):
-                raw = _orr_read_file(up, key_prefix=key_prefix)
+                raw = _orr_read_file(up, key_prefix=key_prefix, slot=f"{i}_{j}")
                 if raw is None:
                     continue
                 coerced, cols = _orr_numeric_columns(raw)
@@ -3480,7 +3798,7 @@ def _orr_data_loader(
                 continue
             df = _orr_merge_entries(entries, sample_name)
             if df is not None:
-                samples.append((sample_name, df))
+                samples.append((_dedup_label(sample_name, seen_labels), df))
     return samples, unit_hint
 
 
@@ -3544,6 +3862,14 @@ def render_orr_tab() -> None:
         help="0.19625 cm² is the standard 5 mm-diameter RRDE glassy-carbon disk.",
     ) if convert_density else None
     display_unit = f"{desired_unit}/cm²" if convert_density else desired_unit
+    # The ring is a separate electrode with its own (larger) area, which the
+    # app never asks for -- the disk area above is the only one entered. So a
+    # "density-converted" ring current is the ring current divided by the
+    # *disk* area, which is not the ring's current density and must not be
+    # labelled as though it were. n and %H2O2 are unaffected: both are ratios
+    # of Ir/N to Id, so the shared divisor cancels out of them exactly.
+    ring_unit = (f"{desired_unit}/cm²(disk)" if convert_density
+                 else desired_unit)
     collection_efficiency = cur5.number_input(
         "Ring collection efficiency N", min_value=0.01, max_value=1.0,
         value=0.222, step=0.01, format="%.3f", key="orr_collection_efficiency",
@@ -3556,7 +3882,7 @@ def render_orr_tab() -> None:
 
     to_rhe_fn = _render_rhe_conversion(
         "orr", default_ph=13.0,
-        default_ref_electrode="Hg/HgO, 1 M NaOH", default_electrolyte="0.1 M KOH",
+        default_ref_electrode="Hg/HgO, 1 M KOH", default_electrolyte="0.1 M KOH",
         default_mode="Reference electrode + electrolyte pH",
     )
 
@@ -3645,6 +3971,10 @@ def render_orr_tab() -> None:
         convention instead of Plotly's own auto-range, which pads both
         ends around the data's min/max and generally won't include 0."""
         vmax, vmin = float(np.max(values)), float(np.min(values))
+        if vmax == 0 and vmin == 0:
+            # An all-zero trace would otherwise give [0, 0], which Plotly
+            # renders as a zero-height axis with no ticks at all.
+            return [-1.0, 1.0]
         if abs(vmax) >= abs(vmin):
             return [0.0, vmax * 1.05 if vmax > 0 else vmax * 0.95]
         return [vmin * 1.05 if vmin < 0 else vmin * 0.95, 0.0]
@@ -3667,10 +3997,18 @@ def render_orr_tab() -> None:
         )
         all_ring_cur = np.concatenate([s["ring"] for s in slices.values() if s["has_ring"]])
         _, ring_y_range = _range_controls(
-            "orr_ring_y", "Potential (V)", f"Ring current ({display_unit})",
+            "orr_ring_y", "Potential (V)", f"Ring current ({ring_unit})",
             float(np.min(all_pot_disk)), float(np.max(all_pot_disk)),
             float(np.min(all_ring_cur)), float(np.max(all_ring_cur)),
         )
+        if convert_density:
+            st.caption(
+                "↳ Ring current is normalised by the **disk** area "
+                "(the only area this app asks for), so it is not the "
+                "ring's own current density — read it as a relative "
+                "trace. n and %H₂O₂ are unaffected: the shared area "
+                "cancels out of both ratios."
+            )
         _, disk_y_range = _range_controls(
             "orr_disk_y", "Potential (V)", f"Disk current ({display_unit})",
             float(np.min(all_pot_disk)), float(np.max(all_pot_disk)),
@@ -3694,7 +4032,7 @@ def render_orr_tab() -> None:
                     x=s["potential"], y=s["ring"], mode="lines", name=lbl,
                     legendgroup=lbl, line={"color": color, "width": 3},
                 ), row=1, col=1)
-                disk_data[f"{lbl} — Ring current ({display_unit})"] = list(s["ring"])
+                disk_data[f"{lbl} — Ring current ({ring_unit})"] = list(s["ring"])
             fig_disk.add_trace(go.Scatter(
                 x=s["potential"], y=s["disk"], mode="lines", name=lbl,
                 legendgroup=lbl, showlegend=not s["has_ring"],
@@ -3863,10 +4201,22 @@ def render_orr_tab() -> None:
         except ValueError as exc:
             st.warning(f"{lbl}: could not locate onset/E½ ({exc}).")
             continue
+        # E1/2 is the steepest point *within the search window*. When the
+        # steepest point of the real wave lies outside it -- a poor catalyst
+        # whose wave sits below 0.4 V, say -- the search returns the window's
+        # own edge, which looks like a plausible number and is not one.
+        e_half = float(onset_res.half_wave_potential)
+        if min(abs(e_half - ehw_lo), abs(e_half - ehw_hi)) <= 0.005:
+            st.warning(
+                f"{lbl}: E½ = {e_half:.3f} V landed on the edge of the "
+                f"{ehw_lo:g}–{ehw_hi:g} V search window, so the wave's real "
+                "steepest point is probably outside it. Widen the window "
+                "above before quoting this value."
+            )
         row = {
             "Sample": lbl, "Rotation rate (rpm)": s["rpm"],
             "E_onset (V vs RHE)": round(onset_res.onset_potential, 3),
-            "E_half-wave (V vs RHE)": round(onset_res.half_wave_potential, 3),
+            "E_half-wave (V vs RHE)": round(e_half, 3),
             f"j_limiting ({display_unit})": round(onset_res.limiting_current, 4),
         }
 
@@ -3895,12 +4245,11 @@ def render_orr_tab() -> None:
         if s["has_ring"]:
             n_arr = orr.electron_number(s["disk"], s["ring"], collection_efficiency)
             pct_arr = orr.peroxide_percent(s["disk"], s["ring"], collection_efficiency)
-            order = np.argsort(s["potential"])
-            row["n @ E½"] = round(float(np.interp(
-                onset_res.half_wave_potential, s["potential"][order], n_arr[order]
+            row["n @ E½"] = round(float(sweep.interp_at(
+                onset_res.half_wave_potential, s["potential"], n_arr
             )), 2)
-            row["%H₂O₂ @ E½"] = round(float(np.interp(
-                onset_res.half_wave_potential, s["potential"][order], pct_arr[order]
+            row["%H₂O₂ @ E½"] = round(float(sweep.interp_at(
+                onset_res.half_wave_potential, s["potential"], pct_arr
             )), 1)
 
         results_rows.append(row)
@@ -4163,10 +4512,18 @@ def render_orr_tab() -> None:
         if p["has_ring"]:
             ring_sel, disk_sel = p["ring"][rpm_mask], p["disk"][rpm_mask]
             _, ring_y_range = _range_controls(
-                "orr_rrde_ring_y", "Potential (V)", f"Ring current ({display_unit})",
+                "orr_rrde_ring_y", "Potential (V)", f"Ring current ({ring_unit})",
                 float(np.min(pot_sel)), float(np.max(pot_sel)),
                 float(np.min(ring_sel)), float(np.max(ring_sel)),
             )
+            if convert_density:
+                st.caption(
+                    "↳ Ring current is normalised by the **disk** area "
+                    "(the only area this app asks for), so it is not the "
+                    "ring's own current density — read it as a relative "
+                    "trace. n and %H₂O₂ are unaffected: the shared area "
+                    "cancels out of both ratios."
+                )
             _, disk_y_range = _range_controls(
                 "orr_rrde_disk_y", "Potential (V)", f"Disk current ({display_unit})",
                 float(np.min(pot_sel)), float(np.max(pot_sel)),
@@ -4263,7 +4620,7 @@ def render_orr_tab() -> None:
             rrde_cols[f"{rv:g}rpm — Potential vs RHE (V)"] = list(p["potential"][m])
             rrde_cols[f"{rv:g}rpm — Disk current ({display_unit})"] = list(p["disk"][m])
             if p["has_ring"]:
-                rrde_cols[f"{rv:g}rpm — Ring current ({display_unit})"] = list(p["ring"][m])
+                rrde_cols[f"{rv:g}rpm — Ring current ({ring_unit})"] = list(p["ring"][m])
         figure_downloads(
             fig_rrde, f"orr_rrde_multirpm_{rrde_label}", key="png_orr_rrde",
             what="RRDE multi-rpm plot", data=_padded_frame(rrde_cols),
@@ -4340,7 +4697,10 @@ def main():
             # with the electrode area to report both Ru and Ru effective.
             ru = render_eis_tab(eis_d, eis_list, sel, ru_unit, current_unit, area_cm2)
         else:
-            st.info("⬆️ Upload EIS data above to begin.")
+            st.info("⬆️ Upload EIS data above to begin, or enter Ru directly below.")
+        manual_ru = render_manual_ru_section(ru_unit, area_cm2)
+        if manual_ru is not None:
+            ru = manual_ru
     with tab_lsv:
         if lsv_d is not None:
             if eis_d is not None:

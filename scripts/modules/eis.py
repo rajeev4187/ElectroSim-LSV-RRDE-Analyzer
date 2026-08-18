@@ -38,6 +38,8 @@ class RuResult:
     radius: float | None = None    # fitted circle radius
     rmse: float | None = None      # radial RMSE of the fit, ohm
     arc_slice: tuple[int, int] | None = None    # (start, stop) indices used
+    # Angular span of the fitted points about the circle centre, in degrees.
+    arc_coverage_deg: float | None = None
 
     @property
     def r_low(self) -> float | None:
@@ -45,6 +47,22 @@ class RuResult:
         if self.rct is None:
             return None
         return self.ru + self.rct
+
+    @property
+    def is_extrapolated(self) -> bool:
+        """Whether Ru is an extrapolation well beyond the measured points.
+
+        The high-frequency intercept is where the *fitted circle* crosses
+        Z'' = 0, which is usually outside the measured data: a spectrum that
+        stops at 100 kHz has not reached the real axis. The shorter the
+        measured arc, the further the circle is being extrapolated and the
+        more a small curvature error moves the intercept. Under roughly a
+        quarter turn the answer should be quoted with that caveat -- a
+        synthetic-arc check puts Ru within 0.16 ohm on a 20 ohm arc covering
+        45-180 degrees, and it degrades quickly below that.
+        """
+        return (self.arc_coverage_deg is not None
+                and self.arc_coverage_deg < 45.0)
 
 
 def _abs_imag(z_imag: np.ndarray) -> np.ndarray:
@@ -145,6 +163,26 @@ def _fit_circle_algebraic(
     return _fit_circle_kasa(x, y)
 
 
+def _angular_coverage_deg(dx: np.ndarray, dy: np.ndarray) -> float:
+    """Angular span, in degrees, of the smallest sector containing all points.
+
+    Not ``max(angle) - min(angle)``: an arc sitting across the +/-pi branch
+    cut of ``arctan2`` has points at both ends of the range and would measure
+    as very nearly a full turn. (A textbook Nyquist arc lands exactly there --
+    its high-frequency end sits on the negative real axis of the circle's own
+    frame, where a sign flip of a 1e-15 imaginary part decides between +pi
+    and -pi.) Instead, find the largest *empty* gap between consecutive
+    angles, treating them as points on a circle, and take what remains.
+    """
+    if len(dx) < 2:
+        return 0.0
+    angles = np.sort(np.arctan2(dy, dx))
+    gaps = np.diff(angles)
+    wrap_gap = (angles[0] + 2 * np.pi) - angles[-1]
+    largest_gap = max(float(np.max(gaps)) if len(gaps) else 0.0, float(wrap_gap))
+    return float(np.degrees(2 * np.pi - largest_gap))
+
+
 def fit_ru_circle(z_real: np.ndarray, z_imag: np.ndarray,
                   start: int | None = None, stop: int | None = None) -> RuResult:
     """Fit a circle to the Nyquist arc and return Ru (high-frequency intercept).
@@ -184,6 +222,8 @@ def fit_ru_circle(z_real: np.ndarray, z_imag: np.ndarray,
     radial = np.sqrt((xs - a) ** 2 + (ys - b) ** 2)
     rmse = float(np.sqrt(np.mean((radial - r) ** 2)))
 
+    coverage = _angular_coverage_deg(xs - a, ys - b)
+
     return RuResult(
         ru=float(ru),
         rct=float(rct) if rct is not None else None,
@@ -192,6 +232,7 @@ def fit_ru_circle(z_real: np.ndarray, z_imag: np.ndarray,
         radius=r,
         rmse=rmse,
         arc_slice=(start, stop),
+        arc_coverage_deg=coverage,
     )
 
 

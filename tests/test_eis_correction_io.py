@@ -222,3 +222,24 @@ def test_list_sheets_closes_its_handle(tmp_path):
         warnings.simplefilter("error", ResourceWarning)
         assert data_io.list_sheets(path)
     path.unlink()  # would raise PermissionError on Windows if still open
+
+
+def test_arc_coverage_measures_the_fitted_span():
+    """A Nyquist arc's high-frequency end sits on the branch cut of arctan2,
+    so a naive max-minus-min angle reads a 45° arc as a full turn."""
+    for fraction in (0.05, 0.25, 0.5, 1.0):
+        theta = np.linspace(np.pi, np.pi * (1 - fraction), 40)
+        zr = 75 + 50 * np.cos(theta)
+        zi = 50 * np.sin(theta)
+        result = eis.fit_ru_circle(zr, zi)
+        assert result.arc_coverage_deg == pytest.approx(fraction * 180, abs=0.5)
+        assert result.ru == pytest.approx(25.0, abs=0.05)
+
+
+def test_short_arcs_are_flagged_as_extrapolated():
+    short = np.linspace(np.pi, np.pi * 0.9, 30)
+    wide = np.linspace(np.pi, np.pi * 0.4, 30)
+    short_fit = eis.fit_ru_circle(75 + 50 * np.cos(short), 50 * np.sin(short))
+    wide_fit = eis.fit_ru_circle(75 + 50 * np.cos(wide), 50 * np.sin(wide))
+    assert short_fit.is_extrapolated
+    assert not wide_fit.is_extrapolated

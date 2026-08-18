@@ -453,9 +453,13 @@ def infer_reaction(potential: np.ndarray, current: np.ndarray,
 
     if cathodic:
         if e_mid > 0.95:
+            # Above 1.23 V a cathodic current cannot be O₂ reduction driven by
+            # overpotential at all, so the wording must not claim it sits below
+            # the equilibrium.
+            where = ("above" if e_mid > 1.23 else "just below")
             return ReactionGuess(
                 "ORR", "medium",
-                f"cathodic current at {window}, just below the O₂/H₂O "
+                f"cathodic current at {window}, {where} the O₂/H₂O "
                 "equilibrium (1.23 V) — but check this is not a reduction "
                 "of the electrode itself",
             )
@@ -472,6 +476,16 @@ def infer_reaction(potential: np.ndarray, current: np.ndarray,
                 "CO₂RR/N₂RR/NO₃RR run at similar potentials — set it "
                 "manually if your electrolyte says otherwise",
             )
+        if e_mid >= 0.0:
+            # A poor ORR catalyst can push its wave down into this band; do not
+            # claim HER with high confidence where both are plausible.
+            return ReactionGuess(
+                "HER", "medium",
+                f"cathodic current at {window}, just above the H⁺/H₂ "
+                "equilibrium (0 V) — HER is the likeliest, but a poor ORR "
+                "catalyst reaches this low too; set it manually if you are "
+                "running O₂-saturated electrolyte",
+            )
         return ReactionGuess(
             "HER", "high",
             f"cathodic current at {window}, at/below the H⁺/H₂ equilibrium (0 V)",
@@ -482,19 +496,22 @@ def infer_reaction(potential: np.ndarray, current: np.ndarray,
             "OER", "high",
             f"anodic current at {window}, above the O₂/H₂O equilibrium (1.23 V)",
         )
-    if e_hi >= 1.35:
-        return ReactionGuess(
-            "OER", "medium",
-            f"anodic current reaching {e_hi:.2f} V vs RHE — past the OER onset",
-        )
     # HOR is identified by where the current *starts*, not where it peaks:
     # it is the only anodic reaction already passing current at the H2/H+
-    # equilibrium, and its branch then climbs well past 0 V.
+    # equilibrium, and its branch then climbs well past 0 V. This test must
+    # come before the "reaches 1.35 V" OER branch: an HOR sweep swept all the
+    # way up past 1.4 V satisfies both, and the starting potential is the
+    # discriminating evidence.
     if e_lo <= 0.25:
         return ReactionGuess(
             "HOR", "high",
             f"anodic current from {e_lo:.2f} V vs RHE — already flowing at "
             "the H₂/H⁺ equilibrium (0 V), which only H₂ oxidation does",
+        )
+    if e_hi >= 1.35:
+        return ReactionGuess(
+            "OER", "medium",
+            f"anodic current reaching {e_hi:.2f} V vs RHE — past the OER onset",
         )
     return ReactionGuess(
         default, "low",
@@ -649,6 +666,7 @@ def auto_tafel_range(potential: np.ndarray, log_i: np.ndarray,
 def fit_tafel(
     potential: np.ndarray, log_i: np.ndarray,
     start: int | None = None, stop: int | None = None,
+    current: np.ndarray | None = None, e_eq: float | None = None,
 ) -> TafelResult:
     """Linear-fit ``potential`` vs ``log_i`` over ``[start, stop)``.
 
@@ -658,11 +676,23 @@ def fit_tafel(
     log_i     : log10(|current|), same length as ``potential``.
     start, stop : index range of the linear region to fit; auto-detected if
                   omitted.
+    current, e_eq : forwarded to :func:`auto_tafel_range` when the range is
+                  auto-detected. Without ``current`` that detector cannot
+                  locate the onset and silently drops to its coarse
+                  best-R^2 window scan, so a caller that has the signed
+                  current (and the reaction's equilibrium potential) should
+                  pass them to get the onset-anchored, overpotential-capped
+                  region instead.
+
+    ``fit_slice`` on the result is the **requested** window, not the fitted
+    one: points that are non-finite in either array are dropped inside the
+    window before the regression. ``n_points`` is the count that actually
+    entered the fit, and ``decades`` the span they covered.
     """
     pot = np.asarray(potential, dtype=float)
     x = np.asarray(log_i, dtype=float)
     if start is None or stop is None:
-        a0, a1 = auto_tafel_range(pot, x)
+        a0, a1 = auto_tafel_range(pot, x, current=current, e_eq=e_eq)
         start = a0 if start is None else start
         stop = a1 if stop is None else stop
     start = max(0, int(start))

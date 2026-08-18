@@ -219,3 +219,36 @@ def test_infer_reaction_reports_a_reason():
 def test_nearest_reference_only_for_known_reactions():
     assert tafel.nearest_reference(118.0, "HER")[0] == 120.0
     assert tafel.nearest_reference(118.0, "MOR") is None
+
+
+def test_hor_swept_past_the_oer_window_is_still_hor():
+    """An HOR scan taken all the way up past 1.4 V satisfies both the "reaches
+    1.35 V" OER test and the "already flowing at 0 V" HOR test. Where the
+    current *starts* is the discriminating evidence, so HOR must win."""
+    pot = np.linspace(0.0, 1.45, 400)
+    cur = 2.0 * (1 - np.exp(-pot / 0.06))
+    assert tafel.infer_reaction(pot, cur).reaction == "HOR"
+
+
+def test_genuine_oer_is_not_misread_as_hor():
+    pot = np.linspace(1.0, 1.80, 400)
+    cur = np.exp((pot - 1.45) / 0.05)
+    assert tafel.infer_reaction(pot, cur).reaction == "OER"
+
+
+def test_cathodic_wave_just_above_zero_volts_is_not_high_confidence_her():
+    """A poor ORR catalyst reaches into the 0–0.15 V band; HER is likelier but
+    not certain, so the guess must not claim high confidence there."""
+    pot = np.linspace(0.35, 0.02, 300)
+    cur = -2.0 / (1 + np.exp((pot - 0.10) / 0.02))
+    guess = tafel.infer_reaction(pot, cur)
+    assert guess.reaction == "HER"
+    assert guess.confidence == "medium"
+    assert "ORR" in guess.reason
+
+
+def test_cathodic_current_above_1v23_is_not_described_as_below_it():
+    pot = np.linspace(1.60, 1.25, 300)
+    cur = -2.0 / (1 + np.exp((pot - 1.40) / 0.02))
+    guess = tafel.infer_reaction(pot, cur)
+    assert "just below" not in guess.reason

@@ -116,3 +116,89 @@ def test_export_formats_are_declared_consistently():
     for label, (ext, mime) in app._EXPORT_FORMATS.items():
         assert ext and mime and "/" in mime, label
     assert 300 in app._EXPORT_DPI_CHOICES
+
+
+def test_preset_export_size_hits_the_requested_column_width_at_every_dpi():
+    """Journals specify a width in centimetres. Kaleido sizes figures in CSS
+    pixels (1/96 in) and then multiplies by scale = dpi/96, so the physical
+    width follows from the CSS size alone. Converting cm to pixels *at dpi*
+    double-counts the resolution -- a 150 dpi single-column figure came out
+    13.4 cm instead of the 8.6 cm asked for."""
+    import app
+
+    for width_cm in app._JOURNAL_WIDTHS_CM.values():
+        if width_cm is None:  # "As shown on screen"
+            continue
+        css_w, css_h = app._preset_export_size(width_cm, 520, 520)
+        assert css_h == css_w  # a square figure stays square
+        for dpi in app._EXPORT_DPI_CHOICES:
+            scale = max(1.0, dpi / app._CSS_PX_PER_INCH)
+            printed_cm = (css_w * scale) / dpi * 2.54
+            assert printed_cm == pytest.approx(width_cm, abs=0.05), (
+                f"{width_cm} cm preset printed {printed_cm:.2f} cm at {dpi} dpi"
+            )
+
+    wide_w, wide_h = app._preset_export_size(17.8, 930, 680)
+    assert wide_h / wide_w == pytest.approx(680 / 930, rel=1e-3)
+
+
+def test_html_export_escapes_markup_in_user_supplied_names():
+    """Sample names, legend names and file names are user strings that end up
+    inside the ``<script>`` payload of the HTML export. Plotly escapes them,
+    but the export is a file the user then sends to a co-author, so pin the
+    behaviour: a downgrade that stopped escaping would be a real hole."""
+    import plotly.graph_objects as go
+
+    hostile = '</script><img src=x onerror="alert(1)">'
+    fig = go.Figure(go.Scatter(x=[1, 2], y=[1, 2], name=hostile))
+    fig.update_layout(title=hostile)
+    html = fig.to_html(include_plotlyjs="cdn", full_html=True)
+    assert "</script><img" not in html
+    assert "onerror=\"alert(1)\"" not in html
+
+
+def _kaleido_available() -> bool:
+    """Whether static image export actually works here (kaleido needs a
+    headless browser, which is not present on every machine or CI runner)."""
+    import plotly.graph_objects as go
+
+    try:
+        go.Figure().to_image(format="png", width=200, height=200)
+        return True
+    except Exception:
+        return False
+
+
+@pytest.mark.skipif(not _kaleido_available(),
+                    reason="kaleido/headless browser not available")
+@pytest.mark.parametrize("dpi", [150, 300, 600])
+@pytest.mark.parametrize("fmt", ["tiff", "png", "jpeg", "svg", "pdf"])
+def test_export_renders_at_the_requested_physical_size(fmt, dpi):
+    """The whole export path, end to end: a single-column preset must come out
+    8.6 cm wide at every dpi, and every raster format must carry a dpi tag.
+
+    Both halves regressed before: the presets converted cm to pixels *at dpi*
+    while kaleido separately multiplies by dpi/96, so a 150 dpi figure came out
+    13.4 cm; and only TIFF went through Pillow, so PNG/JPEG claimed 72 dpi
+    however they were rendered."""
+    import io as _io
+
+    import plotly.graph_objects as go
+    from PIL import Image
+
+    import app
+
+    fig = go.Figure(go.Scatter(x=[0, 1], y=[0, -5], mode="lines"))
+    app.apply_plot_style(fig, {**app._default_style(), "show_title": False},
+                         "Potential vs RHE / V", "Current (mA/cm2)")
+    width, height = app._preset_export_size(8.6, 520, 520)
+    data = app._render_export(fig, fmt, width, height, dpi)
+    assert data
+
+    if fmt in ("svg", "pdf"):
+        return
+    image = Image.open(_io.BytesIO(data))
+    assert image.info.get("dpi"), f"{fmt} carries no dpi tag"
+    assert float(image.info["dpi"][0]) == pytest.approx(dpi, abs=1)
+    printed_cm = image.size[0] / dpi * 2.54
+    assert printed_cm == pytest.approx(8.6, abs=0.05)

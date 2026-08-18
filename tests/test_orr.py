@@ -206,3 +206,42 @@ def test_levich_slope_to_n_returns_a_magnitude():
 
 def test_angular_velocity_conversion():
     assert orr.angular_velocity(1600.0) == pytest.approx(2 * np.pi * 1600 / 60)
+
+
+def test_all_zero_disk_current_yields_no_peroxide_number():
+    """With no disk current there is nothing for the ring signal to be a
+    fraction *of*; the formula would otherwise report a confident 100 %."""
+    disk = np.zeros(50)
+    ring = np.full(50, 0.01)
+    assert np.all(np.isnan(orr.peroxide_percent(disk, ring, 0.222)))
+    assert np.all(np.isnan(orr.electron_number(disk, ring, 0.222)))
+
+
+def test_duplicate_rotation_rates_are_averaged_not_double_counted():
+    """Three points at one x is not a line. Repeats collapse to their mean,
+    and the fit then fails the minimum-rates check honestly."""
+    with pytest.raises(ValueError):
+        orr.fit_koutecky_levich([1600, 1600, 1600], [-4.0, -4.2, -4.1])
+
+    dup = orr.fit_koutecky_levich(
+        [400, 400, 900, 1600], [-2.0, -2.2, -3.0, -4.0])
+    avg = orr.fit_koutecky_levich([400, 900, 1600], [-2.1, -3.0, -4.0])
+    assert dup.n_rotation_rates == 3
+    assert dup.slope == pytest.approx(avg.slope, rel=1e-9)
+
+
+def test_negative_intercept_has_no_kinetic_current_density():
+    fit = orr.KoutieckyLevichFit(
+        potential=0.7, slope=1.0, intercept=-0.5,
+        r_squared=0.999, n_rotation_rates=4,
+    )
+    assert fit.kinetic_current_density is None
+    assert not fit.is_reliable
+
+
+def test_transport_parameters_must_be_positive():
+    for bad in (0.0, -1e-5, float("nan")):
+        with pytest.raises(ValueError):
+            orr.levich_current_density(4.0, 1600, bad, 1.0e-2, 1.2e-6)
+        with pytest.raises(ValueError):
+            orr.levich_slope_to_n(1.0, 1.9e-5, bad, 1.2e-6)

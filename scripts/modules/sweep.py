@@ -51,6 +51,14 @@ def monotonic_segments(potential) -> list[tuple[int, int]]:
     they appear. Flat steps (``dE == 0``) attach to the run in progress rather
     than starting a new one, so ordinary quantisation of the potential axis
     does not shred the sweep into fragments.
+
+    The segments are *maximal*, which means consecutive ones **share their
+    vertex point**: a turn at index ``b`` yields ``(.., b + 1)`` followed by
+    ``(b, ..)``. The vertex belongs to both legs — it is the last point of the
+    incoming ramp and the first of the outgoing one — so each returned range
+    spans the full potential its leg actually measured. Callers therefore get
+    ranges that overlap by exactly one index and must not assume the segments
+    partition the record.
     """
     pot = np.asarray(potential, dtype=float)
     n = len(pot)
@@ -73,9 +81,12 @@ def monotonic_segments(potential) -> list[tuple[int, int]]:
     first = int(np.flatnonzero(nz)[0])
     filled[:first] = sign[first]
 
-    breaks = np.flatnonzero(np.diff(filled) != 0) + 1
-    bounds = [0, *(int(b) + 1 for b in breaks), n]
-    return [(bounds[i], bounds[i + 1]) for i in range(len(bounds) - 1)]
+    # ``breaks`` are the indices of the turning *points* in ``pot``: a sign
+    # change between diff b-1 and diff b means pot[b] is the vertex.
+    breaks = [int(b) for b in np.flatnonzero(np.diff(filled) != 0) + 1]
+    starts = [0, *breaks]
+    stops = [b + 1 for b in breaks] + [n]
+    return list(zip(starts, stops))
 
 
 def main_sweep_indices(potential, min_fraction: float = _MIN_SEGMENT_FRACTION):
@@ -96,9 +107,9 @@ def main_sweep_indices(potential, min_fraction: float = _MIN_SEGMENT_FRACTION):
         return None
     if (start, stop) == (0, n):
         return None
-    # Keep the shared vertex point so the retained leg still spans the full
-    # potential range it actually measured.
-    return np.arange(max(0, start - 1), stop)
+    # ``monotonic_segments`` already includes the shared vertex at both ends of
+    # the leg, so the range is used as-is.
+    return np.arange(start, stop)
 
 
 def clean_sweep(potential, *arrays, strip_approach: bool = True):
@@ -178,6 +189,14 @@ def ascending_xy(x, y):
     ya = np.asarray(y, dtype=float)
     if len(xa) == 0:
         return xa, ya
+    # NaN x sorts to the end, where it becomes the array's upper bound and
+    # makes every query above the last real x extrapolate against it. Public
+    # callers (interp_at) can be handed raw instrument columns, so drop it.
+    finite = np.isfinite(xa)
+    if not finite.all():
+        xa, ya = xa[finite], ya[finite]
+        if len(xa) == 0:
+            return xa, ya
     order = np.argsort(xa, kind="stable")
     xs, ys = xa[order], ya[order]
     # Collapse runs of equal x to their mean y.

@@ -76,6 +76,12 @@ def _ring_disk_terms(disk_current, ring_current, collection_efficiency: float,
     denom = id_ + ir_n
 
     peak = float(np.nanmax(id_)) if np.isfinite(id_).any() else 0.0
+    if peak <= 0:
+        # No disk current anywhere: the ring signal alone carries no
+        # information about how the disk's electrons were split, and the
+        # formulas would confidently report n = 0 / 100 % H2O2 for every
+        # point. A zero floor would let that through, since |Id| >= 0 always.
+        return id_, ir_n, denom, np.zeros(len(id_), dtype=bool)
     floor = float(min_disk_fraction) * peak
     valid = np.isfinite(denom) & (denom > 0) & (id_ >= floor)
     return id_, ir_n, denom, valid
@@ -490,9 +496,14 @@ class KoutieckyLevichFit:
         """|j_k|, the mass-transport-free (kinetic) current density.
 
         Positive by construction: the fit runs on |j|, so j_k is a magnitude
-        and does not inherit the cathodic sweep's negative sign.
+        and does not inherit the cathodic sweep's negative sign. A fit whose
+        intercept comes out **negative** has no j_k at all -- 1/j_k cannot be
+        negative when j_k is a magnitude -- so this returns ``None`` rather
+        than a negative kinetic current density. It happens on scattered
+        Koutecky-Levich plots whose regression line crosses below the origin,
+        exactly the fits :attr:`is_reliable` also rejects.
         """
-        return None if self.intercept == 0 else float(1.0 / self.intercept)
+        return None if self.intercept <= 0 else float(1.0 / self.intercept)
 
     @property
     def is_reliable(self) -> bool:
@@ -502,7 +513,7 @@ class KoutieckyLevichFit:
         gives an ``n`` that is arithmetic, not evidence.
         """
         return (self.n_rotation_rates >= 3 and np.isfinite(self.r_squared)
-                and self.r_squared >= 0.95 and self.intercept != 0)
+                and self.r_squared >= 0.95 and self.intercept > 0)
 
 
 def fit_koutecky_levich(rpm, j, min_points: int = 3,
@@ -530,6 +541,15 @@ def fit_koutecky_levich(rpm, j, min_points: int = 3,
         floor = float(min_current_fraction) * float(np.max(j_arr[mask]))
         mask &= j_arr > floor
     rpm_arr, j_arr = rpm_arr[mask], j_arr[mask]
+    # The same rotation rate entered twice contributes two points at one x.
+    # That is not an independent lever on the slope: three rates recorded as
+    # 1600/1600/1600 would otherwise "fit" a line through a single x, where
+    # sxx = 0 and the slope is whatever the residual noise dictates. Average
+    # repeats instead, and let the min_points check below see the true count.
+    if len(rpm_arr) and len(np.unique(rpm_arr)) != len(rpm_arr):
+        uniq, inverse = np.unique(rpm_arr, return_inverse=True)
+        j_arr = np.bincount(inverse, weights=j_arr) / np.bincount(inverse)
+        rpm_arr = uniq
     if len(rpm_arr) < min_points:
         raise ValueError(
             f"Need at least {min_points} rotation rates for a Koutecky-Levich fit; "
@@ -560,6 +580,25 @@ def fit_koutecky_levich(rpm, j, min_points: int = 3,
     )
 
 
+def _validate_transport(diffusion_coeff_cm2_s: float,
+                        kinematic_viscosity_cm2_s: float,
+                        bulk_concentration_mol_cm3: float) -> None:
+    """Reject non-physical O2 transport parameters before they reach the
+    Levich prefactor.
+
+    ``D**(2/3)`` and ``nu**(-1/6)`` are fractional powers: on a negative
+    value Python raises a bare ``ValueError`` deep inside the arithmetic
+    (or numpy returns ``nan``), neither of which tells the user that the
+    diffusion coefficient they typed was the problem. A zero concentration
+    or viscosity is equally meaningless, and zero viscosity divides by zero.
+    """
+    for name, value in (("Diffusion coefficient D", diffusion_coeff_cm2_s),
+                        ("Kinematic viscosity nu", kinematic_viscosity_cm2_s),
+                        ("Bulk O2 concentration C", bulk_concentration_mol_cm3)):
+        if not np.isfinite(value) or value <= 0:
+            raise ValueError(f"{name} must be a positive number; got {value!r}.")
+
+
 def levich_slope_to_n(kl_slope: float, diffusion_coeff_cm2_s: float,
                       kinematic_viscosity_cm2_s: float,
                       bulk_concentration_mol_cm3: float,
@@ -567,6 +606,8 @@ def levich_slope_to_n(kl_slope: float, diffusion_coeff_cm2_s: float,
     """Electron-transfer number ``n`` from a Koutecky-Levich slope
     (``1/B``) and the electrolyte's O2 transport parameters:
     ``n = B / (0.62 * F * D^(2/3) * nu^(-1/6) * C)``."""
+    _validate_transport(diffusion_coeff_cm2_s, kinematic_viscosity_cm2_s,
+                        bulk_concentration_mol_cm3)
     if kl_slope == 0 or not np.isfinite(kl_slope):
         return None
     b = 1.0 / kl_slope
@@ -590,6 +631,8 @@ def levich_current_density(n_electrons: float, rpm: float,
     1600 rpm is nowhere near the 4-electron value, the discrepancy is in the
     units, the electrode area, or the electrolyte parameters -- not in the fit.
     """
+    _validate_transport(diffusion_coeff_cm2_s, kinematic_viscosity_cm2_s,
+                        bulk_concentration_mol_cm3)
     b = (0.62 * float(n_electrons) * faraday_c_per_mol
          * diffusion_coeff_cm2_s ** (2 / 3)
          * kinematic_viscosity_cm2_s ** (-1 / 6) * bulk_concentration_mol_cm3)

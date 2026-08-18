@@ -135,6 +135,36 @@ def reconcile_ru(
     return ru / float(area_cm2)       # Ω·cm² -> Ω
 
 
+def convert_ru_unit(
+    ru: float,
+    from_unit: str,
+    to_unit: str,
+    area_cm2: float | None = None,
+) -> float:
+    """Convert a Ru value between the two supported units (Ω, Ω·cm²).
+
+    Unlike :func:`reconcile_ru` (which picks the target unit from a current
+    unit's density-ness), this converts directly between the two Ru units —
+    e.g. for a value typed in by the user that isn't already in the unit the
+    rest of the analysis is using. Returns ``ru`` unchanged when the units
+    already match (area not required in that case).
+    """
+    if from_unit not in RU_UNITS:
+        raise ValueError(f"Unknown Ru unit {from_unit!r}; expected one of {RU_UNITS}.")
+    if to_unit not in RU_UNITS:
+        raise ValueError(f"Unknown Ru unit {to_unit!r}; expected one of {RU_UNITS}.")
+    ru = float(ru)
+    if from_unit == to_unit:
+        return ru
+    if not area_cm2 or area_cm2 <= 0:
+        raise ValueError(
+            "Electrode area (cm²) is required to convert between Ω and Ω·cm²."
+        )
+    if from_unit == RU_OHM and to_unit == RU_OHM_CM2:
+        return ru * float(area_cm2)   # Ω -> Ω·cm²
+    return ru / float(area_cm2)       # Ω·cm² -> Ω
+
+
 def apply_ir_correction(
     potential: np.ndarray,
     current: np.ndarray,
@@ -151,7 +181,9 @@ def apply_ir_correction(
     potential : measured potential, V.
     current   : measured current (or current density) in ``current_unit``.
     ru        : uncompensated resistance from EIS fitting, in ``ru_unit``.
-    factor_percent : compensation fraction in percent (clamped to 5..85).
+    factor_percent : compensation fraction in percent, clamped to
+                     ``[MIN_FACTOR_PERCENT, MAX_FACTOR_PERCENT]`` by
+                     :func:`clamp_factor_percent`.
     current_unit   : one of :data:`CURRENT_UNITS` (absolute) or
                      :data:`CURRENT_DENSITY_UNITS` (per-area).
     ru_unit        : ``"Ω"`` or ``"Ω·cm²"``.

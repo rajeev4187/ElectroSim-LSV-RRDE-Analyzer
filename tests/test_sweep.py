@@ -129,3 +129,43 @@ def test_clean_sweep_drops_non_finite_rows_in_lockstep():
     p, c = sweep.clean_sweep(pot, cur, strip_approach=False)
     assert len(p) == len(c) == 3
     assert np.all(np.isfinite(p)) and np.all(np.isfinite(c))
+
+
+def test_monotonic_segments_share_their_vertex():
+    """A turning point belongs to both legs, so each returned range spans the
+    full potential its leg measured. The segments deliberately overlap by one
+    index; they do not partition the record."""
+    pot = np.concatenate([np.linspace(0.0, 1.0, 11), np.linspace(0.9, 0.0, 10)])
+    segs = sweep.monotonic_segments(pot)
+    assert len(segs) == 2
+    (a0, a1), (b0, b1) = segs
+    assert a1 - 1 == b0 == 10          # shared vertex index
+    assert (a0, b1) == (0, len(pot))
+    # Both legs reach the vertex potential.
+    assert pot[a1 - 1] == pytest.approx(1.0)
+    assert pot[b0] == pytest.approx(1.0)
+
+
+def test_monotonic_segments_handles_three_legs():
+    pot = np.concatenate([
+        np.linspace(0.0, 1.0, 11),
+        np.linspace(0.9, -0.5, 15),
+        np.linspace(-0.4, 0.6, 11),
+    ])
+    segs = sweep.monotonic_segments(pot)
+    assert len(segs) == 3
+    assert segs[0][1] - 1 == segs[1][0]
+    assert segs[1][1] - 1 == segs[2][0]
+    assert segs[0][0] == 0 and segs[-1][1] == len(pot)
+
+
+def test_main_sweep_keeps_the_full_vertex_to_end_leg():
+    """The approach leg is dropped but the vertex point it ends on is kept, so
+    the retained sweep still starts at the extreme potential measured."""
+    approach = np.linspace(1.0, 1.41, 21)
+    scan = np.linspace(1.40, 0.20, 200)
+    pot = np.concatenate([approach, scan])
+    keep = sweep.main_sweep_indices(pot)
+    assert pot[keep][0] == pytest.approx(1.41)
+    assert pot[keep][-1] == pytest.approx(0.20)
+    assert len(keep) == 201
