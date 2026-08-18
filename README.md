@@ -111,6 +111,26 @@ CI runs the same checks on Python 3.12, 3.13 and 3.14 (see
 resolves on 3.14 to a release with no matching wheel and forces a source
 build.
 
+### Deployment
+
+System packages for Streamlit Community Cloud live in
+[`packages.txt`](packages.txt). **That file must contain nothing but package
+names, one per line** — the platform feeds it to `apt-get install` verbatim, so
+a `#` comment is not skipped but passed along as a package name, and the failed
+lookups make the whole install exit non-zero before `requirements.txt` is ever
+reached. The rationale for each entry is therefore recorded here instead:
+
+- `fonts-liberation`, `fonts-noto-core`, `fonts-noto-extra` — figures are drawn
+  twice: on screen by the viewer's browser, and for download by kaleido's
+  headless browser on the server. The font stacks in `app.py` fall back through
+  these faces; without them the server render substitutes something arbitrary,
+  which is how axis labels full of `log₁₀`, `Ω`, `−Z″`, `%H₂O₂` and `⁻²` end up
+  as tofu boxes in a downloaded figure that looked perfect in the browser.
+- `chromium` — the browser kaleido 1.x drives. The 0.x wheels bundled one; 1.x
+  does not, and without a browser on the host every TIFF/PNG/SVG/PDF download
+  fails on the deployed app. (The HTML download and the chart's own 📷 button
+  keep working either way, since both render in the viewer's browser.)
+
 ---
 
 ## Loading data

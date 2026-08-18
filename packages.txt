@@ -1,17 +1,4 @@
-# Debian packages installed by Streamlit Community Cloud before requirements.txt.
-#
-# Fonts. Figures are drawn twice: on screen by the viewer own browser, and
-# for download by kaleido headless browser on this host. The font stacks in
-# app.py fall back through these faces, and without them installed the server
-# render substitutes something arbitrary -- which is how axis labels full of
-# log10, Ohm, -Z, %H2O2 end up as tofu boxes in a downloaded figure that
-# looked perfect in the browser.
 fonts-liberation
 fonts-noto-core
 fonts-noto-extra
-
-# The browser kaleido 1.x drives. The 0.x wheels bundled one; 1.x does not, and
-# without a browser here every TIFF/PNG/SVG/PDF download fails on the deployed
-# app (the HTML download and the chart own camera button still work, since
-# both render in the viewer browser).
 chromium
