@@ -82,9 +82,20 @@ Open `http://localhost:8501`. Choose **Use bundled sample** in the sidebar to
 try the EIS/LSV tabs instantly, or load `sample-data/Example ORR 0-1 M KOH/`
 for a full five-rotation-rate RRDE dataset.
 
-Image export (TIFF/PNG/SVG/PDF/JPEG) needs headless Chrome via `kaleido`; if
-it is missing, run `plotly_get_chrome` or use the HTML/CSV downloads, which
-need no external renderer.
+Image export (TIFF/PNG/SVG/PDF/JPEG) drives a headless Chrome through
+`kaleido` 1.x, which — unlike the 0.x wheels — does not bundle a browser. Any
+installed Chrome or Chromium is used; if there is none, run
+`plotly_get_chrome`. Should kaleido report *"requires Google Chrome to be
+installed"* on a machine that has it, the export is automatically retried with
+the browser's path handed over explicitly (its own search reads
+`%PROGRAMFILES%` and friends, which a launching shell can drop). The HTML and
+CSV downloads, and the 📷 button on each chart, need no renderer at all —
+they are drawn by your own browser.
+
+Deployments get `chromium` and the fallback fonts from `packages.txt`. Those
+fonts matter: the figure you see is drawn by your browser, the one you
+download by the server's, and without Liberation/Noto installed there the
+labels full of `log₁₀`, `Ω`, `−Z″` and `%H₂O₂` come back as empty boxes.
 
 ### Development
 

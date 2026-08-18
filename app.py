@@ -26,11 +26,15 @@ Workflow
 
 from __future__ import annotations
 
+import functools
 import hashlib
 import hmac
 import io
 import math
+import os
 import re
+import shutil
+import sys
 import zipfile
 
 import numpy as np
@@ -290,6 +294,72 @@ def _flatten_to_rgb(image: "Image.Image") -> "Image.Image":
     return flat
 
 
+@functools.lru_cache(maxsize=1)
+def _browser_path() -> str | None:
+    """Full path to an installed Chrome/Chromium, or ``None`` if there is none.
+
+    Kaleido 1.x dropped the bundled browser the 0.x wheels carried and now
+    drives a real Chrome. It finds one by checking a fixed list of install
+    locations, and on Windows that list is built from ``%PROGRAMFILES%``,
+    ``%PROGRAMFILES(X86)%`` and ``%LOCALAPPDATA%`` -- so a server started
+    from an environment where those are missing or rewritten reports "Kaleido
+    requires Google Chrome to be installed" on a machine where Chrome is
+    sitting in Program Files. Looking it up here as well gives
+    :func:`_render_export` a path to hand kaleido explicitly when its own
+    discovery comes up empty.
+    """
+    for exe in ("chrome", "google-chrome", "google-chrome-stable", "chromium",
+                "chromium-browser"):
+        found = shutil.which(exe)
+        if found:
+            return found
+
+    candidates: list[str] = []
+    if sys.platform == "win32":
+        roots = [os.environ.get("PROGRAMFILES", r"C:\Program Files"),
+                 os.environ.get("PROGRAMFILES(X86)", r"C:\Program Files (x86)"),
+                 os.environ.get("LOCALAPPDATA", "")]
+        for root in filter(None, roots):
+            candidates += [
+                rf"{root}\Google\Chrome\Application\chrome.exe",
+                rf"{root}\Chromium\Application\chrome.exe",
+            ]
+    elif sys.platform == "darwin":
+        candidates += [
+            "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+            "/Applications/Chromium.app/Contents/MacOS/Chromium",
+        ]
+    else:
+        candidates += ["/usr/bin/google-chrome-stable", "/usr/bin/google-chrome",
+                       "/usr/bin/chromium", "/usr/bin/chromium-browser"]
+    return next((p for p in candidates if os.path.isfile(p)), None)
+
+
+def _figure_to_png(export_fig, width: int, height: int, scale: float) -> bytes:
+    """Kaleido's PNG for a figure, retrying with an explicitly located browser.
+
+    The plain call is the fast path. If it fails -- kaleido's own Chrome
+    discovery came up empty, or the launch fell over -- and a browser can be
+    found on this machine, it is retried with that path handed straight to
+    kaleido, which is what turns "requires Google Chrome to be installed" on a
+    machine that has Chrome back into a rendered figure.
+    """
+    try:
+        return export_fig.to_image(format="png", width=width, height=height,
+                                   scale=scale)
+    except Exception:
+        path = _browser_path()
+        if not path:
+            raise
+        import kaleido  # only needed on this fallback path
+        return kaleido.calc_fig_sync(
+            export_fig,
+            opts={"format": "png", "width": width, "height": height,
+                  "scale": scale},
+            kopts={"path": path},
+        )
+
+
 def _render_export(export_fig, fmt: str, width: int, height: int,
                    dpi: int = 300) -> bytes:
     """Render a figure to ``fmt`` at ``dpi``.
@@ -316,11 +386,21 @@ def _render_export(export_fig, fmt: str, width: int, height: int,
         # Vector: dpi is meaningless. Kaleido sizes these in CSS pixels, the
         # same unit as the raster paths (not in points, despite the sizes
         # looking point-like at typical figure dimensions).
-        return export_fig.to_image(format=fmt, width=width, height=height)
+        try:
+            return export_fig.to_image(format=fmt, width=width, height=height)
+        except Exception:
+            path = _browser_path()
+            if not path:
+                raise
+            import kaleido  # see _figure_to_png for why this retry exists
+            return kaleido.calc_fig_sync(
+                export_fig,
+                opts={"format": fmt, "width": width, "height": height},
+                kopts={"path": path},
+            )
 
     scale = max(1.0, float(dpi) / 96.0)
-    png_bytes = export_fig.to_image(format="png", width=width, height=height,
-                                    scale=scale)
+    png_bytes = _figure_to_png(export_fig, width, height, scale)
     image = _flatten_to_rgb(Image.open(io.BytesIO(png_bytes)))
     buffer = io.BytesIO()
     if fmt == "tiff":
@@ -475,10 +555,22 @@ def figure_downloads(fig, stem: str, key: str, what: str = "figure",
                     st.caption("↻ Format or resolution changed since this was "
                                "rendered — press Render again to refresh it.")
             elif cached.get("error"):
+                # Kaleido's own message says to install Chrome. When one is
+                # already on the machine that is misleading -- the render was
+                # retried with that exact path (see _figure_to_png) and still
+                # failed, so the browser is not the thing to go and fix.
+                found = _browser_path()
                 st.caption(
-                    f"Image export unavailable ({cached['error']}). Use the "
-                    "HTML download beside this button, or the 📷 icon on the "
-                    "chart itself — neither needs a renderer."
+                    f"Image export failed ({cached['error']})."
+                    + (f" A browser was found at `{found}` and used for a "
+                       "retry, so this is not a missing Chrome — try Render "
+                       "again, and if it keeps failing, close any stray "
+                       "chrome.exe processes."
+                       if found else
+                       " No Chrome/Chromium was found on this machine; "
+                       "install one, or run `plotly_get_chrome`.")
+                    + " The HTML download beside this button and the 📷 icon "
+                    "on the chart need no renderer."
                 )
 
         with cols[1]:
