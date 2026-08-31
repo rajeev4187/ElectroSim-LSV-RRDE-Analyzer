@@ -229,6 +229,10 @@ Desktop.ini
 # Personal local sample data
 sample-data/Obed data/
 
-# Generated figures
+# Generated figures (kept local only, not published)
 figures/
-!figures/reviewer-response/PROGRESS.md
+
+# One-off scripts for the Obed-data reviewer-response figures (local only)
+scripts/make_reviewer_figures.py
+scripts/make_eis_figures.py
+scripts/make_circuit_diagram.py
