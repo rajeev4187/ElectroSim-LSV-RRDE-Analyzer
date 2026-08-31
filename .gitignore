@@ -236,3 +236,4 @@ figures/
 scripts/make_reviewer_figures.py
 scripts/make_eis_figures.py
 scripts/make_circuit_diagram.py
+scripts/make_results_docx.py
