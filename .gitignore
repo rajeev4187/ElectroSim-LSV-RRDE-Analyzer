@@ -225,3 +225,10 @@ Desktop.ini
 # Editor workspace settings (local to a contributor's machine)
 .vscode/
 .idea/
+
+# Personal local sample data
+sample-data/Obed data/
+
+# Generated figures
+figures/
+!figures/reviewer-response/PROGRESS.md
