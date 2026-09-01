@@ -5461,7 +5461,10 @@ def render_orr_tab(shared_instrument_file: tuple[bytes, str] | None = None) -> N
              "plateau. **Steepest** takes the inflection point instead and "
              "does not care whether the plateau is flat. **d²I/dE²** finds "
              "that same inflection as a zero-crossing (sub-grid precision, "
-             "but more sensitive to noise).",
+             "but more sensitive to noise) — on clean data it can land "
+             "within a millivolt of Steepest, which is expected, not a "
+             "sign the selector had no effect (the table shows 4 dp so the "
+             "difference stays visible).",
     )]
     ehw_lo = ehw1.number_input(
         "E½ search window min (V vs RHE)", value=0.4, step=0.05, format="%.2f",
@@ -5549,8 +5552,13 @@ def render_orr_tab(shared_instrument_file: tuple[bytes, str] | None = None) -> N
             )
         row = {
             "Sample": lbl, "Rotation rate (rpm)": s["rpm"],
-            "E_onset (V vs RHE)": round(onset_res.onset_potential, 3),
-            "E_half-wave (V vs RHE)": round(e_half, 3),
+            # 4 dp, not 3: "steepest" and "second_derivative" locate the same
+            # inflection point by different numerical routes and often land
+            # within ~1 mV of each other on smooth data — at 3 dp they can
+            # round to an identical value, which looks like the method
+            # selector has no effect even though it genuinely recomputed.
+            "E_onset (V vs RHE)": round(onset_res.onset_potential, 4),
+            "E_half-wave (V vs RHE)": round(e_half, 4),
             f"j_limiting ({display_unit})": round(onset_res.limiting_current, 4),
         }
 
