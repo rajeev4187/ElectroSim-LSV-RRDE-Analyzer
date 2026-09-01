@@ -5,12 +5,14 @@ get the numbers and the figure.**
 
 Live app: <https://lsv-analysis-ir-compensation-tafel-slope.streamlit.app/>
 
-A Streamlit application that takes raw potentiostat exports (Excel/CSV/ZIP)
-and returns the quantities electrocatalysis papers actually report — Ru, iR-
-corrected curves, onset potentials, overpotentials at benchmark current
-densities, Tafel slopes, Koutecký–Levich electron numbers, half-wave
-potentials, and RRDE peroxide yields — together with journal-styled plots and
-export-ready tables. No scripting, no installation, no data leaving memory.
+A Streamlit application that takes raw potentiostat exports (Excel/CSV/ZIP, or
+a Biologic/Pine instrument file directly) and returns the quantities
+electrocatalysis papers actually report — Ru, iR-corrected curves, onset
+potentials, overpotentials at benchmark current densities, Tafel slopes,
+Koutecký–Levich electron numbers, half-wave potentials, RRDE peroxide yields,
+and long-duration stability (% retention, degradation rate) — together with
+journal-styled plots and export-ready tables. No scripting, no installation,
+no data leaving memory.
 
 ---
 
@@ -20,14 +22,20 @@ export-ready tables. No scripting, no installation, no data leaving memory.
 | --- | --- |
 | Release | **v1.1.0** — stable, actively maintained |
 | Deployment | Public Streamlit Cloud app (link above); runs locally the same way |
-| Scope | 5 independent analysis modules, ~5.5 k lines of Python |
+| Scope | 6 independent analysis modules, ~6.5 k lines of Python |
 | Data handling | In-memory only; optional password gate; one-click session reset |
 | License | MIT |
 
-Recent additions: batch ZIP loading of whole RRDE data folders, replicate-group
-statistics (mean ± SD) for LSV fits, reaction-aware automatic Tafel-region
-detection, stacked ring/disk multi-rotation-rate plots, and independent but
-linked EIS and LSV iR-correction tabs.
+Recent additions: a **Chrono / Stability** tab (chronoamperometry and
+chronopotentiometry — % retention, degradation rate, time-to-90 %/half-life),
+direct import of raw **Biologic (.mpr/.mpt)** and **Pine Research AfterMath
+(.paax)** instrument files with a per-experiment picker (a `.paax` project can
+bundle many studies) and a sidebar upload shared across tabs, per-sample data
+trimming to cut a noisy/unsettled opening or a bad tail before it skews an
+average, dedicated E_onset comparison charts (plus onset markers on the
+curves themselves) on the LSV Analysis and ORR/RRDE tabs, and a
+chemical-formula helper (`TiO2` → `TiO₂`, plus a subscript/superscript/Greek
+palette) on every sample-name field.
 
 ---
 
@@ -40,6 +48,7 @@ linked EIS and LSV iR-correction tabs.
 | **LSV Analysis** | One or many `Potential, Current` files | Onset potential, η at benchmark j (e.g. 10 mA/cm²), auto-detected Tafel region, Tafel slope + R² + mechanistic benchmark, multi-sample overlays |
 | **K-L Analysis** | RDE curves at 3+ rotation rates | Koutecký–Levich fit at several potentials → kinetic current density j_k and electron-transfer number n |
 | **ORR / RRDE Analysis** | Disk-only or disk + ring, 1+ samples, 1+ rotation rates | Onset, half-wave potential E½, mass-transport-corrected Tafel slope, electron number n and %H₂O₂ from ring/disk current, merged multi-rpm ring/disk figures |
+| **Chrono / Stability** | Chronoamperometry (current vs time) or chronopotentiometry (potential vs time), 1+ samples | % retention vs. time, degradation rate, time to 90 % retention, half-life, with per-sample data trimming and a final-retention comparison chart |
 
 Cross-cutting features:
 
@@ -56,6 +65,15 @@ Cross-cutting features:
   volts.
 - **Replicate groups** — repeat scans sharing a group name get every fitted
   value reported as **mean ± SD** in its own results section.
+- **Chemical-formula sample names** — an "Aa→A" button lowers a typed formula's
+  digits to Unicode subscripts (`LiFePO4` → `LiFePO₄`), plus a palette of
+  subscripts, superscripts, Greek letters and symbols, on every sample-name
+  field across the app. Unicode throughout, not markup, so the name survives
+  a plot legend, a table, a CSV and a file name alike.
+- **Raw instrument files, no CSV round-trip** — a Biologic EC-Lab `.mpr`/`.mpt`
+  export or a Pine Research AfterMath `.paax` export can be uploaded directly
+  on the EIS, LSV Analysis, ORR/RRDE and Chrono tabs (including their ZIP
+  batch-upload modes); other vendor formats still go through CSV/Excel.
 - **Publication-styled export** — Arial fonts, selectable size, closed box
   axes, draggable legends and slope labels.
 - **Figure styling, under your control.** A **Plot appearance** panel on every
@@ -136,19 +154,47 @@ reached. The rationale for each entry is therefore recorded here instead:
 ## Loading data
 
 - **EIS / LSV tabs** — one Excel workbook (Sheet 1 = EIS `Z'`, `Z''`;
-  Sheet 2 = LSV `Potential`, `Current`) or two CSVs. Several samples can sit
-  side-by-side as repeated column pairs; pick the active one in the sidebar.
-- **LSV Analysis** — one `Potential, Current` file per sample (Excel or CSV),
-  combined into a single overlay.
-- **K-L and ORR/RRDE** — share one loader, in two styles:
-  - **Per-sample uploaders** for raw per-electrode files exactly as
+  Sheet 2 = LSV `Potential`, `Current`), two CSVs, or a Biologic/Pine
+  instrument file (see below). Several samples can sit side-by-side as
+  repeated column pairs; pick the active one in the sidebar.
+- **LSV Analysis** — one `Potential, Current` file per sample (Excel, CSV, or
+  a Biologic/Pine instrument file), combined into a single overlay; also
+  loadable in bulk from a ZIP.
+- **K-L, ORR/RRDE and Chrono/Stability** — share the same loading style:
+  - **Per-sample uploaders** for raw per-electrode/per-run files exactly as
     instrument software exports them
-    (`Disk Current vs Disk Potential (1600 RPM).csv`), or a compiled workbook
-    with `Potential, Disk current, Potential, Ring current` already paired.
-    Rotation rate and disk/ring role are guessed from the filename and can be
-    corrected by hand.
+    (`Disk Current vs Disk Potential (1600 RPM).csv`), a compiled workbook
+    with `Potential, Disk current, Potential, Ring current` already paired
+    (ORR/RRDE), or a Biologic/Pine instrument file. Rotation rate and
+    disk/ring role are guessed from the filename and can be corrected by
+    hand.
   - **Batch ZIP upload** — zip a data folder (one subfolder per sample) and
-    load everything at once, roles and rotation rates read from filenames.
+    load everything at once, roles and rotation rates read from filenames;
+    instrument files inside the zip are recognised too.
+- **Raw instrument files** — a **Biologic EC-Lab** `.mpr` (binary) or `.mpt`
+  (ASCII export), read via the third-party `galvani` library, or a **Pine
+  Research AfterMath** `.paax` project file, which turned out to be plain
+  XML and is parsed with the standard library — no extra dependency. Other
+  vendor formats (e.g. CH Instruments `.bin`) aren't supported yet; export to
+  CSV/text from the instrument's own software instead.
+  - **Experiment picker.** A `.paax` project routinely bundles many studies
+    — one real export on hand held 14, including a failed EIS run. Whenever
+    a file has more than one usable experiment for the tab you're on, a
+    dropdown (labelled by AfterMath's own technique + timestamp) lets you
+    pick which one, instead of silently taking whichever happened to sort
+    first.
+  - **Shared across tabs.** A sidebar **Instrument file** uploader makes one
+    uploaded file available on the EIS, LSV Analysis, ORR/RRDE and Chrono
+    tabs at once — each still opts in and picks its own experiment; a
+    direct upload on a specific tab overrides the shared one just for that
+    tab.
+  - **RRDE multi-rpm auto-merge.** A rotating ring-disk run is normally
+    several experiments in the file, one per rotation rate, each with its
+    own disk *and* ring current stream. The ORR/RRDE tab's picker becomes a
+    multi-select, pre-checked with every rotation-rate experiment it finds
+    — disk, ring, and the rpm itself (read from the experiment's own name)
+    all load together as one multi-rpm sample instead of one rate at a
+    time.
 
 Electrolyte O₂ transport parameters for K-L ship as presets for 0.1 M KOH,
 0.1 M HClO₄, and 0.5 M H₂SO₄, or can be entered manually.
@@ -163,6 +209,7 @@ Koutecký–Levich  1/j = 1/j_k + 1/(B·w^0.5),  w = 2·pi·rpm/60,
                  B = 0.62 n F D^(2/3) v^(-1/6) C
 RRDE             n = 4|Id| / (|Id| + |Ir|/N)
                  %H2O2 = 200(|Ir|/N) / (|Id| + |Ir|/N)
+Chrono           retention(t) = value(t) / mean(value[0, t_baseline]) x 100%
 ```
 
 - Koutecký, J.; Levich, V. G. *Zh. Fiz. Khim.* **1958**, *32*, 1565.
@@ -192,6 +239,10 @@ RRDE             n = 4|Id| / (|Id| + |Ir|/N)
   pinning at 100 %.
 - **E½ method is yours to choose** — the literature-standard j_lim/2
   interpolation (default), the steepest point, or the d²I/dE² inflection.
+- **Trimmable stability data.** A chrono-technique record's opening seconds
+  are often an electrode-equilibration transient, and a real % retention
+  needs a clean baseline, not that spike — the Chrono/Stability tab lets you
+  cut a bad opening or tail per sample, upstream of every plot and metric.
 
 Full technical notes — data formats, security hardening, and using the Python
 API without the GUI — are in the module docstrings under

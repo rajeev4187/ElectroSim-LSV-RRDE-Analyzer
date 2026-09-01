@@ -1,8 +1,16 @@
 # Hardened defaults for a public deployment.
 [server]
-# Cap upload size (MB). EIS/LSV files are tiny; this blunts DoS via huge files.
-maxUploadSize = 15
-maxMessageSize = 50
+# Cap upload size (MB). CSV/Excel EIS/LSV files are tiny, but a raw
+# instrument export (scripts/modules/instrument_formats.py) is not: a Pine
+# Research AfterMath .paax project routinely bundles many experiments'
+# worth of point data and can run tens of MB (36 MB on the largest real
+# sample this project has been tested against). 50 MB covers that with
+# headroom while staying well under Streamlit's own 200 MB default, so a
+# crafted huge upload still can't consume unbounded memory/CPU on a public
+# deployment -- data_io.py's own row/column/zip-bomb caps are the second
+# layer of that defense regardless of this limit.
+maxUploadSize = 50
+maxMessageSize = 200
 # Cross-site request forgery protection (keep on). CORS must stay enabled for
 # XSRF protection to function.
 enableXsrfProtection = true

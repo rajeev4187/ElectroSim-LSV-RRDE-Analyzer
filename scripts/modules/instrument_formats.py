@@ -47,8 +47,10 @@ real export file is available to verify against.
 
 from __future__ import annotations
 
+import re
 import xml.etree.ElementTree as ET
 from pathlib import Path
+from urllib.parse import unquote
 
 import numpy as np
 import pandas as pd
@@ -149,34 +151,44 @@ def _paax_stream_xy(data_el: ET.Element) -> tuple[np.ndarray, np.ndarray] | None
     return np.concatenate(x_parts), np.concatenate(y_parts)
 
 
+def _paax_stream_from_element(stream_el: ET.Element) -> dict | None:
+    """Parse one ``<stream>`` element into ``identifier`` (Pine's short tag,
+    e.g. ``"current"``), ``display_name`` (e.g. ``"Measured Current"``),
+    ``x_kind``/``y_kind`` (Pine's physical-quantity tags, e.g.
+    ``"time"``/``"current"``) and the concatenated, unit-normalised ``x``/
+    ``y`` arrays (see ``_PAAX_SCALE_TO_PROJECT_UNITS``). ``None`` if the
+    stream carries no identifier or no actual points (many GUI/derived-plot
+    streams reference their data elsewhere rather than embedding it)."""
+    ident_el = stream_el.find("identifier")
+    data_el = stream_el.find("data")
+    if ident_el is None or data_el is None:
+        return None
+    xy = _paax_stream_xy(data_el)
+    if xy is None:
+        return None
+    x, y = xy
+    name_el = stream_el.find("name/ascii")
+    x_units, y_units = data_el.find("X_units"), data_el.find("Y_units")
+    x_kind = x_units.get("qty_kind") if x_units is not None else None
+    y_kind = y_units.get("qty_kind") if y_units is not None else None
+    x = x * _PAAX_SCALE_TO_PROJECT_UNITS.get(x_kind, 1.0)
+    y = y * _PAAX_SCALE_TO_PROJECT_UNITS.get(y_kind, 1.0)
+    return {
+        "identifier": ident_el.get("name", ""),
+        "display_name": (name_el.text or "").strip() if name_el is not None else "",
+        "x_kind": x_kind, "y_kind": y_kind,
+        "x": x, "y": y,
+    }
+
+
 def _paax_streams(root: ET.Element):
-    """Yield one dict per ``<stream>`` that carries real point data:
-    ``identifier`` (Pine's short tag, e.g. ``"current"``), ``display_name``
-    (e.g. ``"Measured Current"``), ``x_kind``/``y_kind`` (Pine's physical-
-    quantity tags, e.g. ``"time"``/``"current"``) and the concatenated,
-    unit-normalised ``x``/``y`` arrays (see
-    ``_PAAX_SCALE_TO_PROJECT_UNITS``)."""
+    """Yield one dict per ``<stream>`` in the whole document that carries
+    real point data (see :func:`_paax_stream_from_element`) — every
+    experiment's streams flattened together, in document order."""
     for stream_el in root.iter("stream"):
-        ident_el = stream_el.find("identifier")
-        data_el = stream_el.find("data")
-        if ident_el is None or data_el is None:
-            continue
-        xy = _paax_stream_xy(data_el)
-        if xy is None:
-            continue
-        x, y = xy
-        name_el = stream_el.find("name/ascii")
-        x_units, y_units = data_el.find("X_units"), data_el.find("Y_units")
-        x_kind = x_units.get("qty_kind") if x_units is not None else None
-        y_kind = y_units.get("qty_kind") if y_units is not None else None
-        x = x * _PAAX_SCALE_TO_PROJECT_UNITS.get(x_kind, 1.0)
-        y = y * _PAAX_SCALE_TO_PROJECT_UNITS.get(y_kind, 1.0)
-        yield {
-            "identifier": ident_el.get("name", ""),
-            "display_name": (name_el.text or "").strip() if name_el is not None else "",
-            "x_kind": x_kind, "y_kind": y_kind,
-            "x": x, "y": y,
-        }
+        s = _paax_stream_from_element(stream_el)
+        if s is not None:
+            yield s
 
 
 def _paax_find(root: ET.Element, *, identifier: str | None = None,
@@ -198,6 +210,311 @@ def _paax_find(root: ET.Element, *, identifier: str | None = None,
             continue
         return s
     return None
+
+
+# --------------------------------------------------------------------------- #
+# Per-experiment candidates (a .paax file usually bundles several)            #
+# --------------------------------------------------------------------------- #
+# AfterMath's DAB tree nests one "experiment" node inside each named "study"
+# node, which itself holds the "X_results" node the actual data streams live
+# under (study -> experiment -> X_results -> streams -> stream). Confirmed
+# across every sample .paax on hand: the *experiment* node's own <name> is
+# always the literal placeholder text "experiment" -- never a real name --
+# while the *study* node one level up carries AfterMath's own generated
+# label, e.g. "RRDE Experiment[ 5b]2026-JUL-08 1513[ 23]20]" (technique +
+# timestamp, with some internal bracket noise from AfterMath's own numbering
+# left in deliberately: some real exports hold several same-technique,
+# same-minute studies distinguished only by that trailing number). A study's
+# own <name> is direct URL-encoded text (unlike a <stream>'s
+# <name><ascii>...</ascii></name>), so it needs unquoting.
+def _paax_node_index(root: ET.Element) -> dict[str, ET.Element]:
+    """``DAB_node`` index -> element, for every node in the file."""
+    return {el.get("index"): el for el in root.iter("DAB_node") if el.get("index")}
+
+
+def _paax_node_name(el: ET.Element | None) -> str | None:
+    """A DAB_node's own decoded ``<name>``, or ``None`` if it has none. The
+    raw text is URL-encoded, so trailing whitespace (e.g. a literal ``%20``)
+    only shows up *after* unquoting — stripped there, not before."""
+    if el is None:
+        return None
+    name_el = el.find("name")
+    if name_el is None or not name_el.text:
+        return None
+    decoded = unquote(name_el.text).strip()
+    return decoded or None
+
+
+def _paax_experiment_label(nodes: dict[str, ET.Element], experiment_idx: str | None) -> str:
+    """Human-readable label for one experiment — its parent study's own
+    name (technique + timestamp), or a bare index if even that is missing
+    (has happened for an aborted run that never got far enough to be
+    named)."""
+    exp_el = nodes.get(experiment_idx) if experiment_idx else None
+    study_idx = exp_el.get("parent") if exp_el is not None else None
+    name = _paax_node_name(nodes.get(study_idx)) if study_idx else None
+    return name or (f"Experiment {experiment_idx}" if experiment_idx else "Experiment")
+
+
+def _paax_matches_per_experiment(root: ET.Element, *,
+                                 identifier: str | tuple[str, ...] | None = None,
+                                 x_kind: str | None = None, y_kind: str | None = None,
+                                 name_contains: str | None = None):
+    """Yield ``(experiment_index, label, stream)`` for the first stream
+    within *each* experiment (``X_results`` block) matching every given
+    criterion, in document order — one candidate per experiment that has a
+    match, rather than :func:`_paax_find`'s single first-in-the-whole-file
+    match. This is what lets a caller offer "which experiment?" instead of
+    silently taking whichever happens to come first — including, in a real
+    multi-technique export, a failed or aborted one that merely happens to
+    sort earliest.
+
+    ``identifier`` accepts a tuple of Pine's own stream-identifier tags, not
+    just one: a technique that produces the same *shape* of curve can still
+    tag it differently -- a real export on hand carries a DPV (differential
+    pulse voltammetry) curve as ``"differential_current_vs_potential"``,
+    distinct from CV/LSV's plain ``"current_vs_potential"``, and both are
+    genuine potential-vs-current sweeps a caller may want to accept. This is
+    deliberately *not* done by matching on ``x_kind``/``y_kind`` alone
+    (``"potential"``/``"current"``) instead of an identifier allow-list: the
+    same real export also carries hundreds of EIS Lissajous-loop streams in
+    that exact shape, which are not a polarization curve at all and would
+    flood a picker meant for one.
+    """
+    identifiers = (
+        {identifier} if isinstance(identifier, str)
+        else set(identifier) if identifier is not None else None
+    )
+    nodes = _paax_node_index(root)
+    for xr in root.iter("DAB_node"):
+        if xr.get("type") != "X_results":
+            continue
+        exp_idx = xr.get("parent")
+        for stream_el in xr.iter("stream"):
+            s = _paax_stream_from_element(stream_el)
+            if s is None:
+                continue
+            if identifiers is not None and s["identifier"] not in identifiers:
+                continue
+            if x_kind is not None and s["x_kind"] != x_kind:
+                continue
+            if y_kind is not None and s["y_kind"] != y_kind:
+                continue
+            if name_contains is not None and name_contains.lower() not in s["display_name"].lower():
+                continue
+            yield exp_idx, _paax_experiment_label(nodes, exp_idx), s
+            break  # first matching stream within this experiment is enough
+
+
+def _paax_experiment_count(root: ET.Element) -> int:
+    """How many experiments (``X_results`` blocks) this file has at all --
+    for an honest "searched N experiments, found none" message rather than
+    a bare "not found" that leaves a reader unsure whether the search was
+    thorough."""
+    return sum(1 for xr in root.iter("DAB_node") if xr.get("type") == "X_results")
+
+
+# Pine's own stream-identifier tags for a potential-vs-current sweep. Not
+# just "current_vs_potential" (CV/LSV/RDE/RRDE) -- see
+# :func:`_paax_matches_per_experiment`'s docstring for why DPV's own
+# ``differential_current_vs_potential`` belongs here too, and why this is an
+# identifier allow-list rather than a shape (x_kind/y_kind) match.
+_LSV_STREAM_IDENTIFIERS = ("current_vs_potential", "differential_current_vs_potential")
+
+
+def list_eis_candidates(file_or_path, filename: str) -> list[dict]:
+    """``[{"label": ..., "z_real": ..., "z_imag": ...}, ...]`` — one entry
+    per usable experiment. A Biologic file always yields exactly one entry
+    (one technique per file); a Pine AfterMath file yields one per
+    experiment with a Nyquist (-Zi vs Zr) curve, labelled by its study's own
+    name — build a picker from this when there is more than one.
+    """
+    suffix = Path(filename).suffix.lower()
+    if suffix != ".paax":
+        z_real, z_imag = load_eis(file_or_path, filename)
+        return [{"label": filename, "z_real": z_real, "z_imag": z_imag}]
+    root = _paax_root(file_or_path)
+    out = [
+        {"label": label, "z_real": s["x"], "z_imag": s["y"]}
+        for _, label, s in _paax_matches_per_experiment(
+            root, x_kind="resistance", y_kind="resistance", name_contains="nyquist")
+    ]
+    if not out:
+        n_exp = _paax_experiment_count(root)
+        raise ValueError(
+            f"{filename}: searched {n_exp} experiment(s) in this AfterMath "
+            "file and found no Nyquist (impedance) curve in any of them — "
+            "is it an EIS experiment?"
+        )
+    return out
+
+
+def list_lsv_candidates(file_or_path, filename: str) -> list[dict]:
+    """``[{"label": ..., "potential": ..., "current": ...}, ...]`` — one
+    entry per usable experiment. A Biologic file always yields exactly one
+    entry; a Pine AfterMath file yields one per experiment with a
+    potential-vs-current sweep curve (LSV/CV/RDE/RRDE's
+    ``"current_vs_potential"`` or DPV's own
+    ``"differential_current_vs_potential"`` — see
+    :data:`_LSV_STREAM_IDENTIFIERS`), labelled by its study's own name.
+    """
+    suffix = Path(filename).suffix.lower()
+    if suffix != ".paax":
+        potential, current = load_lsv(file_or_path, filename)
+        return [{"label": filename, "potential": potential, "current": current}]
+    root = _paax_root(file_or_path)
+    out = [
+        {"label": label, "potential": s["x"], "current": s["y"]}
+        for _, label, s in _paax_matches_per_experiment(
+            root, identifier=_LSV_STREAM_IDENTIFIERS)
+    ]
+    if not out:
+        n_exp = _paax_experiment_count(root)
+        raise ValueError(
+            f"{filename}: searched {n_exp} experiment(s) in this AfterMath "
+            "file and found no Current-vs-Potential (or Differential "
+            "Current-vs-Potential) curve in any of them — is it an "
+            "LSV/CV/DPV/RDE/RRDE polarization experiment?"
+        )
+    return out
+
+
+_RPM_IN_NAME = re.compile(r"\(?\s*(\d+(?:\.\d+)?)\s*rpm\s*\)?", re.IGNORECASE)
+
+
+def _paax_rpm_from_name(name: str) -> float | None:
+    """A rotation rate parsed out of a stream's own display name, e.g.
+    ``"Disk Current vs Disk Potential (2000 RPM)"`` -> ``2000.0`` — Pine
+    bakes it directly into the name for an RRDE/RDE experiment, so it does
+    not have to be guessed from a filename or typed by hand."""
+    m = _RPM_IN_NAME.search(name)
+    return float(m.group(1)) if m else None
+
+
+def _paax_rrde_streams_per_experiment(root: ET.Element):
+    """Yield ``(experiment_index, label, disk_stream, ring_stream_or_None,
+    rpm_or_None)`` for every experiment with at least one potential-vs-
+    current stream.
+
+    A real RRDE experiment records **two** streams under the identical
+    ``current_vs_potential`` identifier within the same experiment — Pine
+    names them ``"Disk Current vs Disk Potential (...)"`` and ``"Ring
+    Current vs Disk Potential (...)"`` (confirmed against a real RRDE
+    export; the ring stream shares the disk's own potential axis exactly,
+    not a separate one). :func:`_paax_matches_per_experiment` stops at the
+    first match per experiment, which is exactly right for a plain LSV/CV
+    file (there is only one) but silently drops the ring current entirely
+    for an RRDE one — this collects every matching stream per experiment
+    instead and tells disk from ring by each stream's own name.
+    """
+    nodes = _paax_node_index(root)
+    identifiers = set(_LSV_STREAM_IDENTIFIERS)
+    for xr in root.iter("DAB_node"):
+        if xr.get("type") != "X_results":
+            continue
+        exp_idx = xr.get("parent")
+        matches = []
+        for stream_el in xr.iter("stream"):
+            s = _paax_stream_from_element(stream_el)
+            if s is not None and s["identifier"] in identifiers:
+                matches.append(s)
+        if not matches:
+            continue
+        ring = next((s for s in matches if "ring" in s["display_name"].lower()), None)
+        disk = next((s for s in matches if s is not ring), matches[0])
+        rpm = _paax_rpm_from_name(disk["display_name"])
+        if rpm is None and ring is not None:
+            rpm = _paax_rpm_from_name(ring["display_name"])
+        yield exp_idx, _paax_experiment_label(nodes, exp_idx), disk, ring, rpm
+
+
+def list_rrde_candidates(file_or_path, filename: str) -> list[dict]:
+    """``[{"label": ..., "potential": ..., "disk_current": ...,
+    "ring_current": ... or None, "rpm": ... or None}, ...]`` — one entry
+    per usable experiment, keeping **both** channels when an RRDE
+    experiment records both (unlike :func:`list_lsv_candidates`, which
+    keeps only the first potential-vs-current stream per experiment and so
+    silently drops the ring current). Also recovers the rotation rate when
+    Pine's own stream name states it, e.g. ``"...( 2000 RPM)"``.
+
+    A Biologic file always yields exactly one entry with ``ring_current``
+    and ``rpm`` both ``None`` — Biologic's own RRDE recording isn't
+    disambiguated the same way here and is treated as disk-only, matching
+    how the rest of this project already handles a raw two-column
+    instrument file elsewhere.
+    """
+    suffix = Path(filename).suffix.lower()
+    if suffix != ".paax":
+        potential, current = load_lsv(file_or_path, filename)
+        return [{"label": filename, "potential": potential, "disk_current": current,
+                 "ring_current": None, "rpm": None}]
+    root = _paax_root(file_or_path)
+    out = [
+        {
+            "label": label, "potential": disk["x"], "disk_current": disk["y"],
+            "ring_current": ring["y"] if ring is not None else None,
+            "rpm": rpm,
+        }
+        for _, label, disk, ring, rpm in _paax_rrde_streams_per_experiment(root)
+    ]
+    if not out:
+        n_exp = _paax_experiment_count(root)
+        raise ValueError(
+            f"{filename}: searched {n_exp} experiment(s) in this AfterMath "
+            "file and found no Current-vs-Potential (or Differential "
+            "Current-vs-Potential) curve in any of them — is it an "
+            "LSV/CV/DPV/RDE/RRDE polarization experiment?"
+        )
+    return out
+
+
+def list_chrono_candidates(file_or_path, filename: str) -> list[dict]:
+    """``[{"label": ..., "time_s": ..., "potential": ... or None,
+    "current": ... or None}, ...]`` — one entry per usable experiment,
+    carrying whichever of the time-series Potential/Current streams that
+    experiment actually has (both, for a typical chrono run; the caller
+    picks whichever the chosen technique — CA or CP — needs). A Biologic
+    file always yields exactly one entry.
+    """
+    suffix = Path(filename).suffix.lower()
+    if suffix != ".paax":
+        df = load_table(file_or_path, filename)
+        time_s = df["time/s"].to_numpy(dtype=float) if "time/s" in df.columns else None
+        potential = df["Ewe/V"].to_numpy(dtype=float) if "Ewe/V" in df.columns else None
+        current = df["I/mA"].to_numpy(dtype=float) if "I/mA" in df.columns else None
+        if time_s is None or (potential is None and current is None):
+            raise ValueError(f"{filename}: no time-series potential/current data found.")
+        return [{"label": filename, "time_s": time_s, "potential": potential, "current": current}]
+
+    root = _paax_root(file_or_path)
+    pot_by_exp = {
+        idx: (label, s) for idx, label, s in
+        _paax_matches_per_experiment(root, identifier="potential", x_kind="time")
+    }
+    cur_by_exp = {
+        idx: (label, s) for idx, label, s in
+        _paax_matches_per_experiment(root, identifier="current", x_kind="time")
+    }
+    exp_indices = sorted(set(pot_by_exp) | set(cur_by_exp), key=lambda i: int(i))
+    out = []
+    for idx in exp_indices:
+        pot_entry, cur_entry = pot_by_exp.get(idx), cur_by_exp.get(idx)
+        label = (pot_entry or cur_entry)[0]
+        out.append({
+            "label": label,
+            "time_s": (pot_entry or cur_entry)[1]["x"],
+            "potential": pot_entry[1]["y"] if pot_entry else None,
+            "current": cur_entry[1]["y"] if cur_entry else None,
+        })
+    if not out:
+        n_exp = _paax_experiment_count(root)
+        raise ValueError(
+            f"{filename}: searched {n_exp} experiment(s) in this AfterMath "
+            "file and found no time-series Potential/Current stream in any "
+            "of them — is it a chronoamperometry/chronopotentiometry "
+            "experiment?"
+        )
+    return out
 
 
 def _paax_table(file_or_path, filename: str) -> pd.DataFrame:

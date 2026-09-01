@@ -723,6 +723,129 @@ def _cached_instrument_table(payload: bytes, filename: str) -> pd.DataFrame:
     return instrument_formats.load_table(io.BytesIO(payload), filename)
 
 
+@st.cache_data(ttl=_CACHE_TTL_S, show_spinner=False, max_entries=32)
+def _cached_eis_candidates(payload: bytes, filename: str) -> list[dict]:
+    return instrument_formats.list_eis_candidates(io.BytesIO(payload), filename)
+
+
+@st.cache_data(ttl=_CACHE_TTL_S, show_spinner=False, max_entries=32)
+def _cached_instrument_lsv_candidates(payload: bytes, filename: str) -> list[dict]:
+    return instrument_formats.list_lsv_candidates(io.BytesIO(payload), filename)
+
+
+@st.cache_data(ttl=_CACHE_TTL_S, show_spinner=False, max_entries=32)
+def _cached_rrde_candidates(payload: bytes, filename: str) -> list[dict]:
+    return instrument_formats.list_rrde_candidates(io.BytesIO(payload), filename)
+
+
+@st.cache_data(ttl=_CACHE_TTL_S, show_spinner=False, max_entries=32)
+def _cached_chrono_candidates(payload: bytes, filename: str) -> list[dict]:
+    return instrument_formats.list_chrono_candidates(io.BytesIO(payload), filename)
+
+
+def _rank_instrument_candidate(label: str, prefer_contains) -> tuple:
+    """Sort key for ordering candidates so the *default* selection (index 0
+    of the selectbox) is a sensible guess rather than raw document order —
+    which a real multi-technique file has no reason to put the tab-relevant
+    experiment first in (the earliest-run experiment in a session is often
+    an EIS/OCP check that happens to precede the actual sweep/RRDE/chrono
+    run the tab wants). Two rules, applied in order:
+
+    1. A label naming a failed/aborted run always sorts last.
+    2. Among the rest, a label containing one of ``prefer_contains``
+       (checked in the order given — earlier entries win) sorts before one
+       that doesn't; ``None`` skips this rule entirely.
+
+    Ties keep their original (document) order — Python's sort is stable.
+    """
+    lowered = label.lower()
+    failed = ("fail" in lowered) or ("abort" in lowered)
+    if prefer_contains:
+        needles = (prefer_contains,) if isinstance(prefer_contains, str) else prefer_contains
+        preferred = next(
+            (i for i, needle in enumerate(needles) if needle.lower() in lowered),
+            len(needles),
+        )
+    else:
+        preferred = 0
+    return (failed, preferred)
+
+
+def _pick_instrument_candidate(
+    candidates: list[dict], key: str, prefer_contains=None,
+) -> dict | None:
+    """If ``candidates`` has more than one entry (a raw instrument file that
+    bundles several experiments — routine for a Pine AfterMath .paax
+    project), render a selectbox naming each by its own study label so the
+    user picks which one feeds this tab, rather than silently taking
+    whichever happened to come first in the file. Candidates are reordered
+    first (see :func:`_rank_instrument_candidate`) so the pre-selected
+    default is the tab's best guess at the right technique, with a failed/
+    aborted run never the default even when it does happen to sort first in
+    the file. ``prefer_contains`` is a substring, or a priority-ordered
+    tuple of them, to match against each label (e.g. ``("RRDE", "RDE")`` on
+    the ORR tab) — omit it where no technique is clearly the right guess
+    (e.g. the general LSV Analysis tab, where CV/LSV/RDE are all equally
+    valid). Returns the chosen candidate, or the sole one with no widget
+    when there is only one.
+    """
+    if not candidates:
+        return None
+    ordered = sorted(
+        candidates, key=lambda c: _rank_instrument_candidate(c["label"], prefer_contains)
+    )
+    if len(ordered) == 1:
+        return ordered[0]
+    labels = [c["label"] for c in ordered]
+    choice = st.selectbox(
+        "Which experiment in this file?", labels, key=key,
+        help=f"This file contains {len(ordered)} experiments with usable "
+             "data for this tab — pick the one you want. Pre-selected to "
+             "this tab's best guess; a failed/aborted run is never the "
+             "default.",
+    )
+    return next(c for c in ordered if c["label"] == choice)
+
+
+def _pick_rrde_candidates(candidates: list[dict], key: str) -> list[dict]:
+    """Multi-select for the ORR/RRDE tab's instrument-file sources.
+
+    Unlike :func:`_pick_instrument_candidate` (one experiment feeds one
+    sample), a single RRDE *sample* is normally many experiments — one per
+    rotation rate, all otherwise the same electrode/electrolyte — recorded
+    as separate studies in the same file. Defaulting to just one of them
+    would mean re-adding each rotation rate by hand; instead every
+    candidate whose own name states a rotation rate (see
+    :func:`instrument_formats.list_rrde_candidates`'s ``rpm`` field) is
+    pre-selected, so the whole multi-rpm set loads at once — merged
+    downstream via :func:`_orr_merge_entries`, the same machinery a
+    multi-file CSV upload already uses for several rotation rates of one
+    sample. A candidate without a detected rpm (e.g. a CV run recorded
+    alongside the RRDE studies in the same file) is left unselected but
+    stays pickable by hand. Returns the chosen candidates, most RRDE-like
+    first; a lone candidate returns unselected-widget as a single-item list.
+    """
+    if not candidates:
+        return []
+    ordered = sorted(
+        candidates,
+        key=lambda c: _rank_instrument_candidate(c["label"], ("RRDE", "RDE", "ORR")),
+    )
+    if len(ordered) == 1:
+        return ordered
+    by_label = {c["label"]: c for c in ordered}
+    labels = [c["label"] for c in ordered]
+    default = [c["label"] for c in ordered if c.get("rpm") is not None]
+    chosen_labels = st.multiselect(
+        "Which experiment(s) in this file?", labels, default=default, key=key,
+        help="Pre-selected: every experiment whose own name states a "
+             "rotation rate — a full multi-rpm RRDE set loads together as "
+             "one sample. Deselect any you don't want, or add others "
+             "(e.g. a CV run) by hand.",
+    )
+    return [by_label[lbl] for lbl in chosen_labels]
+
+
 @st.cache_data(ttl=_CACHE_TTL_S, show_spinner=False, max_entries=8)
 def _cached_sample_bytes(path: str) -> bytes:
     """Read a bundled sample file once per session rather than per rerun."""
@@ -748,7 +871,32 @@ def _clear_reset_control():
         st.rerun()
 
 
-def eis_data_loader():
+def render_shared_instrument_uploader() -> tuple[bytes, str] | None:
+    """Sidebar file uploader for a raw instrument export, shared across the
+    EIS, LSV Analysis, ORR/RRDE and Chrono tabs — upload once here instead
+    of separately on each tab that happens to need the same file. Each tab
+    still opts in explicitly (its own "Upload instrument file" source falls
+    back to this only when nothing was uploaded directly there), and still
+    gets its own experiment picker if the file bundles more than one — see
+    :func:`_pick_instrument_candidate`.
+
+    Returns ``(payload_bytes, filename)``, or ``None`` if nothing is
+    uploaded here.
+    """
+    nonce = st.session_state.get("uploader_nonce", 0)
+    st.sidebar.markdown("**Instrument file** (shared across tabs)")
+    up = st.sidebar.file_uploader(
+        "Biologic (.mpr/.mpt) or Pine AfterMath (.paax)",
+        type=["mpr", "mpt", "paax"], key=f"shared_instrument_{nonce}",
+        help="Upload once here to make it available on the EIS, LSV "
+             "Analysis, ORR/RRDE and Chrono tabs — each still opts in via "
+             "its own 'Upload instrument file' source, and picks which "
+             "experiment if the file holds more than one.",
+    )
+    return (up.getvalue(), up.name) if up is not None else None
+
+
+def eis_data_loader(shared_file: tuple[bytes, str] | None = None):
     """Render the EIS/Ru tab's own data-source controls.
 
     Independent of the LSV/iR tab's loader (each tab uploads its own file,
@@ -793,13 +941,25 @@ def eis_data_loader():
                 "Biologic (.mpr/.mpt) or Pine AfterMath (.paax) file",
                 type=["mpr", "mpt", "paax"], key=f"eis_instrument_{nonce}",
             )
-            if up is None:
-                st.info("⬆️ Upload a .mpr/.mpt/.paax file to begin.")
+            if up is not None:
+                payload, name = up.getvalue(), up.name
+            elif shared_file is not None:
+                payload, name = shared_file
+                st.caption(f"↳ Using the sidebar instrument file: **{name}**")
+            else:
+                st.info(
+                    "⬆️ Upload a .mpr/.mpt/.paax file here, or in the "
+                    "sidebar, to begin."
+                )
                 return None, None
-            z_real, z_imag = instrument_formats.load_eis(
-                io.BytesIO(up.getvalue()), up.name
+            candidates = _cached_eis_candidates(payload, name)
+            chosen = _pick_instrument_candidate(
+                candidates, key=f"eis_instrument_pick_{nonce}", prefer_contains="EIS")
+            return (
+                [data_io.EISData(z_real=chosen["z_real"], z_imag=chosen["z_imag"],
+                                 label=chosen["label"])],
+                name,
             )
-            return [data_io.EISData(z_real=z_real, z_imag=z_imag, label=up.name)], up.name
 
         up = st.file_uploader(
             "EIS CSV (Z', Z'')", type=["csv", "txt"], key=f"eis_csv_{nonce}"
@@ -814,7 +974,7 @@ def eis_data_loader():
         return None, None
 
 
-def lsv_data_loader():
+def lsv_data_loader(shared_file: tuple[bytes, str] | None = None):
     """Render the LSV iR Correction tab's own data-source controls.
 
     Mirrors :func:`eis_data_loader` — see its docstring for the pairing
@@ -860,15 +1020,23 @@ def lsv_data_loader():
                 "Biologic (.mpr/.mpt) or Pine AfterMath (.paax) file",
                 type=["mpr", "mpt", "paax"], key=f"lsv_instrument_{nonce}",
             )
-            if up is None:
-                st.info("⬆️ Upload a .mpr/.mpt/.paax file to begin.")
+            if up is not None:
+                payload, name = up.getvalue(), up.name
+            elif shared_file is not None:
+                payload, name = shared_file
+                st.caption(f"↳ Using the sidebar instrument file: **{name}**")
+            else:
+                st.info(
+                    "⬆️ Upload a .mpr/.mpt/.paax file here, or in the "
+                    "sidebar, to begin."
+                )
                 return None, None
-            potential, current = instrument_formats.load_lsv(
-                io.BytesIO(up.getvalue()), up.name
-            )
+            candidates = _cached_instrument_lsv_candidates(payload, name)
+            chosen = _pick_instrument_candidate(candidates, key=f"lsv_instrument_pick_{nonce}")
             return (
-                [data_io.LSVData(potential=potential, current=current, label=up.name)],
-                up.name,
+                [data_io.LSVData(potential=chosen["potential"], current=chosen["current"],
+                                 label=chosen["label"])],
+                name,
             )
 
         up = st.file_uploader(
@@ -1964,8 +2132,24 @@ def apply_plot_style(fig, style: dict, xtitle: str, ytitle: str,
     axis_font = {"family": family, "size": size}
     small_font = {"family": family, "size": max(9, round(size * 0.55))}
     position = style.get("legend_position", "outside-right")
+    title_size = size + 8
 
     legend_kwargs = _legend_layout(style, small_font)
+    # 10 px is not enough room for a tick label, let alone an axis title:
+    # every exported figure came out with its y-axis numbers and both axis
+    # titles clipped at the edge. One derivation for every figure, so the
+    # styled tabs and the hand-built ones cannot drift (see
+    # :func:`_journal_margin`).
+    margin = {**_journal_margin(
+        size, legend_below=(position == "below"),
+        titled=bool(title and style.get("show_title"))),
+        **_legend_margin_extra(style)}
+    # A long y-axis title at a large export font can render taller (its
+    # rendered width, once rotated -90°) than the plot's own domain height,
+    # overshooting into the chart title above it -- see
+    # :func:`_min_height_for_rotated_title`.
+    height = _min_height_for_rotated_title(
+        ytitle, title_size, margin.get("t", 0) + margin.get("b", 0), height)
     layout = {
         "template": "plotly_white",
         "height": height,
@@ -1978,15 +2162,7 @@ def apply_plot_style(fig, style: dict, xtitle: str, ytitle: str,
         "paper_bgcolor": "white",
         "plot_bgcolor": "white",
         "showlegend": legend_kwargs is not None,
-        # 10 px is not enough room for a tick label, let alone an axis title:
-        # every exported figure came out with its y-axis numbers and both axis
-        # titles clipped at the edge. One derivation for every figure, so the
-        # styled tabs and the hand-built ones cannot drift (see
-        # :func:`_journal_margin`).
-        "margin": {**_journal_margin(
-            size, legend_below=(position == "below"),
-            titled=bool(title and style.get("show_title"))),
-            **_legend_margin_extra(style)},
+        "margin": margin,
     }
     if legend_kwargs is not None:
         layout["legend"] = legend_kwargs
@@ -1997,7 +2173,7 @@ def apply_plot_style(fig, style: dict, xtitle: str, ytitle: str,
     axis_kwargs = _axis_style(style)
     # Axis titles read one step up from the tick labels in most journal house
     # styles; using one size for both made the titles disappear into the numbers.
-    title_font = {"family": family, "size": size + 8}
+    title_font = {"family": family, "size": title_size}
     # Explicit gap between the tick labels and the title (see
     # :func:`_axis_title_standoff`) -- Plotly's own auto-standoff isn't wide
     # enough at these font sizes and the title crowds or overlaps the tick
@@ -2068,6 +2244,29 @@ def _axis_title(text: str, font_size: int, family: str = "") -> dict:
         "font": {"family": family or _ARIAL, "size": font_size},
         "standoff": _axis_title_standoff(font_size),
     }
+
+
+def _min_height_for_rotated_title(text: str, font_size: int, reserved: int,
+                                  base_height: int) -> int:
+    """Smallest figure height that keeps a rotated (-90°) y-axis title (or
+    the hand-built figures' equivalent rotated annotation) from outgrowing
+    the room it actually has and overshooting into neighbouring text.
+
+    Plotly rotates a y-axis title -90°, so its rendered *width* at its own
+    font size becomes its vertical extent once rotated. That extent has to
+    fit within the figure's own plot domain (the height left over after
+    ``reserved`` — the top+bottom margins, which is where the chart title
+    and the x-axis title live); a long title at a large export font size
+    routinely exceeded a fixed 420-680 px height and grew straight into the
+    chart title above it. Character width is estimated at 0.66x the font
+    size, the same approximation :func:`_journal_table_figure` uses for
+    Arial-like text; a font-sized pad keeps the title off the domain edge
+    rather than exactly touching it.
+    """
+    if not text:
+        return base_height
+    needed = int(len(text) * font_size * 0.66 + font_size + reserved)
+    return max(base_height, needed)
 
 
 def _journal_margin(font_size: int, *, legend_below: bool = False,
@@ -2458,7 +2657,8 @@ _SPECIAL_CHAR_ROWS = (
 )
 
 
-def special_character_widget(key: str, default: str, fmt_col=None) -> None:
+def special_character_widget(key: str, default: str, fmt_col=None,
+                             format_default: bool = True) -> None:
     """Chemical-formula input helper shared by every sample/label name field
     in the app: an "Aa→A" button that runs :func:`formatting.format_formula`
     over the current value (``LiFePO4`` -> ``LiFePO₄``), plus a "Special
@@ -2475,10 +2675,19 @@ def special_character_widget(key: str, default: str, fmt_col=None) -> None:
     ahead of the text_input's own creation. ``fmt_col`` is the container (a
     ``st`` column slot, or ``st`` itself) the "Aa→A" button renders into —
     pass a spare column from the caller's own layout to put it beside the
-    name field instead of above it.
+    name field instead of above it. ``format_default`` runs ``default``
+    itself through :func:`formatting.format_formula` before seeding
+    session_state (on by default, matching a typed sample name like
+    ``TiO2``) — set ``False`` for a default that merely *looks* like a
+    formula to that heuristic without being one, e.g. an instrument file's
+    own bracket-heavy technique/timestamp label
+    (``...1438[ 23]11]`` reads its trailing ``]11`` as "close a subscript
+    group, then digit 11" and mangles it to ``]₁₁]``).
     """
     if key not in st.session_state:
-        st.session_state[key] = formatting.format_formula(default)
+        st.session_state[key] = (
+            formatting.format_formula(default) if format_default else default
+        )
     target = fmt_col if fmt_col is not None else st
     if target.button("Aa→A", key=f"{key}__fmt", width="stretch",
                      help="Lower the digits of a chemical formula: LiFePO4 "
@@ -2617,7 +2826,9 @@ def _tafel_extract_zip_samples(
     return series
 
 
-def _tafel_data_loader() -> list[tuple[str, data_io.LSVData]]:
+def _tafel_data_loader(
+    shared_file: tuple[bytes, str] | None = None,
+) -> list[tuple[str, data_io.LSVData]]:
     """File uploader local to the Tafel tab — independent of the main sidebar
     EIS/LSV loader. Multiple files (different samples/lots/repeat runs) may
     be uploaded at once, either individually or batched via a ZIP of a data
@@ -2654,6 +2865,34 @@ def _tafel_data_loader() -> list[tuple[str, data_io.LSVData]]:
                     + ", ".join(lbl for lbl, _ in zip_series)
                 )
             series.extend(zip_series)
+
+    if shared_file is not None:
+        payload, name = shared_file
+        with st.expander(f"📎 Sidebar instrument file — {name}"):
+            include_shared = st.checkbox(
+                "Include this file as an additional sample/run", value=False,
+                key="tafel_shared_include",
+            )
+            if include_shared:
+                try:
+                    shared_candidates = _cached_instrument_lsv_candidates(payload, name)
+                except Exception as exc:
+                    st.warning(f"{name}: {exc}")
+                    shared_candidates = []
+                if shared_candidates:
+                    shared_chosen = _pick_instrument_candidate(
+                        shared_candidates, key="tafel_shared_pick")
+                    shared_name_key = "tafel_shared_name"
+                    special_character_widget(
+                        shared_name_key, default=shared_chosen["label"],
+                        format_default=False)
+                    shared_sample_name = st.text_input("Sample name", key=shared_name_key)
+                    series.append((
+                        _dedup_label(shared_sample_name, seen_labels),
+                        data_io.LSVData(potential=shared_chosen["potential"],
+                                        current=shared_chosen["current"],
+                                        label=shared_chosen["label"]),
+                    ))
 
     source = st.radio(
         "Additionally upload individual files",
@@ -2863,7 +3102,7 @@ def _render_rhe_conversion(key_prefix: str, default_ph: float = 13.0,
     return lambda pot: tafel.to_rhe(np.asarray(pot, dtype=float), e_ref, ph)
 
 
-def render_tafel_tab() -> None:
+def render_tafel_tab(shared_instrument_file: tuple[bytes, str] | None = None) -> None:
     st.subheader("LSV analysis")
     st.caption(
         "Onset potential, benchmark overpotentials at fixed current "
@@ -2874,7 +3113,7 @@ def render_tafel_tab() -> None:
         "upload and does not use the EIS/LSV data loaded in the sidebar."
     )
 
-    series = _tafel_data_loader()
+    series = _tafel_data_loader(shared_file=shared_instrument_file)
     if not series:
         return
     st.success(
@@ -3311,26 +3550,48 @@ def render_tafel_tab() -> None:
                 legendgroup=meta["reaction"],
                 line={"color": meta["color"], "width": 3},
             ))
+        # Onset potential marked directly on the curve it came from -- a
+        # dashed vertical line, in that sample's own colour, at the
+        # potential where its |current| first departs from the flat
+        # pre-onset baseline (see tafel.onset_potential). Non-fatal per
+        # sample: a curve too short/noisy to locate an onset on just draws
+        # without one rather than losing the whole plot.
+        onset_marked = False
+        for meta in fits:
+            try:
+                onset_v = tafel.onset_potential(meta["potential"], meta["current"])
+            except ValueError:
+                continue
+            lsv_fig.add_vline(
+                x=onset_v, line={"color": meta["color"], "dash": "dot", "width": 1.5},
+            )
+            onset_marked = True
         orig_lsv_legend = _legend_layout(style, small_font)
         orig_lsv_position = style.get("legend_position", "outside-right")
+        orig_lsv_ytitle = f"Current ({display_unit})"
+        orig_lsv_margin = {**_journal_margin(
+            font_size, legend_below=(orig_lsv_position == "below"),
+            titled=bool(style.get("show_title"))),
+            **_legend_margin_extra(style)}
         lsv_fig.update_layout(
             title=({"text": "Original LSV",
                     "font": {"family": _font_stack(style["font_family"]), "size": font_size}}
                    if style.get("show_title") else None),
-            template="plotly_white", height=460, font=axis_font,
+            template="plotly_white",
+            height=_min_height_for_rotated_title(
+                orig_lsv_ytitle, font_size,
+                orig_lsv_margin.get("t", 0) + orig_lsv_margin.get("b", 0), 460),
+            font=axis_font,
             showlegend=orig_lsv_legend is not None,
             **({"legend": orig_lsv_legend} if orig_lsv_legend is not None else {}),
-            margin={**_journal_margin(
-                font_size, legend_below=(orig_lsv_position == "below"),
-                titled=bool(style.get("show_title"))),
-                **_legend_margin_extra(style)},
+            margin=orig_lsv_margin,
         )
         lsv_fig.update_xaxes(
             title=_axis_title("Potential vs RHE / V", font_size),
             tickfont={"family": _ARIAL, "size": font_size}, **_axis_style(style),
         )
         lsv_fig.update_yaxes(
-            title=_axis_title(f"Current ({display_unit})", font_size),
+            title=_axis_title(orig_lsv_ytitle, font_size),
             tickfont={"family": _ARIAL, "size": font_size}, **_axis_style(style),
         )
         if lsv_x_range is not None:
@@ -3340,6 +3601,13 @@ def render_tafel_tab() -> None:
         _white_background(lsv_fig)
         _pin_canvas(lsv_fig)
         _show_figure(lsv_fig)
+        if onset_marked:
+            st.caption(
+                "Dashed vertical line = **E_onset**, in each sample's own "
+                "colour — where |current| first departs from the flat "
+                "pre-onset baseline (see the *Onset potential comparison* "
+                "chart below for the numbers side by side)."
+            )
         figure_downloads(
             lsv_fig, "original_lsv_plot", key="png_lsv_original",
             what="LSV plot", data=_padded_frame(lsv_plotted),
@@ -3449,19 +3717,23 @@ def render_tafel_tab() -> None:
     )
     tafel_legend = _legend_layout(style, small_font)
     tafel_legend_position = style.get("legend_position", "outside-right")
+    tafel_ytitle = "Potential vs RHE / V"
+    tafel_margin = {**_journal_margin(
+        font_size, legend_below=(tafel_legend_position == "below"),
+        titled=bool(style.get("show_title"))),
+        **_legend_margin_extra(style)}
     fig.update_layout(
         title=({"text": title_text,
                 "font": {"family": _font_stack(style["font_family"]), "size": font_size}}
                if style.get("show_title") else None),
         template="plotly_white",
-        height=560,
+        height=_min_height_for_rotated_title(
+            tafel_ytitle, font_size,
+            tafel_margin.get("t", 0) + tafel_margin.get("b", 0), 560),
         font=axis_font,  # baseline (inherited by legend/annotations unless overridden)
         showlegend=tafel_legend is not None,
         **({"legend": tafel_legend} if tafel_legend is not None else {}),
-        margin={**_journal_margin(
-            font_size, legend_below=(tafel_legend_position == "below"),
-            titled=bool(style.get("show_title"))),
-            **_legend_margin_extra(style)},
+        margin=tafel_margin,
         dragmode="select",
     )
     # Axis titles/ticks are the "axes" text: always the full 28/36 pt Arial.
@@ -3474,7 +3746,7 @@ def render_tafel_tab() -> None:
         **_axis_style(style),
     )
     fig.update_yaxes(
-        title=_axis_title("Potential vs RHE / V", font_size),
+        title=_axis_title(tafel_ytitle, font_size),
         tickfont={"family": _ARIAL, "size": font_size}, range=tafel_y_range,
         **_axis_style(style),
     )
@@ -3672,15 +3944,19 @@ def render_tafel_tab() -> None:
                 error_y={"type": "data", "array": stds.to_numpy(), "visible": True},
                 marker={"color": bar_colors},
             ))
+            bar_margin = _journal_margin(
+                font_size, titled=bool(style.get("show_title")))
             fig_bar.update_layout(
                 title=({"text": f"Benchmark @ j = {target_j:g} {display_unit}",
                         "font": {"family": _font_stack(style["font_family"]),
                                  "size": font_size}}
                        if style.get("show_title") else None),
-                template="plotly_white", height=420,
+                template="plotly_white",
+                height=_min_height_for_rotated_title(
+                    ylabel, font_size,
+                    bar_margin.get("t", 0) + bar_margin.get("b", 0), 420),
                 font={"family": _ARIAL, "size": font_size},
-                margin=_journal_margin(
-                    font_size, titled=bool(style.get("show_title"))),
+                margin=bar_margin,
             )
             fig_bar.update_xaxes(
                 tickfont={"family": _ARIAL, "size": font_size}, **_axis_style(style),
@@ -3733,21 +4009,26 @@ def render_tafel_tab() -> None:
                          "visible": True},
                 marker={"color": onset_colors},
             ))
+            onset_bar_ytitle = "E_onset (V vs RHE)"
+            onset_bar_margin = _journal_margin(
+                font_size, titled=bool(style.get("show_title")))
             fig_onset_bar.update_layout(
                 title=({"text": "Onset potential by sample",
                         "font": {"family": _font_stack(style["font_family"]),
                                  "size": font_size}}
                        if style.get("show_title") else None),
-                template="plotly_white", height=420,
+                template="plotly_white",
+                height=_min_height_for_rotated_title(
+                    onset_bar_ytitle, font_size,
+                    onset_bar_margin.get("t", 0) + onset_bar_margin.get("b", 0), 420),
                 font={"family": _ARIAL, "size": font_size},
-                margin=_journal_margin(
-                    font_size, titled=bool(style.get("show_title"))),
+                margin=onset_bar_margin,
             )
             fig_onset_bar.update_xaxes(
                 tickfont={"family": _ARIAL, "size": font_size}, **_axis_style(style),
             )
             fig_onset_bar.update_yaxes(
-                title=_axis_title("E_onset (V vs RHE)", font_size),
+                title=_axis_title(onset_bar_ytitle, font_size),
                 tickfont={"family": _ARIAL, "size": font_size}, **_axis_style(style),
             )
             _white_background(fig_onset_bar)
@@ -4499,6 +4780,7 @@ def _orr_extract_zip_samples(
 def _orr_data_loader(
     key_prefix: str = "orr",
     file_help: str = "Disk/ring current file(s) for this sample",
+    shared_file: tuple[bytes, str] | None = None,
 ) -> tuple[list[tuple[str, pd.DataFrame]], str | None]:
     """File uploader local to the calling tab — independent of the other
     tabs. Two ways to load data, usable together:
@@ -4573,6 +4855,54 @@ def _orr_data_loader(
             if unit_hint is None:
                 unit_hint = zip_unit_hint
 
+    if shared_file is not None:
+        payload, name = shared_file
+        with st.expander(f"📎 Sidebar instrument file — {name}"):
+            include_shared = st.checkbox(
+                "Include this file as an additional sample", value=False,
+                key=f"{key_prefix}_shared_include",
+                help="Every rotation-rate experiment found in the file "
+                     "loads together as one multi-rpm sample, disk + ring "
+                     "current together where both were recorded.",
+            )
+            if include_shared:
+                try:
+                    shared_candidates = _cached_rrde_candidates(payload, name)
+                except Exception as exc:
+                    st.warning(f"{name}: {exc}")
+                    shared_candidates = []
+                shared_chosen_list = _pick_rrde_candidates(
+                    shared_candidates, key=f"{key_prefix}_shared_pick")
+                if shared_chosen_list:
+                    shared_name_key = f"{key_prefix}_shared_name"
+                    special_character_widget(
+                        shared_name_key, default=shared_chosen_list[0]["label"],
+                        format_default=False)
+                    shared_sample_name = st.text_input("Sample name", key=shared_name_key)
+                    no_rpm = [c["label"] for c in shared_chosen_list if c["rpm"] is None]
+                    if no_rpm:
+                        st.caption(
+                            "↳ No rotation rate stated in the experiment's "
+                            "own name for: " + ", ".join(no_rpm)
+                            + " — defaulted to 1600 rpm."
+                        )
+                    no_ring = [c["label"] for c in shared_chosen_list if c["ring_current"] is None]
+                    if no_ring:
+                        st.caption(
+                            "↳ No separate ring-current stream for: "
+                            + ", ".join(no_ring) + " — loaded as disk-only."
+                        )
+                    shared_entries = [
+                        (c["potential"], c["disk_current"], c["ring_current"],
+                         c["rpm"] or 1600.0)
+                        for c in shared_chosen_list
+                    ]
+                    shared_df = _orr_merge_entries(shared_entries, shared_sample_name)
+                    if shared_df is not None:
+                        samples.append(
+                            (_dedup_label(shared_sample_name, seen_labels), shared_df)
+                        )
+
     n_samples = st.number_input(
         "Number of additional samples to load individually", min_value=0,
         max_value=8, value=(0 if samples else 1), step=1,
@@ -4596,6 +4926,38 @@ def _orr_data_loader(
 
             entries = []  # (potential, disk_current, ring_current_or_None, rpm)
             for j, up in enumerate(ups):
+                if instrument_formats.is_supported(up.name):
+                    # Routed through the same per-experiment RRDE-aware
+                    # candidate list as the sidebar-shared-file path
+                    # (list_rrde_candidates, which keeps *both* disk and
+                    # ring current when an experiment records both) rather
+                    # than the generic column-count heuristics below —
+                    # those assume a raw CSV/Excel export and, fed a raw
+                    # instrument table instead, can misread a column
+                    # entirely (e.g. a chronoamperometry export's time
+                    # column read as if it were the disk current).
+                    try:
+                        up_candidates = _cached_rrde_candidates(up.getvalue(), up.name)
+                    except Exception as exc:
+                        st.warning(f"{up.name}: {exc}")
+                        continue
+                    st.caption(f"{up.name}")
+                    up_chosen_list = _pick_rrde_candidates(
+                        up_candidates, key=f"{key_prefix}_instrument_pick_{i}_{j}")
+                    for up_chosen in up_chosen_list:
+                        rpm_guess = (
+                            up_chosen["rpm"] or _guess_rpm_from_filename(up.name) or 1600.0
+                        )
+                        ring_note = (
+                            "" if up_chosen["ring_current"] is not None else " — disk only"
+                        )
+                        st.caption(f"↳ {up_chosen['label']}{ring_note} @ {rpm_guess:g} rpm")
+                        entries.append((
+                            up_chosen["potential"], up_chosen["disk_current"],
+                            up_chosen["ring_current"], rpm_guess,
+                        ))
+                    continue
+
                 raw = _orr_read_file(up, key_prefix=key_prefix, slot=f"{i}_{j}")
                 if raw is None:
                     continue
@@ -4639,7 +5001,7 @@ def _orr_data_loader(
     return samples, unit_hint
 
 
-def render_orr_tab() -> None:
+def render_orr_tab(shared_instrument_file: tuple[bytes, str] | None = None) -> None:
     st.subheader("ORR / RRDE analysis")
     st.caption(
         "At one rotation rate (conventionally 1600 rpm): onset potential, "
@@ -4652,7 +5014,7 @@ def render_orr_tab() -> None:
         "own file upload and does not use data loaded elsewhere."
     )
 
-    samples, unit_hint = _orr_data_loader()
+    samples, unit_hint = _orr_data_loader(shared_file=shared_instrument_file)
     if not samples:
         return
 
@@ -4884,9 +5246,19 @@ def render_orr_tab() -> None:
         # the right border to clip when the legend was dragged inside the
         # plot (see note below).
         left_margin = 175 + (font_size - 28) * 4
+        disk_ytitle = f"Current density ({display_unit})"
+        # The Y title below is a rotated *annotation* (xref/yref="paper"),
+        # anchored at the full canvas's vertical centre rather than a native
+        # axis title anchored to the plot domain -- so unlike
+        # `_min_height_for_rotated_title`'s usual native-title callers,
+        # nothing is "reserved" out of its own budget; it just needs the
+        # whole canvas tall enough to hold it without poking past the top/
+        # bottom edge (which is what "the title runs off the image" looks
+        # like at a long label + large export font).
+        fig_disk_height = _min_height_for_rotated_title(disk_ytitle, font_size, 0, 680)
         fig_disk.update_layout(
-            template="plotly_white", height=680, width=930, font=axis_font_disk,
-            margin={"l": left_margin, "r": 40},
+            template="plotly_white", height=fig_disk_height, width=930,
+            font=axis_font_disk, margin={"l": left_margin, "r": 40},
         )
         fig_disk.update_xaxes(
             title=_axis_title("Potential vs RHE / V", font_size, family=_ARIAL),
@@ -4906,7 +5278,7 @@ def render_orr_tab() -> None:
         fig_disk.add_annotation(
             x=0, y=0.5, xref="paper", yref="paper",
             xanchor="center", yanchor="middle", textangle=-90,
-            text=f"Current density ({display_unit})", showarrow=False,
+            text=disk_ytitle, showarrow=False,
             font=axis_font_disk, xshift=-(left_margin - 30),
         )
         fig_disk.update_yaxes(tickfont=axis_font_disk, row=1, col=1)
@@ -5177,6 +5549,50 @@ def render_orr_tab() -> None:
 
     onset_samples = {lbl: s for lbl, s in slices.items() if s.get("onset") is not None}
     if onset_samples:
+        st.markdown("**Onset potential verification**")
+        st.caption(
+            "Dashed vertical line = **E_onset** — where |current| first "
+            "departs from the flat pre-onset baseline — marked on each "
+            "sample's own disk current curve (see the *Onset / half-wave "
+            "potential comparison* chart below for the numbers side by "
+            "side)."
+        )
+        fig_onset_verify = go.Figure()
+        onset_verify_data: dict[str, list] = {}
+        for lbl, s in onset_samples.items():
+            color = palette_for[lbl]
+            fig_onset_verify.add_trace(go.Scatter(
+                x=s["potential"], y=s["disk"], mode="lines", name=lbl,
+                line={"color": color, "width": 2.5},
+            ))
+            onset_v = s["onset"].onset_potential
+            order = np.argsort(s["potential"])
+            onset_i = float(np.interp(onset_v, s["potential"][order], s["disk"][order]))
+            fig_onset_verify.add_trace(go.Scatter(
+                x=[onset_v], y=[onset_i], mode="markers", showlegend=False,
+                marker={"size": 11, "color": _darken(color), "symbol": "circle"},
+            ))
+            fig_onset_verify.add_vline(
+                x=onset_v, line={"color": _darken(color), "width": 1.5, "dash": "dot"},
+            )
+            onset_verify_data[f"{lbl} — Potential vs RHE (V)"] = list(s["potential"])
+            onset_verify_data[f"{lbl} — Disk current ({display_unit})"] = list(s["disk"])
+        _style_axes(fig_onset_verify, "Potential vs RHE / V", f"Disk current ({display_unit})")
+        if disk_x_range is not None:
+            fig_onset_verify.update_xaxes(range=disk_x_range)
+        fig_onset_verify.update_yaxes(
+            range=disk_y_range if disk_y_range is not None
+            else _zero_anchored_range(all_disk_cur)
+        )
+        _white_background(fig_onset_verify)
+        _pin_canvas(fig_onset_verify)
+        _show_figure(fig_onset_verify)
+        figure_downloads(
+            fig_onset_verify, f"orr_onset_verify_{int(primary_rpm)}rpm",
+            key="png_orr_onset_verify", what="Onset verification plot",
+            data=_padded_frame(onset_verify_data),
+        )
+
         st.markdown("**E½ verification (dI/dE)**")
         st.caption(
             "The dashed vertical line is the E½ reported above (the "
@@ -5520,8 +5936,11 @@ def render_orr_tab() -> None:
                     name=f"{rv:g} rpm", legendgroup=f"{rv:g}", showlegend=False,
                     line={"color": color, "width": 2.5},
                 ), row=2, col=1)
+            rrde_ytitle = f"Current ({display_unit})"
+            fig_rrde_height = _min_height_for_rotated_title(
+                rrde_ytitle, font_size, 0, 680)
             fig_rrde.update_layout(
-                template="plotly_white", height=680, width=930,
+                template="plotly_white", height=fig_rrde_height, width=930,
                 font=axis_font_rrde, margin={"l": left_margin, "r": 40},
             )
             fig_rrde.update_xaxes(
@@ -5531,7 +5950,7 @@ def render_orr_tab() -> None:
             fig_rrde.add_annotation(
                 x=0, y=0.5, xref="paper", yref="paper",
                 xanchor="center", yanchor="middle", textangle=-90,
-                text=f"Current ({display_unit})", showarrow=False,
+                text=rrde_ytitle, showarrow=False,
                 font=axis_font_rrde, xshift=-(left_margin - 30),
             )
             fig_rrde.update_yaxes(tickfont=axis_font_rrde, row=1, col=1)
@@ -5724,6 +6143,7 @@ def _chrono_extract_zip_samples(
 
 def _chrono_data_loader(
     mode: str, key_prefix: str = "chrono",
+    shared_file: tuple[bytes, str] | None = None,
 ) -> list[tuple[str, np.ndarray, np.ndarray]]:
     """Per-sample file uploader for chrono-technique data — mirrors the ORR
     tab's per-sample uploader (:func:`_orr_data_loader`) but for a single
@@ -5775,6 +6195,45 @@ def _chrono_data_loader(
                 (_dedup_label(lbl, seen_labels), t, v) for lbl, t, v in zip_samples
             )
 
+    if shared_file is not None:
+        payload, name = shared_file
+        with st.expander(f"📎 Sidebar instrument file — {name}"):
+            include_shared = st.checkbox(
+                "Include this file as an additional sample", value=False,
+                key=f"{key_prefix}_shared_include",
+            )
+            if include_shared:
+                try:
+                    shared_candidates = _cached_chrono_candidates(payload, name)
+                except Exception as exc:
+                    st.warning(f"{name}: {exc}")
+                    shared_candidates = []
+                if shared_candidates:
+                    shared_chosen = _pick_instrument_candidate(
+                        shared_candidates, key=f"{key_prefix}_shared_pick",
+                        prefer_contains=("CA", "CP", "Chrono"))
+                    shared_value = (
+                        shared_chosen["current"] if mode == "CA"
+                        else shared_chosen["potential"]
+                    )
+                    if shared_value is None:
+                        st.warning(
+                            f"{shared_chosen['label']}: no "
+                            f"{'current' if mode == 'CA' else 'potential'} "
+                            "data in this experiment — pick a different "
+                            "one, or switch technique above."
+                        )
+                    else:
+                        shared_name_key = f"{key_prefix}_shared_name"
+                        special_character_widget(
+                            shared_name_key, default=shared_chosen["label"],
+                            format_default=False)
+                        shared_sample_name = st.text_input("Sample name", key=shared_name_key)
+                        samples.append((
+                            _dedup_label(shared_sample_name, seen_labels),
+                            shared_chosen["time_s"], shared_value,
+                        ))
+
     n_samples = st.number_input(
         "Number of additional samples to load individually", min_value=0,
         max_value=12, value=(0 if samples else 1), step=1,
@@ -5796,6 +6255,38 @@ def _chrono_data_loader(
                 continue
             t_parts, v_parts = [], []
             for j, up in enumerate(ups):
+                if instrument_formats.is_supported(up.name):
+                    # Per-experiment candidates (list_chrono_candidates),
+                    # same as the sidebar-shared-file path — a raw file's
+                    # *first* time-series stream in document order is not
+                    # necessarily the technique this sample means (e.g. a
+                    # short OCP hold ahead of the real CA/CP run).
+                    try:
+                        up_candidates = _cached_chrono_candidates(up.getvalue(), up.name)
+                    except Exception as exc:
+                        st.warning(f"{up.name}: {exc}")
+                        continue
+                    up_chosen = _pick_instrument_candidate(
+                        up_candidates, key=f"{key_prefix}_instrument_pick_{i}_{j}",
+                        prefer_contains=("CA", "CP", "Chrono"))
+                    if up_chosen is None:
+                        continue
+                    up_value = (
+                        up_chosen["current"] if mode == "CA" else up_chosen["potential"]
+                    )
+                    if up_value is None:
+                        st.warning(
+                            f"{up.name} — {up_chosen['label']}: no "
+                            f"{'current' if mode == 'CA' else 'potential'} "
+                            "data in this experiment — pick a different "
+                            "one, or switch technique above."
+                        )
+                        continue
+                    st.caption(f"{up.name} — {up_chosen['label']}")
+                    t_parts.append(up_chosen["time_s"])
+                    v_parts.append(up_value)
+                    continue
+
                 raw = _orr_read_file(up, key_prefix=key_prefix, slot=f"{i}_{j}")
                 if raw is None:
                     continue
@@ -5823,7 +6314,7 @@ def _chrono_data_loader(
     return samples
 
 
-def render_chrono_tab() -> None:
+def render_chrono_tab(shared_instrument_file: tuple[bytes, str] | None = None) -> None:
     st.subheader("Chronoamperometry / Chronopotentiometry — stability")
     st.caption(
         "Long-duration stability test: current (chronoamperometry, "
@@ -5899,7 +6390,7 @@ def render_chrono_tab() -> None:
         native_unit = current_unit = display_unit = "V"
         value_label = "Potential (V)"
 
-    series = _chrono_data_loader(mode)
+    series = _chrono_data_loader(mode, shared_file=shared_instrument_file)
     if not series:
         return
     st.success(
@@ -5919,10 +6410,49 @@ def render_chrono_tab() -> None:
                             style=style)
 
     time_factor = _CHRONO_TIME_UNIT_S[time_unit]
+
+    trim_start_s: dict[str, float] = {}
+    trim_end_s: dict[str, float] = {}
+    with st.expander("✂️ Trim problematic data (per sample)"):
+        st.caption(
+            "Pine/AfterMath and other instrument exports sometimes open "
+            "with a noisy or unsettled first few points (electrode "
+            "equilibration, a relay/connection transient) that would "
+            "otherwise skew the baseline used for % retention — or end "
+            "with a bad tail (disconnect, operator stop). Trim them here: "
+            "this removes the points entirely, upstream of every plot and "
+            "metric below, rather than just hiding them on a view range."
+        )
+        for lbl, t_raw, v_raw in series:
+            slug = _widget_slug(lbl)
+            span_s = float(t_raw[-1] - t_raw[0]) * time_factor if len(t_raw) > 1 else 0.0
+            tc1, tc2 = st.columns(2)
+            trim_start_s[lbl] = tc1.number_input(
+                f"{lbl} — skip first N seconds", min_value=0.0,
+                max_value=max(span_s, 0.0), value=0.0, step=1.0,
+                key=f"chrono_trim_start_{slug}",
+            )
+            trim_end_s[lbl] = tc2.number_input(
+                f"{lbl} — skip last N seconds", min_value=0.0,
+                max_value=max(span_s, 0.0), value=0.0, step=1.0,
+                key=f"chrono_trim_end_{slug}",
+            )
+
     results: dict[str, chrono.RetentionResult] = {}
     rows = []
     for lbl, t_raw, v_raw in series:
         t_s = t_raw * time_factor
+        start_cut = trim_start_s.get(lbl, 0.0)
+        end_cut = trim_end_s.get(lbl, 0.0)
+        if (start_cut > 0 or end_cut > 0) and len(t_s) > 1:
+            keep = (t_s >= t_s[0] + start_cut) & (t_s <= t_s[-1] - end_cut)
+            if keep.sum() < 2:
+                st.warning(
+                    f"{lbl}: trim would leave fewer than 2 points — "
+                    "ignoring it for this sample."
+                )
+            else:
+                t_s, v_raw = t_s[keep], v_raw[keep]
         if mode == "CA":
             v = _rescale_current(v_raw, native_unit, current_unit)
             if convert_density:
@@ -6064,12 +6594,103 @@ def render_tutorials_tab() -> None:
             "`E_corrected = E_measured − factor · I · Ru`.\n"
             "3. **LSV Analysis** — onset potential, benchmark overpotentials, "
             "and the Tafel slope of the (iR-corrected, if you ran step 2) "
-            "curve.\n"
+            "curve, plus a bar chart comparing onset potential across "
+            "samples.\n"
             "4. **K-L Analysis** — Koutecký–Levich fit across ≥ 3 rotation "
             "rates for the kinetic current density and electron number n.\n"
             "5. **ORR / RRDE Analysis** — onset, E½, mass-transport-"
             "corrected Tafel slope, and (with ring data) n and %H₂O₂ "
-            "directly from one rotation rate."
+            "directly from one rotation rate, plus an onset/E½ comparison "
+            "chart.\n"
+            "6. **Chrono / Stability** — independent of the above: "
+            "chronoamperometry or chronopotentiometry, reported as % "
+            "retention, degradation rate, and time to 90 %/50 % retention."
+        )
+        st.caption(
+            "Sample-name fields throughout the app accept a formula-"
+            "formatting helper (**Aa→A** plus a subscript/superscript/Greek "
+            "palette) — see *Sample names & chemical formulas* below. Every "
+            "tab's uploader also accepts a raw Biologic (.mpr/.mpt) or Pine "
+            "Research AfterMath (.paax) instrument file directly — see "
+            "*Instrument file import*."
+        )
+
+    with st.expander("Sample names & chemical formulas"):
+        st.markdown(
+            "Every sample/legend-name field has an **Aa→A** button and a "
+            "**Special characters** palette above it. **Aa→A** lowers a "
+            "typed formula's digits to Unicode subscripts — `LiFePO4` "
+            "becomes `LiFePO₄` — recognising a digit as part of the formula "
+            "only when it directly follows an element symbol or a closing "
+            "bracket, so a name like `LaB6 (NIST SRM 660c)` keeps its "
+            "catalogue number intact while `LaB6` still becomes `LaB₆`. The "
+            "palette appends one subscript, superscript, Greek letter or "
+            "symbol (°, Å, Ω, ·, ×, ≈, …) per click."
+        )
+        st.caption(
+            "Unicode characters throughout, not `<sub>`/LaTeX markup — the "
+            "same string has to survive a Plotly legend, a results table, a "
+            "CSV, a figure export and a downloaded file's name, and markup "
+            "renders as literal angle brackets in at least the CSV and the "
+            "file name."
+        )
+
+    with st.expander("Instrument file import — Biologic & Pine Research"):
+        st.markdown(
+            "The EIS, LSV Analysis, ORR/RRDE and Chrono/Stability tabs (and "
+            "their ZIP batch-upload modes) accept a raw instrument export "
+            "directly, in addition to CSV/Excel:"
+        )
+        st.markdown(
+            "- **Biologic EC-Lab** `.mpr` (binary) or `.mpt` (ASCII "
+            "export), read via the open-source `galvani` library.\n"
+            "- **Pine Research AfterMath** `.paax` project file — turned "
+            "out to be plain XML rather than a proprietary binary layout, "
+            "so it's parsed with the standard library, no extra dependency."
+        )
+        st.markdown(
+            "**One file, several experiments.** A `.paax` project routinely "
+            "bundles many studies — one real export on hand held 14, "
+            "including a failed EIS run. Whenever a chosen file has more "
+            "than one usable experiment for the tab you're on, a **\"Which "
+            "experiment in this file?\"** dropdown appears, labelled by "
+            "AfterMath's own technique + timestamp (e.g. *RRDE "
+            "Experiment... 2026-JUL-08 1513*), pre-selected to that tab's "
+            "own best guess (never a failed/aborted run) — nothing is "
+            "picked silently. On the LSV Analysis/ORR tabs this recognises "
+            "DPV's own curve tag alongside plain CV/LSV/RDE/RRDE, not just "
+            "one exact technique name; if a tab reports no matching "
+            "experiment, none of the file's studies actually contain that "
+            "kind of data."
+        )
+        st.markdown(
+            "**RRDE: one sample, many experiments.** A rotating ring-disk "
+            "run is normally recorded as several separate experiments in "
+            "the file — one per rotation rate — each carrying *both* a "
+            "disk and a ring current stream. On the ORR/RRDE tab the "
+            "picker becomes a multi-select, pre-checked with every "
+            "experiment whose own name states a rotation rate (e.g. "
+            "*RRDE Experiment... (2000 RPM)*), so the full multi-rpm set "
+            "loads as one sample — disk and ring current, and the "
+            "rotation rate itself, all read from the file — rather than "
+            "adding each rate by hand. A non-rotated experiment recorded "
+            "in the same file (e.g. a CV run) is left unchecked but stays "
+            "pickable."
+        )
+        st.markdown(
+            "**Upload once, use on several tabs.** The sidebar has its own "
+            "**Instrument file** uploader, shared across the EIS, LSV "
+            "Analysis, ORR/RRDE and Chrono tabs — upload a file there once "
+            "instead of separately on each tab that needs it. Each tab "
+            "still opts in explicitly (its own \"Upload instrument file\" "
+            "source falls back to the sidebar file only when nothing was "
+            "uploaded directly in that tab) and still gets its own "
+            "experiment picker."
+        )
+        st.caption(
+            "Other vendor formats (e.g. CH Instruments `.bin`) aren't "
+            "supported yet; export to CSV/text from the instrument's own "
+            "software instead."
         )
 
     with st.expander("EIS / Ru Analysis — extracting Ru from the Nyquist arc"):
@@ -6243,6 +6864,16 @@ def render_tutorials_tab() -> None:
             "catalyst activity loss vs. rising overpotential) depends on "
             "which technique and quantity you're tracking."
         )
+        st.markdown(
+            "**Trimming a bad opening or tail.** A raw export's first few "
+            "points are often an electrode-equilibration transient rather "
+            "than real behaviour — left in, they can dominate the "
+            "baseline average and report a large, spurious \"degradation\" "
+            "that is really just the trace settling. The **✂️ Trim "
+            "problematic data** control (per sample, in seconds) removes "
+            "points entirely before the baseline, retention curve, or any "
+            "metric is computed — not a view-only axis range."
+        )
 
     with st.expander("Reference electrodes & the RHE conversion"):
         st.markdown(
@@ -6285,6 +6916,7 @@ def main():
     )
 
     _clear_reset_control()
+    shared_instrument_file = render_shared_instrument_uploader()
 
     tab_eis, tab_lsv, tab_tafel, tab_kl, tab_orr, tab_chrono, tab_tutorials = st.tabs(
         ["📈 EIS / Ru Analysis", "🔬 LSV iR Correction", "📐 LSV Analysis",
@@ -6293,9 +6925,9 @@ def main():
     )
 
     with tab_eis:
-        eis_list, eis_name = eis_data_loader()
+        eis_list, eis_name = eis_data_loader(shared_instrument_file)
     with tab_lsv:
-        lsv_list, lsv_name = lsv_data_loader()
+        lsv_list, lsv_name = lsv_data_loader(shared_instrument_file)
 
     eis_d = lsv_d = None
     sel, n_pairs = 0, 0
@@ -6365,16 +6997,16 @@ def main():
             st.info("⬆️ Upload LSV data above to begin.")
 
     with tab_tafel:
-        render_tafel_tab()
+        render_tafel_tab(shared_instrument_file)
 
     with tab_kl:
         render_kl_tab()
 
     with tab_orr:
-        render_orr_tab()
+        render_orr_tab(shared_instrument_file)
 
     with tab_chrono:
-        render_chrono_tab()
+        render_chrono_tab(shared_instrument_file)
 
     with tab_tutorials:
         render_tutorials_tab()
