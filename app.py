@@ -4902,6 +4902,14 @@ def _orr_data_loader(
                         samples.append(
                             (_dedup_label(shared_sample_name, seen_labels), shared_df)
                         )
+                        # instrument_formats always returns current already
+                        # in mA (Biologic's own convention; Pine's raw
+                        # Amperes converted once in that module) -- without
+                        # this, the "Current unit as uploaded" selectbox
+                        # below falls back to its own default of A and
+                        # every value gets rescaled x1000 too high.
+                        if unit_hint is None:
+                            unit_hint = "mA"
 
     n_samples = st.number_input(
         "Number of additional samples to load individually", min_value=0,
@@ -4944,6 +4952,13 @@ def _orr_data_loader(
                     st.caption(f"{up.name}")
                     up_chosen_list = _pick_rrde_candidates(
                         up_candidates, key=f"{key_prefix}_instrument_pick_{i}_{j}")
+                    if up_chosen_list and unit_hint is None:
+                        # instrument_formats always returns current already
+                        # in mA -- without this, the "Current unit as
+                        # uploaded" selectbox below falls back to its own
+                        # default of A and every value gets rescaled x1000
+                        # too high.
+                        unit_hint = "mA"
                     for up_chosen in up_chosen_list:
                         rpm_guess = (
                             up_chosen["rpm"] or _guess_rpm_from_filename(up.name) or 1600.0
