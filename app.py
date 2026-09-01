@@ -22,6 +22,9 @@ Workflow
    rpm) for onset/E1/2/Tafel plus (with ring current) electron number and
    peroxide yield directly; several rotation rates for a merged ring/disk
    comparison plot.
+7. **Chrono / Stability** tab: independent, chronoamperometry (current vs
+   time) or chronopotentiometry (potential vs time) — % retention vs time,
+   degradation rate, and time to 90 %/50 % retention per sample.
 """
 
 from __future__ import annotations
@@ -45,7 +48,10 @@ import streamlit as st
 from PIL import Image
 from plotly.subplots import make_subplots
 
-from scripts.modules import correction, data_io, eis, orr, sweep, tafel
+from scripts.modules import (
+    chrono, correction, data_io, eis, formatting, instrument_formats, orr,
+    sweep, tafel,
+)
 
 APP_NAME = "ElectroSim-LSV-RRDE-Analyzer"
 
@@ -712,6 +718,11 @@ def _cached_table(payload: bytes, sheet) -> pd.DataFrame:
     return data_io.read_table(io.BytesIO(payload), sheet=sheet)
 
 
+@st.cache_data(ttl=_CACHE_TTL_S, show_spinner=False, max_entries=64)
+def _cached_instrument_table(payload: bytes, filename: str) -> pd.DataFrame:
+    return instrument_formats.load_table(io.BytesIO(payload), filename)
+
+
 @st.cache_data(ttl=_CACHE_TTL_S, show_spinner=False, max_entries=8)
 def _cached_sample_bytes(path: str) -> bytes:
     """Read a bundled sample file once per session rather than per rerun."""
@@ -752,10 +763,14 @@ def eis_data_loader():
     nonce = st.session_state.get("uploader_nonce", 0)
     source = st.radio(
         "Choose input", ["Upload Excel workbook", "Upload CSV file",
+                         "Upload instrument file (.mpr/.mpt/.paax)",
                          "Use bundled sample"],
         horizontal=True, key="eis_source",
         help="Z', Z'' pairs. Several datasets may sit side-by-side as "
-             "repeated column pairs.",
+             "repeated column pairs. The instrument-file option reads a "
+             "Biologic EC-Lab .mpr/.mpt export or a Pine Research AfterMath "
+             ".paax export directly — other vendor formats aren't "
+             "supported yet.",
     )
     try:
         if source in ("Use bundled sample", "Upload Excel workbook"):
@@ -772,6 +787,19 @@ def eis_data_loader():
             sheets = _cached_sheets(payload)
             sheet = st.selectbox("EIS sheet", sheets, index=0, key="eis_sheet")
             return _cached_eis_datasets(payload, sheet), name
+
+        if source == "Upload instrument file (.mpr/.mpt/.paax)":
+            up = st.file_uploader(
+                "Biologic (.mpr/.mpt) or Pine AfterMath (.paax) file",
+                type=["mpr", "mpt", "paax"], key=f"eis_instrument_{nonce}",
+            )
+            if up is None:
+                st.info("⬆️ Upload a .mpr/.mpt/.paax file to begin.")
+                return None, None
+            z_real, z_imag = instrument_formats.load_eis(
+                io.BytesIO(up.getvalue()), up.name
+            )
+            return [data_io.EISData(z_real=z_real, z_imag=z_imag, label=up.name)], up.name
 
         up = st.file_uploader(
             "EIS CSV (Z', Z'')", type=["csv", "txt"], key=f"eis_csv_{nonce}"
@@ -800,10 +828,14 @@ def lsv_data_loader():
     nonce = st.session_state.get("uploader_nonce", 0)
     source = st.radio(
         "Choose input", ["Upload Excel workbook", "Upload CSV file",
+                         "Upload instrument file (.mpr/.mpt/.paax)",
                          "Use bundled sample"],
         horizontal=True, key="lsv_source",
         help="Potential, Current pairs. Several datasets may sit side-by-side "
-             "as repeated column pairs.",
+             "as repeated column pairs. The instrument-file option reads a "
+             "Biologic EC-Lab .mpr/.mpt export or a Pine Research AfterMath "
+             ".paax export directly — other vendor formats aren't "
+             "supported yet.",
     )
     try:
         if source in ("Use bundled sample", "Upload Excel workbook"):
@@ -822,6 +854,22 @@ def lsv_data_loader():
                 "LSV sheet", sheets, index=min(1, len(sheets) - 1), key="lsv_sheet"
             )
             return _cached_lsv_datasets(payload, sheet), name
+
+        if source == "Upload instrument file (.mpr/.mpt/.paax)":
+            up = st.file_uploader(
+                "Biologic (.mpr/.mpt) or Pine AfterMath (.paax) file",
+                type=["mpr", "mpt", "paax"], key=f"lsv_instrument_{nonce}",
+            )
+            if up is None:
+                st.info("⬆️ Upload a .mpr/.mpt/.paax file to begin.")
+                return None, None
+            potential, current = instrument_formats.load_lsv(
+                io.BytesIO(up.getvalue()), up.name
+            )
+            return (
+                [data_io.LSVData(potential=potential, current=current, label=up.name)],
+                up.name,
+            )
 
         up = st.file_uploader(
             "LSV CSV (Potential, Current)", type=["csv", "txt"],
@@ -1766,10 +1814,13 @@ def plot_style_controls(key_prefix: str, *, default_palette: str = "Default (Plo
             help="Kept to faces that are safe for journal submission.",
         )
         style["font_size"] = c2.number_input(
-            "Axis font size (pt)", min_value=8, max_value=48, value=28, step=1,
+            "Axis font size (pt)", min_value=8, max_value=48, value=22, step=1,
             key=f"{key_prefix}_font_size",
             help="Applies to axis titles and tick labels. Legend and "
-                 "annotations scale from this.",
+                 "annotations scale from this — a large size here is the "
+                 "usual reason in-plot text (legend, slope/benchmark "
+                 "labels) crowds or overlaps data points; drop it if that "
+                 "happens.",
         )
         style["palette_name"] = c3.selectbox(
             "Colour palette", list(_PALETTES),
@@ -1947,10 +1998,17 @@ def apply_plot_style(fig, style: dict, xtitle: str, ytitle: str,
     # Axis titles read one step up from the tick labels in most journal house
     # styles; using one size for both made the titles disappear into the numbers.
     title_font = {"family": family, "size": size + 8}
-    fig.update_xaxes(title={"text": xtitle, "font": title_font},
-                     tickfont=axis_font, **axis_kwargs)
-    fig.update_yaxes(title={"text": ytitle, "font": title_font},
-                     tickfont=axis_font, range=yrange, **axis_kwargs)
+    # Explicit gap between the tick labels and the title (see
+    # :func:`_axis_title_standoff`) -- Plotly's own auto-standoff isn't wide
+    # enough at these font sizes and the title crowds or overlaps the tick
+    # numbers in the exported image.
+    standoff = _axis_title_standoff(size)
+    fig.update_xaxes(
+        title={"text": xtitle, "font": title_font, "standoff": standoff},
+        tickfont=axis_font, **axis_kwargs)
+    fig.update_yaxes(
+        title={"text": ytitle, "font": title_font, "standoff": standoff},
+        tickfont=axis_font, range=yrange, **axis_kwargs)
 
 
 def trace_color_pickers(labels: list[str], style: dict, key_prefix: str) -> dict:
@@ -1981,7 +2039,35 @@ def trace_color_pickers(labels: list[str], style: dict, key_prefix: str) -> dict
     return colors
 
 
-_JOURNAL_FONT_SIZES = [28, 36]
+_JOURNAL_FONT_SIZES = [22, 28, 36]
+
+
+def _axis_title_standoff(font_size: int) -> int:
+    """Pixel gap Plotly should leave between an axis's tick labels and its
+    title text.
+
+    Left to Plotly's own auto-standoff, this app's larger journal font sizes
+    (tick labels at 28-36 pt is a routine choice for a print-ready export)
+    regularly rendered the axis title crowding or overlapping the tick
+    numbers in the exported TIFF/PNG -- on-screen and export use the same
+    figure object, but kaleido's headless renderer sizes text by its own
+    font metrics, which run tighter than the browser's for the same nominal
+    point size. An explicit standoff, scaled with the font rather than a
+    fixed pixel count, keeps the gap proportionate at every size.
+    """
+    return max(14, round(font_size * 0.7))
+
+
+def _axis_title(text: str, font_size: int, family: str = "") -> dict:
+    """Axis title dict with the standoff from :func:`_axis_title_standoff`
+    applied, for the hand-built figures that set ``title=`` directly rather
+    than going through :func:`apply_plot_style` (which applies the same gap
+    itself). One helper so neither path can drift from the other."""
+    return {
+        "text": text,
+        "font": {"family": family or _ARIAL, "size": font_size},
+        "standoff": _axis_title_standoff(font_size),
+    }
 
 
 def _journal_margin(font_size: int, *, legend_below: bool = False,
@@ -1999,18 +2085,23 @@ def _journal_margin(font_size: int, *, legend_below: bool = False,
     holds a rotated axis title plus a tick label; bottom holds a tick label
     plus the axis title, which renders at ``font_size + 8`` (see
     :func:`apply_plot_style`); right and top only need to keep the last tick
-    label and any title off the edge.
+    label and any title off the edge. Both also add
+    :func:`_axis_title_standoff` explicitly, since that gap sits *between*
+    the tick label and the title rather than being implied by either term.
     """
     title_size = font_size + 8
     tick_len = 7
+    standoff = _axis_title_standoff(font_size)
     return {
-        # rotated title + ~4 characters of tick label + tick + padding
-        "l": int(max(45, title_size * 1.2 + font_size * 2.4 + tick_len + 10)),
+        # rotated title + ~4 characters of tick label + tick + standoff + padding
+        "l": int(max(45, title_size * 1.2 + font_size * 2.4 + tick_len
+                     + standoff + 10)),
         # half of the last x tick label, or room for an outside legend
         "r": int(max(25, font_size * 1.5 + 10)),
         "t": int(max(25, title_size * 1.8)) if titled else int(max(15, font_size)),
-        # x tick label + axis title + tick + padding (+ a legend strip below)
-        "b": int(max(40, font_size * 1.2 + title_size * 1.3 + tick_len + 10)
+        # x tick label + axis title + tick + standoff + padding (+ legend strip)
+        "b": int(max(40, font_size * 1.2 + title_size * 1.3 + tick_len
+                     + standoff + 10)
                  + (font_size * 2.2 if legend_below else 0)),
     }
 
@@ -2357,6 +2448,59 @@ def _dedup_label(label: str, seen: dict[str, int]) -> str:
     return label if seen[label] == 1 else f"{label} ({seen[label]})"
 
 
+# Palette rows for `special_character_widget` below: exactly the characters a
+# chemical-formula sample name needs and that are awkward to type by hand.
+_SPECIAL_CHAR_ROWS = (
+    ("Subscripts", "₀₁₂₃₄₅₆₇₈₉₊₋"),
+    ("Superscripts", "⁰¹²³⁴⁵⁶⁷⁸⁹⁺⁻"),
+    ("Greek", "αβγδεθλμνπρστφχωΔΩ"),
+    ("Symbols", "°ÅΩ·×±≈≤≥→←½⅓¼′″"),
+)
+
+
+def special_character_widget(key: str, default: str, fmt_col=None) -> None:
+    """Chemical-formula input helper shared by every sample/label name field
+    in the app: an "Aa→A" button that runs :func:`formatting.format_formula`
+    over the current value (``LiFePO4`` -> ``LiFePO₄``), plus a "Special
+    characters" palette that appends one Unicode subscript/superscript/Greek/
+    symbol character per click. Unicode throughout (not markup), because the
+    same string has to survive a Plotly axis/legend, a pandas table, a CSV, a
+    figure export and a file name — tag-based markup renders as literal angle
+    brackets in at least the CSV and the file name.
+
+    Must be called **before** ``st.text_input(..., key=key)`` is
+    instantiated: Streamlit refuses to let a widget's own session_state entry
+    be written once that widget already exists this run, so both the format
+    button and the palette buttons below have to act on ``session_state[key]``
+    ahead of the text_input's own creation. ``fmt_col`` is the container (a
+    ``st`` column slot, or ``st`` itself) the "Aa→A" button renders into —
+    pass a spare column from the caller's own layout to put it beside the
+    name field instead of above it.
+    """
+    if key not in st.session_state:
+        st.session_state[key] = formatting.format_formula(default)
+    target = fmt_col if fmt_col is not None else st
+    if target.button("Aa→A", key=f"{key}__fmt", width="stretch",
+                     help="Lower the digits of a chemical formula: LiFePO4 "
+                          "becomes LiFePO₄."):
+        st.session_state[key] = formatting.format_formula(
+            st.session_state.get(key) or default)
+    with st.expander("Special characters"):
+        st.caption(
+            "Each one is added at the end of the name. Unicode throughout, "
+            "so it survives the plot, the table, a CSV and a file name "
+            "alike — which `<sub>` markup does not."
+        )
+        for row_name, row in _SPECIAL_CHAR_ROWS:
+            st.caption(row_name)
+            cols = st.columns(len(row))
+            for col, char in zip(cols, row):
+                if col.button(char, key=f"{key}__sc_{row_name}_{char}",
+                              width="stretch"):
+                    st.session_state[key] = (
+                        st.session_state.get(key) or default) + char
+
+
 def _selection_signature(points: list) -> tuple:
     """Fingerprint a Plotly box-select event so it can be applied exactly
     once (Streamlit keeps the same selection in session_state across
@@ -2401,7 +2545,10 @@ def _tafel_extract_zip_samples(
     **Replicate group** by default and error bars across them fall out of
     the existing replicate-statistics machinery with no extra tagging.
     Files at the zip's own root all become runs of one sample, named after
-    the zip."""
+    the zip. A member recognised as a raw instrument export (Biologic
+    .mpr/.mpt or Pine AfterMath .paax, see
+    :mod:`scripts.modules.instrument_formats`) is parsed directly instead
+    of as CSV/Excel."""
     try:
         zf = zipfile.ZipFile(io.BytesIO(upload.getvalue()))
     except zipfile.BadZipFile:
@@ -2417,11 +2564,12 @@ def _tafel_extract_zip_samples(
 
     members = [
         m for m in zf.namelist()
-        if m.lower().endswith((".csv", ".txt", ".xlsx", ".xls"))
+        if (m.lower().endswith((".csv", ".txt", ".xlsx", ".xls"))
+            or instrument_formats.is_supported(m))
         and "__MACOSX" not in m and not m.rsplit("/", 1)[-1].startswith(".")
     ]
     if not members:
-        st.warning(f"{upload.name}: no CSV/Excel files found inside.")
+        st.warning(f"{upload.name}: no CSV/Excel/instrument files found inside.")
         return []
     if len(members) > MAX_ZIP_MEMBERS:
         st.error(
@@ -2443,7 +2591,13 @@ def _tafel_extract_zip_samples(
             skipped += 1
             continue
         try:
-            if filename.lower().endswith((".xlsx", ".xls")):
+            if instrument_formats.is_supported(filename):
+                potential, current = instrument_formats.load_lsv(
+                    io.BytesIO(raw_bytes), filename
+                )
+                ds = [data_io.LSVData(potential=potential, current=current,
+                                      label=filename)]
+            elif filename.lower().endswith((".xlsx", ".xls")):
                 sheets = data_io.list_sheets(io.BytesIO(raw_bytes))
                 ds = data_io.load_lsv_datasets(io.BytesIO(raw_bytes), sheet=sheets[0])
             else:
@@ -2503,12 +2657,16 @@ def _tafel_data_loader() -> list[tuple[str, data_io.LSVData]]:
 
     source = st.radio(
         "Additionally upload individual files",
-        ["Excel workbook(s)", "CSV file(s)", "None"],
+        ["Excel workbook(s)", "CSV file(s)", "Instrument file(s) (.mpr/.mpt/.paax)",
+         "None"],
         horizontal=True,
         key="tafel_source",
         help="Columns: Potential, Current (or current density). Several "
              "datasets may also sit side-by-side within one file as "
-             "repeated column pairs.",
+             "repeated column pairs. The instrument-file option reads a "
+             "Biologic EC-Lab .mpr/.mpt export or a Pine Research "
+             "AfterMath .paax export directly — other vendor formats "
+             "aren't supported yet.",
     )
 
     try:
@@ -2551,6 +2709,25 @@ def _tafel_data_loader() -> list[tuple[str, data_io.LSVData]]:
                     for d in ds:
                         label = f"{base} · {d.label}" if len(ds) > 1 else base
                         series.append((_dedup_label(label, seen_labels), d))
+        elif source == "Instrument file(s) (.mpr/.mpt/.paax)":
+            ups = st.file_uploader(
+                "Biologic (.mpr/.mpt) or Pine AfterMath (.paax) file(s)",
+                type=["mpr", "mpt", "paax"], key="tafel_instrument",
+                accept_multiple_files=True,
+            )
+            if ups:
+                for up in ups:
+                    base = up.name.rsplit(".", 1)[0]
+                    try:
+                        potential, current = instrument_formats.load_lsv(
+                            io.BytesIO(up.getvalue()), up.name
+                        )
+                    except Exception as exc:
+                        st.warning(f"{up.name}: {exc}")
+                        continue
+                    d = data_io.LSVData(potential=potential, current=current,
+                                        label=up.name)
+                    series.append((_dedup_label(base, seen_labels), d))
     except Exception as exc:
         st.error(f"Could not load data: {exc}")
 
@@ -3008,12 +3185,16 @@ def render_tafel_tab() -> None:
                     sel_range = None
                 if sel_range is not None:
                     st.session_state[range_key] = sel_range
+            name_key = f"tafel_name_{slug}"
+            special_character_widget(name_key, default=f"Sample {i + 1}")
             c0, cg, cr, c1, c2 = st.columns([1.0, 1.0, 0.8, 1.7, 0.5])
             display_name = c0.text_input(
-                "Legend name", value=f"Sample {i + 1}",
-                key=f"tafel_name_{slug}",
+                "Legend name",
+                key=name_key,
                 help="Shown in the plot legend; edit if you'd rather show "
-                     "the auto-detected file/column name.",
+                     "the auto-detected file/column name. Subscripts/"
+                     "superscripts can be typed directly, or use **Aa→A** / "
+                     "**Special characters** above.",
             )
             # Only pre-fill a guess when the label carries the "(2)"/"(3)"
             # suffix _dedup_label adds for a genuine repeat upload (same
@@ -3145,12 +3326,11 @@ def render_tafel_tab() -> None:
                 **_legend_margin_extra(style)},
         )
         lsv_fig.update_xaxes(
-            title={"text": "Potential vs RHE / V", "font": {"family": _ARIAL, "size": font_size}},
+            title=_axis_title("Potential vs RHE / V", font_size),
             tickfont={"family": _ARIAL, "size": font_size}, **_axis_style(style),
         )
         lsv_fig.update_yaxes(
-            title={"text": f"Current ({display_unit})",
-                   "font": {"family": _ARIAL, "size": font_size}},
+            title=_axis_title(f"Current ({display_unit})", font_size),
             tickfont={"family": _ARIAL, "size": font_size}, **_axis_style(style),
         )
         if lsv_x_range is not None:
@@ -3289,13 +3469,12 @@ def render_tafel_tab() -> None:
     # a sparse count (default 4 for this tab) keeps a publication-style plot
     # uncluttered.
     fig.update_xaxes(
-        title={"text": f"log₁₀ |Current| ({display_unit})",
-               "font": {"family": _ARIAL, "size": font_size}},
+        title=_axis_title(f"log₁₀ |Current| ({display_unit})", font_size),
         tickfont={"family": _ARIAL, "size": font_size}, range=tafel_x_range,
         **_axis_style(style),
     )
     fig.update_yaxes(
-        title={"text": "Potential vs RHE / V", "font": {"family": _ARIAL, "size": font_size}},
+        title=_axis_title("Potential vs RHE / V", font_size),
         tickfont={"family": _ARIAL, "size": font_size}, range=tafel_y_range,
         **_axis_style(style),
     )
@@ -3507,7 +3686,7 @@ def render_tafel_tab() -> None:
                 tickfont={"family": _ARIAL, "size": font_size}, **_axis_style(style),
             )
             fig_bar.update_yaxes(
-                title={"text": ylabel, "font": {"family": _ARIAL, "size": font_size}},
+                title=_axis_title(ylabel, font_size),
                 tickfont={"family": _ARIAL, "size": font_size}, **_axis_style(style),
             )
             _white_background(fig_bar)
@@ -3521,6 +3700,66 @@ def render_tafel_tab() -> None:
                     "Sample": list(means.index),
                     "Mean": list(means.to_numpy()),
                     "SD": list(stds.to_numpy()),
+                }),
+            )
+
+    if len(results) >= 2 and summary["E_onset (V vs RHE)"].notna().any():
+        st.markdown("**Onset potential comparison**")
+        st.caption(
+            "E_onset is where |current| first departs from the flat "
+            "pre-onset baseline (same detector the Tafel fit-range "
+            "auto-start uses). One bar per sample by default; samples "
+            "sharing a **Replicate group** name above are instead merged "
+            "into one bar (its mean across those repeat runs, with an "
+            "error bar of ±1 SD)."
+        )
+        onset_bar_key = [
+            g if g else s
+            for g, s in zip(summary["Replicate group"], summary["Sample"])
+        ]
+        onset_df = pd.DataFrame({
+            "Sample": onset_bar_key, "value": summary["E_onset (V vs RHE)"],
+        }).dropna(subset=["value"])
+        if not onset_df.empty:
+            onset_grouped = onset_df.groupby("Sample", sort=False)["value"]
+            onset_means = onset_grouped.mean()
+            onset_stds = onset_grouped.std(ddof=1).fillna(0.0)
+            onset_colors = [
+                _PALETTE_T[i % len(_PALETTE_T)] for i in range(len(onset_means))
+            ]
+            fig_onset_bar = go.Figure(go.Bar(
+                x=list(onset_means.index), y=onset_means.to_numpy(),
+                error_y={"type": "data", "array": onset_stds.to_numpy(),
+                         "visible": True},
+                marker={"color": onset_colors},
+            ))
+            fig_onset_bar.update_layout(
+                title=({"text": "Onset potential by sample",
+                        "font": {"family": _font_stack(style["font_family"]),
+                                 "size": font_size}}
+                       if style.get("show_title") else None),
+                template="plotly_white", height=420,
+                font={"family": _ARIAL, "size": font_size},
+                margin=_journal_margin(
+                    font_size, titled=bool(style.get("show_title"))),
+            )
+            fig_onset_bar.update_xaxes(
+                tickfont={"family": _ARIAL, "size": font_size}, **_axis_style(style),
+            )
+            fig_onset_bar.update_yaxes(
+                title=_axis_title("E_onset (V vs RHE)", font_size),
+                tickfont={"family": _ARIAL, "size": font_size}, **_axis_style(style),
+            )
+            _white_background(fig_onset_bar)
+            _pin_canvas(fig_onset_bar)
+            _show_figure(fig_onset_bar)
+            figure_downloads(
+                fig_onset_bar, "onset_potential_bar", key="png_tafel_onset_bar",
+                what="Onset potential bar chart",
+                data=_padded_frame({
+                    "Sample": list(onset_means.index),
+                    "Mean E_onset (V vs RHE)": list(onset_means.to_numpy()),
+                    "SD": list(onset_stds.to_numpy()),
                 }),
             )
 
@@ -4026,7 +4265,19 @@ def _orr_read_file(up, key_prefix: str = "orr",
     to share a name — routine in RRDE work, where disk and ring exports come
     out of per-rpm folders with identical names — would build the same widget
     key twice and crash the tab with ``DuplicateWidgetID``.
+
+    Also accepts a raw instrument export (Biologic .mpr/.mpt or Pine
+    Research AfterMath .paax, see :mod:`scripts.modules.instrument_formats`)
+    — its own column names
+    (``time/s``, ``Ewe/V``, ``I/mA``, …) already match this project's
+    fuzzy header hints, so no separate handling is needed downstream.
     """
+    if instrument_formats.is_supported(up.name):
+        try:
+            return _cached_instrument_table(up.getvalue(), up.name)
+        except Exception as exc:
+            st.warning(f"{up.name}: {exc}")
+            return None
     try:
         if up.name.lower().endswith((".xlsx", ".xls")):
             sheets = _cached_sheets(up.getvalue())
@@ -4160,7 +4411,10 @@ def _orr_extract_zip_samples(
     file needs correcting by hand. Also returns a current-unit guess sniffed
     from the first readable file's column headers (see
     :func:`_guess_current_unit_from_cols`), or ``None`` if nothing recognisable
-    was found.
+    was found. A member recognised as a raw instrument export (Biologic
+    .mpr/.mpt or Pine AfterMath .paax, see
+    :mod:`scripts.modules.instrument_formats`) is parsed directly instead
+    of as CSV/Excel.
     """
     try:
         zf = zipfile.ZipFile(io.BytesIO(upload.getvalue()))
@@ -4177,11 +4431,12 @@ def _orr_extract_zip_samples(
 
     members = [
         m for m in zf.namelist()
-        if m.lower().endswith((".csv", ".txt", ".xlsx", ".xls"))
+        if (m.lower().endswith((".csv", ".txt", ".xlsx", ".xls"))
+            or instrument_formats.is_supported(m))
         and "__MACOSX" not in m and not m.rsplit("/", 1)[-1].startswith(".")
     ]
     if not members:
-        st.warning(f"{upload.name}: no CSV/Excel files found inside.")
+        st.warning(f"{upload.name}: no CSV/Excel/instrument files found inside.")
         return [], None
     if len(members) > MAX_ZIP_MEMBERS:
         st.error(
@@ -4204,7 +4459,9 @@ def _orr_extract_zip_samples(
             skipped += 1
             continue
         try:
-            if filename.lower().endswith((".xlsx", ".xls")):
+            if instrument_formats.is_supported(filename):
+                df = instrument_formats.load_table(io.BytesIO(raw_bytes), filename)
+            elif filename.lower().endswith((".xlsx", ".xls")):
                 sheets = data_io.list_sheets(io.BytesIO(raw_bytes))
                 df = data_io.read_table(io.BytesIO(raw_bytes), sheet=sheets[0])
             else:
@@ -4275,7 +4532,10 @@ def _orr_data_loader(
         "layout most RDE/RRDE software exports) *or* a compiled workbook "
         "with Potential/Disk-current/Potential/Ring-current already paired "
         "for one rotation rate. Rotation rate and disk/ring role are guessed "
-        "from the filename and can be corrected below."
+        "from the filename and can be corrected below. A Biologic EC-Lab "
+        "`.mpr`/`.mpt` export or a Pine Research AfterMath `.paax` export "
+        "can be uploaded directly too (read as a single-electrode/disk "
+        "file — other instrument formats aren't supported yet)."
     )
 
     samples: list[tuple[str, pd.DataFrame]] = []
@@ -4321,12 +4581,13 @@ def _orr_data_loader(
 
     for i in range(int(n_samples)):
         with st.expander(f"Sample {i + 1} — files", expanded=(i == 0 and not samples)):
-            sample_name = st.text_input(
-                "Sample name", value=f"Sample {i + 1}", key=f"{key_prefix}_sample_name_{i}"
-            )
+            name_key = f"{key_prefix}_sample_name_{i}"
+            special_character_widget(name_key, default=f"Sample {i + 1}")
+            sample_name = st.text_input("Sample name", key=name_key)
             ups = st.file_uploader(
                 file_help,
-                type=["csv", "txt", "xlsx", "xls"], accept_multiple_files=True,
+                type=["csv", "txt", "xlsx", "xls", "mpr", "mpt", "paax"],
+                accept_multiple_files=True,
                 key=f"{key_prefix}_files_{i}",
             )
             if not ups:
@@ -4622,13 +4883,13 @@ def render_orr_tab() -> None:
         # margin sized for the worst case, since automargin was what caused
         # the right border to clip when the legend was dragged inside the
         # plot (see note below).
-        left_margin = 160 + (font_size - 28) * 4
+        left_margin = 175 + (font_size - 28) * 4
         fig_disk.update_layout(
             template="plotly_white", height=680, width=930, font=axis_font_disk,
             margin={"l": left_margin, "r": 40},
         )
         fig_disk.update_xaxes(
-            title={"text": "Potential vs RHE / V", "font": axis_font_disk},
+            title=_axis_title("Potential vs RHE / V", font_size, family=_ARIAL),
             tickfont=axis_font_disk, row=2, col=1,
         )
         # One common Y-axis title spanning both rows (no separate "Ring"/
@@ -4985,6 +5246,45 @@ def render_orr_tab() -> None:
             key="png_orr_table", style=style,
         )
 
+        if summary_df["E_onset (V vs RHE)"].notna().any():
+            st.markdown("**Onset / half-wave potential comparison**")
+            st.caption(
+                "E_onset is where |current| first departs from the flat "
+                "pre-onset baseline; E_half-wave is the steepest point of "
+                "the wave within the E½ search window set above. One bar "
+                "pair per sample."
+            )
+            fig_onset_bar = go.Figure()
+            fig_onset_bar.add_trace(go.Bar(
+                x=summary_df["Sample"], y=summary_df["E_onset (V vs RHE)"],
+                name="E_onset", marker={"color": _PALETTE_O[0]},
+            ))
+            if "E_half-wave (V vs RHE)" in summary_df.columns:
+                fig_onset_bar.add_trace(go.Bar(
+                    x=summary_df["Sample"],
+                    y=summary_df["E_half-wave (V vs RHE)"],
+                    name="E_half-wave",
+                    marker={"color": _PALETTE_O[1 % len(_PALETTE_O)]},
+                ))
+            fig_onset_bar.update_layout(barmode="group")
+            _style_axes(fig_onset_bar, "Sample", "Potential (V vs RHE)")
+            _white_background(fig_onset_bar)
+            _pin_canvas(fig_onset_bar)
+            _show_figure(fig_onset_bar)
+            onset_bar_cols = {
+                "Sample": list(summary_df["Sample"]),
+                "E_onset (V vs RHE)": list(summary_df["E_onset (V vs RHE)"]),
+            }
+            if "E_half-wave (V vs RHE)" in summary_df.columns:
+                onset_bar_cols["E_half-wave (V vs RHE)"] = list(
+                    summary_df["E_half-wave (V vs RHE)"])
+            figure_downloads(
+                fig_onset_bar, f"orr_onset_bar_{int(primary_rpm)}rpm",
+                key="png_orr_onset_bar",
+                what="Onset/half-wave potential bar chart",
+                data=_padded_frame(onset_bar_cols),
+            )
+
     if tafel_slider_specs:
         st.markdown(
             "**Tafel fit range** (per sample — feeds the mass-transport-"
@@ -5225,7 +5525,7 @@ def render_orr_tab() -> None:
                 font=axis_font_rrde, margin={"l": left_margin, "r": 40},
             )
             fig_rrde.update_xaxes(
-                title={"text": "Potential vs RHE / V", "font": axis_font_rrde},
+                title=_axis_title("Potential vs RHE / V", font_size, family=_ARIAL),
                 tickfont=axis_font_rrde, row=2, col=1,
             )
             fig_rrde.add_annotation(
@@ -5292,6 +5592,450 @@ def render_orr_tab() -> None:
         figure_downloads(
             fig_rrde, f"orr_rrde_multirpm_{rrde_label}", key="png_orr_rrde",
             what="RRDE multi-rpm plot", data=_padded_frame(rrde_cols),
+        )
+
+
+# --------------------------------------------------------------------------- #
+# Chronoamperometry / Chronopotentiometry (stability) tab                     #
+# --------------------------------------------------------------------------- #
+_CHRONO_TIME_HINTS = ("time", "t/s", "t(s)", "t (s)", "elapsed")
+_CHRONO_CUR_HINTS = ("current", "i ", "i(", "i/", "amp", "j ", "j/")
+_CHRONO_TIME_UNIT_S = {"s": 1.0, "min": 60.0, "h": 3600.0}
+
+
+def _chrono_table_to_series(coerced: pd.DataFrame, cols: list, mode: str):
+    """``(time, value)`` from an already-numeric-coerced table. ``mode`` is
+    ``"CA"`` (value = current) or ``"CP"`` (value = potential) — used only to
+    pick the right header hints when more than two numeric columns are
+    present. Time is matched by header hint first, else the first column;
+    falls back to the next remaining column for the value. Returns ``None``
+    if no numeric rows survive."""
+    lowered = {c: str(c).strip().lower() for c in cols}
+    time_col = next(
+        (c for c, name in lowered.items()
+         if any(h in name for h in _CHRONO_TIME_HINTS)),
+        cols[0],
+    )
+    remaining = [c for c in cols if c != time_col]
+    if not remaining:
+        return None
+    hints = _CHRONO_CUR_HINTS if mode == "CA" else _ORR_POT_HINTS
+    value_col = next(
+        (c for c in remaining if any(h in lowered[c] for h in hints)),
+        remaining[0],
+    )
+    t = coerced[time_col].to_numpy(dtype=float)
+    v = coerced[value_col].to_numpy(dtype=float)
+    mask = np.isfinite(t) & np.isfinite(v)
+    return (t[mask], v[mask]) if mask.any() else None
+
+
+def _chrono_extract_zip_samples(
+    upload, mode: str, key_prefix: str = "chrono",
+) -> list[tuple[str, np.ndarray, np.ndarray]]:
+    """Batch-load chrono-technique runs from a ZIP of a data folder —
+    mirrors :func:`_orr_extract_zip_samples`/:func:`_tafel_extract_zip_samples`
+    but for a single (time, value) series per sample. Files sharing a
+    top-level subfolder are one sample (their series concatenated and
+    time-sorted, same as the per-sample uploader below); files at the zip's
+    own root all become one sample, named after the zip. A member
+    recognised as a raw instrument export (Biologic .mpr/.mpt or Pine
+    AfterMath .paax, see :mod:`scripts.modules.instrument_formats`) is
+    parsed directly instead of as CSV/Excel.
+    """
+    try:
+        zf = zipfile.ZipFile(io.BytesIO(upload.getvalue()))
+    except zipfile.BadZipFile:
+        st.error(f"{upload.name}: not a valid .zip file.")
+        return []
+    total = sum(info.file_size for info in zf.infolist())
+    if total > data_io.MAX_UNCOMPRESSED_BYTES:
+        st.error(
+            f"{upload.name}: zip expands too large; rejected as a possible "
+            "decompression bomb."
+        )
+        return []
+
+    members = [
+        m for m in zf.namelist()
+        if (m.lower().endswith((".csv", ".txt", ".xlsx", ".xls"))
+            or instrument_formats.is_supported(m))
+        and "__MACOSX" not in m and not m.rsplit("/", 1)[-1].startswith(".")
+    ]
+    if not members:
+        st.warning(f"{upload.name}: no CSV/Excel/instrument files found inside.")
+        return []
+    if len(members) > MAX_ZIP_MEMBERS:
+        st.error(
+            f"{upload.name}: contains {len(members)} data files, more than "
+            f"the {MAX_ZIP_MEMBERS}-file limit. Split it into smaller zips."
+        )
+        return []
+
+    default_sample = upload.name.rsplit(".", 1)[0]
+    grouped: dict[str, list[tuple[np.ndarray, np.ndarray]]] = {}
+    skipped = 0
+    for member in sorted(members):
+        parts = member.replace("\\", "/").split("/")
+        sample_name = parts[0] if len(parts) > 1 else default_sample
+        filename = parts[-1]
+        try:
+            raw_bytes = zf.read(member)
+        except Exception:
+            skipped += 1
+            continue
+        try:
+            if instrument_formats.is_supported(filename):
+                df = instrument_formats.load_table(io.BytesIO(raw_bytes), filename)
+            elif filename.lower().endswith((".xlsx", ".xls")):
+                sheets = data_io.list_sheets(io.BytesIO(raw_bytes))
+                df = data_io.read_table(io.BytesIO(raw_bytes), sheet=sheets[0])
+            else:
+                df = data_io.read_table(io.BytesIO(raw_bytes), sheet=None)
+        except Exception:
+            skipped += 1
+            continue
+        coerced, cols = _orr_numeric_columns(df)
+        if len(cols) < 2:
+            skipped += 1
+            continue
+        series = _chrono_table_to_series(coerced, cols, mode)
+        if series is None:
+            skipped += 1
+            continue
+        grouped.setdefault(sample_name, []).append(series)
+
+    if skipped:
+        st.caption(
+            f"↪ {skipped} file(s) inside the zip were skipped (unreadable or "
+            "not enough numeric columns)."
+        )
+
+    samples: list[tuple[str, np.ndarray, np.ndarray]] = []
+    for sample_name, parts_list in grouped.items():
+        t_all = np.concatenate([t for t, _ in parts_list])
+        v_all = np.concatenate([v for _, v in parts_list])
+        t_sorted, v_sorted = sweep.ascending_xy(t_all, v_all)
+        if len(t_sorted) < 2:
+            continue
+        samples.append((sample_name, t_sorted, v_sorted))
+    return samples
+
+
+def _chrono_data_loader(
+    mode: str, key_prefix: str = "chrono",
+) -> list[tuple[str, np.ndarray, np.ndarray]]:
+    """Per-sample file uploader for chrono-technique data — mirrors the ORR
+    tab's per-sample uploader (:func:`_orr_data_loader`) but for a single
+    (time, value) series per sample rather than disk/ring pairs. Several
+    files uploaded under the same sample are concatenated and time-sorted
+    (:func:`sweep.ascending_xy`), which is only correct for genuinely
+    contiguous segments of one continuous run sharing an absolute time base
+    — not for pasting in unrelated repeats (use separate samples for those).
+    Returns a list of ``(sample_name, time_raw, value_raw)``, still in
+    whatever time/current unit the file itself used.
+    """
+    value_kind = "current" if mode == "CA" else "potential"
+    example_col = "Current (mA)" if mode == "CA" else "Potential (V)"
+    st.markdown(
+        f"**Data source** (independent of the other tabs) — for each "
+        f"sample, upload one or more Time + {value_kind.title()} files. "
+        f"Column headers are matched automatically (e.g. `Time (s)`, "
+        f"`{example_col}`); with unrecognised headers the first numeric "
+        "column is used as time and the next as the value. A Biologic "
+        "EC-Lab `.mpr`/`.mpt` export or a Pine Research AfterMath `.paax` "
+        "export can be uploaded directly too — other instrument formats "
+        "aren't supported yet."
+    )
+    samples: list[tuple[str, np.ndarray, np.ndarray]] = []
+    seen_labels: dict[str, int] = {}
+
+    with st.expander("📦 Batch upload — a ZIP of a whole data folder"):
+        st.caption(
+            "For many samples at once: zip your data folder (one subfolder "
+            "per sample, containing its Time/value file(s) — extra nesting "
+            "inside a sample's subfolder is fine) and upload it here. "
+            "Files at the zip's own root all become one sample, named "
+            "after the zip. Biologic .mpr/.mpt and Pine AfterMath .paax "
+            "files are recognised inside the zip too."
+        )
+        zip_up = st.file_uploader(
+            "ZIP file", type=["zip"], key=f"{key_prefix}_zip",
+        )
+        if zip_up is not None:
+            zip_samples = _chrono_extract_zip_samples(
+                zip_up, mode, key_prefix=key_prefix
+            )
+            if zip_samples:
+                st.success(
+                    f"Loaded {len(zip_samples)} sample(s) from {zip_up.name}: "
+                    + ", ".join(lbl for lbl, _, _ in zip_samples)
+                )
+            samples.extend(
+                (_dedup_label(lbl, seen_labels), t, v) for lbl, t, v in zip_samples
+            )
+
+    n_samples = st.number_input(
+        "Number of additional samples to load individually", min_value=0,
+        max_value=12, value=(0 if samples else 1), step=1,
+        key=f"{key_prefix}_n_samples",
+    )
+    for i in range(int(n_samples)):
+        with st.expander(f"Sample {i + 1} — files", expanded=(i == 0 and not samples)):
+            name_key = f"{key_prefix}_sample_name_{i}"
+            special_character_widget(name_key, default=f"Sample {i + 1}")
+            sample_name = st.text_input("Sample name", key=name_key)
+            ups = st.file_uploader(
+                f"Time + {value_kind} file(s)",
+                type=["csv", "txt", "xlsx", "xls", "mpr", "mpt", "paax"],
+                accept_multiple_files=True,
+                key=f"{key_prefix}_files_{i}",
+            )
+            if not ups:
+                st.caption("No files uploaded for this sample yet.")
+                continue
+            t_parts, v_parts = [], []
+            for j, up in enumerate(ups):
+                raw = _orr_read_file(up, key_prefix=key_prefix, slot=f"{i}_{j}")
+                if raw is None:
+                    continue
+                coerced, cols = _orr_numeric_columns(raw)
+                if len(cols) < 2:
+                    st.warning(f"{up.name}: fewer than 2 numeric columns, skipped.")
+                    continue
+                series = _chrono_table_to_series(coerced, cols, mode)
+                if series is None:
+                    st.warning(f"{up.name}: no usable numeric rows, skipped.")
+                    continue
+                t_parts.append(series[0])
+                v_parts.append(series[1])
+            if not t_parts:
+                continue
+            t_sorted, v_sorted = sweep.ascending_xy(
+                np.concatenate(t_parts), np.concatenate(v_parts)
+            )
+            if len(t_sorted) < 2:
+                st.warning(f"{sample_name}: fewer than 2 valid points, skipped.")
+                continue
+            samples.append(
+                (_dedup_label(sample_name, seen_labels), t_sorted, v_sorted)
+            )
+    return samples
+
+
+def render_chrono_tab() -> None:
+    st.subheader("Chronoamperometry / Chronopotentiometry — stability")
+    st.caption(
+        "Long-duration stability test: current (chronoamperometry, "
+        "potential held constant) or potential (chronopotentiometry, "
+        "current held constant) recorded over time. Reports % retention "
+        "relative to an early baseline, a degradation rate, and the time "
+        "to fall to 90 %/50 % retention — the standard way catalyst/"
+        "electrode stability is compared across samples. This tab has its "
+        "own file upload and does not use the data loaded on the other tabs."
+    )
+
+    mode_choice = st.radio(
+        "Technique",
+        ["Chronoamperometry (current vs time)",
+         "Chronopotentiometry (potential vs time)"],
+        horizontal=True, key="chrono_mode",
+    )
+    mode = "CA" if mode_choice.startswith("Chronoamperometry") else "CP"
+
+    top1, top2, top3 = st.columns(3)
+    time_unit = top1.selectbox(
+        "Time unit as uploaded", list(_CHRONO_TIME_UNIT_S), index=0,
+        key="chrono_time_unit",
+    )
+    baseline_window = top2.number_input(
+        "Baseline averaging window (s)", min_value=1.0, value=60.0, step=10.0,
+        key="chrono_baseline_window",
+        help="The % retention reference is the mean value over this many "
+             "seconds from the start of the record, not just the first "
+             "point, so a noisy/transient opening reading doesn't set a "
+             "spurious 100 % reference.",
+    )
+    font_size = top3.selectbox(
+        "Axis font size (pt)", _JOURNAL_FONT_SIZES, index=0,
+        key="chrono_font_size_quick",
+        help="Quick control; the full appearance panel below overrides it.",
+    )
+
+    convert_density = False
+    area_cm2 = None
+    if mode == "CA":
+        st.markdown("**Current unit & electrode area**")
+        cur1, cur2, cur3 = st.columns([1.3, 1, 1])
+        native_unit = cur1.selectbox(
+            "Current unit as uploaded", _ABS_CURRENT_UNITS + _DENSITY_CURRENT_UNITS,
+            index=0, key="chrono_native_unit",
+        )
+        convert_density = cur2.checkbox(
+            "Convert absolute current to current density (÷ area)",
+            value=False, key="chrono_convert_density",
+            help="Enable if the uploaded current is absolute (e.g. mA) and "
+                 "you want the stability analysis reported as a current "
+                 "density (e.g. mA/cm²) instead.",
+        )
+        if convert_density:
+            abs_default = (native_unit if native_unit in _ABS_CURRENT_UNITS
+                           else _ABS_CURRENT_UNITS[0])
+            current_unit = cur3.selectbox(
+                "Desired current unit", _ABS_CURRENT_UNITS,
+                index=_ABS_CURRENT_UNITS.index(abs_default),
+                key="chrono_current_unit_abs",
+            )
+            area_cm2 = st.number_input(
+                "Electrode area (cm²)", min_value=1e-4, value=0.196, step=0.01,
+                format="%.4f", key="chrono_area_cm2",
+            )
+            display_unit = f"{current_unit}/cm²"
+        else:
+            current_unit = native_unit
+            display_unit = current_unit
+        value_label = f"Current ({display_unit})"
+    else:
+        native_unit = current_unit = display_unit = "V"
+        value_label = "Potential (V)"
+
+    series = _chrono_data_loader(mode)
+    if not series:
+        return
+    st.success(
+        f"Loaded {len(series)} sample(s): "
+        + ", ".join(lbl for lbl, _, _ in series)
+    )
+
+    style = plot_style_controls("chrono", show_markers=False, default_n_ticks=5)
+    font_size = style["font_size"]
+    _PALETTE_C = style["palette"]
+    palette_for = {
+        lbl: _PALETTE_C[i % len(_PALETTE_C)] for i, (lbl, _, _) in enumerate(series)
+    }
+
+    def _style_axes(fig, xtitle, ytitle, yrange=None):
+        _journal_axes_style(fig, xtitle, ytitle, font_size, yrange=yrange,
+                            style=style)
+
+    time_factor = _CHRONO_TIME_UNIT_S[time_unit]
+    results: dict[str, chrono.RetentionResult] = {}
+    rows = []
+    for lbl, t_raw, v_raw in series:
+        t_s = t_raw * time_factor
+        if mode == "CA":
+            v = _rescale_current(v_raw, native_unit, current_unit)
+            if convert_density:
+                v = v / area_cm2
+        else:
+            v = v_raw
+        try:
+            res = chrono.compute_retention(t_s, v, baseline_window_s=baseline_window)
+        except ValueError as exc:
+            st.warning(f"{lbl}: {exc}")
+            continue
+        results[lbl] = res
+        rows.append({
+            "Sample": lbl,
+            f"Baseline {value_label}": round(res.baseline, 4),
+            f"Final {value_label}": round(res.final_value, 4),
+            "Final retention (%)": round(res.final_retention_pct, 1),
+            "Degradation rate (%/h)": round(res.degradation_pct_per_hour, 4),
+            "Time to 90% retention (h)": (
+                round(res.time_to_90pct_s / 3600.0, 2)
+                if res.time_to_90pct_s is not None else None
+            ),
+            "Half-life (h)": (
+                round(res.half_life_s / 3600.0, 2)
+                if res.half_life_s is not None else None
+            ),
+            "Decay fit R2": round(res.r_squared, 4),
+        })
+
+    if not results:
+        return
+
+    st.markdown(f"**{value_label.split(' (')[0]} vs time**")
+    fig_vt = go.Figure()
+    vt_data: dict[str, list] = {}
+    for lbl, res in results.items():
+        t_h = res.time_s / 3600.0
+        fig_vt.add_trace(go.Scatter(
+            x=t_h, y=res.value, mode="lines", name=lbl,
+            line={"color": palette_for[lbl], "width": 2.5},
+        ))
+        vt_data[f"{lbl} — time (h)"] = list(t_h)
+        vt_data[f"{lbl} — {value_label}"] = list(res.value)
+    _style_axes(fig_vt, "Time (h)", value_label)
+    _white_background(fig_vt)
+    _pin_canvas(fig_vt)
+    _show_figure(fig_vt)
+    figure_downloads(
+        fig_vt, "chrono_value_vs_time", key="png_chrono_vt",
+        what="Value vs time plot", data=_padded_frame(vt_data),
+    )
+
+    st.markdown("**% retention vs time**")
+    fig_ret = go.Figure()
+    ret_data: dict[str, list] = {}
+    for lbl, res in results.items():
+        t_h = res.time_s / 3600.0
+        fig_ret.add_trace(go.Scatter(
+            x=t_h, y=res.retention_pct, mode="lines", name=lbl,
+            line={"color": palette_for[lbl], "width": 2.5},
+        ))
+        ret_data[f"{lbl} — time (h)"] = list(t_h)
+        ret_data[f"{lbl} — retention (%)"] = list(res.retention_pct)
+    fig_ret.add_hline(y=100, line={"dash": "dot", "color": "#999999", "width": 1})
+    fig_ret.add_hline(y=90, line={"dash": "dot", "color": "#cccccc", "width": 1})
+    _style_axes(fig_ret, "Time (h)", "Retention (%)")
+    _white_background(fig_ret)
+    _pin_canvas(fig_ret)
+    _show_figure(fig_ret)
+    figure_downloads(
+        fig_ret, "chrono_retention_vs_time", key="png_chrono_retention",
+        what="Retention vs time plot", data=_padded_frame(ret_data),
+    )
+
+    st.markdown("**Stability summary**")
+    st.caption(
+        "Baseline/final values are the raw quantity; retention and "
+        "degradation rate are always in %. R2 is of the linear fit used "
+        "for the degradation rate — a low value flags a noisy or "
+        "non-monotonic trace rather than a clean decay."
+    )
+    summary = pd.DataFrame(rows)
+    st.dataframe(summary, width="stretch", hide_index=True)
+    st.download_button(
+        "⬇️ Download stability summary (CSV)",
+        data=summary.to_csv(index=False).encode("utf-8"),
+        file_name="chrono_stability_summary.csv", mime="text/csv",
+        key="dl_chrono_summary",
+    )
+    _journal_table_figure(
+        summary, font_size, "chrono_stability_table", key="png_chrono_table",
+        style=style,
+    )
+
+    if len(rows) >= 2:
+        st.markdown("**Final retention comparison**")
+        bar_colors = [palette_for[r["Sample"]] for r in rows]
+        fig_bar = go.Figure(go.Bar(
+            x=[r["Sample"] for r in rows],
+            y=[r["Final retention (%)"] for r in rows],
+            marker={"color": bar_colors},
+        ))
+        _style_axes(fig_bar, "Sample", "Final retention (%)")
+        _white_background(fig_bar)
+        _pin_canvas(fig_bar)
+        _show_figure(fig_bar)
+        figure_downloads(
+            fig_bar, "chrono_final_retention_bar", key="png_chrono_bar",
+            what="Final retention bar chart",
+            data=_padded_frame({
+                "Sample": [r["Sample"] for r in rows],
+                "Final retention (%)": [r["Final retention (%)"] for r in rows],
+            }),
         )
 
 
@@ -5469,6 +6213,37 @@ def render_tutorials_tab() -> None:
             "electrolyte when precision matters."
         )
 
+    with st.expander("Chrono / Stability — chronoamperometry & chronopotentiometry"):
+        st.markdown(
+            "A long-duration stability test: current (chronoamperometry, "
+            "potential held constant) or potential (chronopotentiometry, "
+            "current held constant) recorded over time. Reported as "
+            "**retention** relative to an early baseline rather than the "
+            "raw trace:"
+        )
+        st.latex(
+            r"\text{Retention}(t) = \frac{\text{value}(t)}"
+            r"{\overline{\text{value}}_{\,[0,\,t_{\text{baseline}}]}} "
+            r"\times 100\%"
+        )
+        st.markdown(
+            "where the baseline is the mean value over the first "
+            "``baseline window`` seconds (not just the first point), so a "
+            "noisy or transient opening reading doesn't set a spurious "
+            "100 % reference. The **degradation rate** is the slope of a "
+            "linear fit of retention (%) vs. time (h); **time to 90 % "
+            "retention** and **half-life** are read off the same trace by "
+            "linear interpolation between the bracketing samples, and come "
+            "back blank if the sample never falls that far in the "
+            "recorded window."
+        )
+        st.caption(
+            "This is a generic retention/degradation-rate calculation, not "
+            "specific to one reaction — the physical interpretation (e.g. "
+            "catalyst activity loss vs. rising overpotential) depends on "
+            "which technique and quantity you're tracking."
+        )
+
     with st.expander("Reference electrodes & the RHE conversion"):
         st.markdown(
             "Every tab that plots potential converts to the reversible "
@@ -5506,14 +6281,15 @@ def main():
     st.title(f"⚡ {APP_NAME}")
     st.caption(
         "EIS fitting → Ru extraction → LSV ohmic-drop correction, plus "
-        "independent Tafel-slope analysis"
+        "independent Tafel-slope, ORR/RRDE, and chrono-stability analysis"
     )
 
     _clear_reset_control()
 
-    tab_eis, tab_lsv, tab_tafel, tab_kl, tab_orr, tab_tutorials = st.tabs(
+    tab_eis, tab_lsv, tab_tafel, tab_kl, tab_orr, tab_chrono, tab_tutorials = st.tabs(
         ["📈 EIS / Ru Analysis", "🔬 LSV iR Correction", "📐 LSV Analysis",
-         "📉 K-L Analysis", "⚛️ ORR / RRDE Analysis", "🎓 Tutorials"]
+         "📉 K-L Analysis", "⚛️ ORR / RRDE Analysis", "⏱️ Chrono / Stability",
+         "🎓 Tutorials"]
     )
 
     with tab_eis:
@@ -5596,6 +6372,9 @@ def main():
 
     with tab_orr:
         render_orr_tab()
+
+    with tab_chrono:
+        render_chrono_tab()
 
     with tab_tutorials:
         render_tutorials_tab()

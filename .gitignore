@@ -229,6 +229,13 @@ Desktop.ini
 # Personal local sample data
 sample-data/Obed data/
 
+# Raw instrument-export files used to verify format parsers against ground
+# truth (e.g. Biologic .mpr/.mpt, CH Instruments .bin, Pine binary) — not
+# published, since these are the user's own real experimental data. The
+# README explaining what to drop there stays tracked.
+sample-data/instrument-samples/*
+!sample-data/instrument-samples/README.md
+
 # Generated figures (kept local only, not published)
 figures/
 
