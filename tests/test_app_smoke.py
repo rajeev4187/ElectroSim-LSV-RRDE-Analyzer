@@ -97,7 +97,10 @@ def test_style_helpers_are_self_consistent():
         assert all(c.startswith("#") and len(c) == 7 for c in colours), name
 
     for position in app._LEGEND_POSITIONS:
-        assert position == "hidden" or position in app._LEGEND_ANCHORS, position
+        # "hidden" and "auto" are dynamic sentinels resolved at render time
+        # (auto -> whichever corner _auto_legend_corner picks), not static
+        # anchors themselves.
+        assert position in ("hidden", "auto") or position in app._LEGEND_ANCHORS, position
 
 
 def test_apply_plot_style_produces_a_renderable_figure():

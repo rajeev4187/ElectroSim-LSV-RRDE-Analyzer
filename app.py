@@ -1147,10 +1147,11 @@ def sidebar_units(current_default: str | None = None,
     if correction.needs_area(current_unit, ru_unit):
         area_cm2 = st.sidebar.number_input(
             "Electrode area (cm²)",
-            min_value=1e-4, value=0.04, step=0.01, format="%.4f",
+            min_value=1e-4, value=0.19625, step=0.001, format="%.5f",
             help="Geometric (or active) electrode area used to convert between "
                  "Ω and Ω·cm². Enter YOUR electrode's area — the default "
-                 "(0.04 cm²) is just a common value.",
+                 "(0.19625 cm², the standard 5 mm-diameter RDE/RRDE "
+                 "glassy-carbon disk) is just a common value.",
         )
         if is_density:  # current mA/cm² + Ru in Ω
             st.sidebar.caption(
@@ -1725,7 +1726,8 @@ def render_lsv_tab(lsv_d, ru: float | None, current_unit: str = "mA",
         # side-by-side view (update_xaxes/update_yaxes with no row/col
         # target every axis in the figure).
         lsvir_small_font = {"family": _ARIAL, "size": max(11, round(font_size * 0.55))}
-        lsvir_legend = _legend_layout(style, lsvir_small_font)
+        lsvir_legend = _legend_layout(style, lsvir_small_font, fig=fig,
+                                      x_range=x_range, y_range=y_range)
         lsvir_position = style.get("legend_position", "outside-right")
         fig.update_layout(
             template="plotly_white",
@@ -1956,13 +1958,13 @@ _PALETTES: dict[str, list[str]] = {
 _LINE_DASHES = ["solid", "dot", "dash", "longdash", "dashdot"]
 _MARKER_SYMBOLS = ["circle", "square", "diamond", "triangle-up", "cross",
                    "x", "star", "hexagon"]
-_LEGEND_POSITIONS = ["top-left", "top-right", "bottom-left", "bottom-right",
-                     "outside-right", "below", "hidden"]
+_LEGEND_POSITIONS = ["auto", "top-left", "top-right", "bottom-left",
+                     "bottom-right", "outside-right", "below", "hidden"]
 
 
 def plot_style_controls(key_prefix: str, *, default_palette: str = "Default (Plotly)",
                         show_markers: bool = True,
-                        default_legend: str = "outside-right",
+                        default_legend: str = "auto",
                         default_n_ticks: int = 5) -> dict:
     """Render the shared "Plot appearance" panel and return a style dict.
 
@@ -2004,8 +2006,10 @@ def plot_style_controls(key_prefix: str, *, default_palette: str = "Default (Plo
             help="This is the setting the downloaded figure uses. Dragging "
                  "the legend on the chart moves it on screen only — that "
                  "edit stays in the browser and the saved file will not have "
-                 "it. 'outside-right' (default) sits clear of the data so "
-                 "nothing is hidden behind it.",
+                 "it. 'auto' (default) picks whichever corner of the plot "
+                 "has the least data in it, so the legend sits inside the "
+                 "axes without covering a curve — pick a fixed corner or "
+                 "'outside-right' instead if you'd rather choose by hand.",
         )
 
         d1, d2, d3, d4 = st.columns(4)
@@ -2088,7 +2092,57 @@ _LEGEND_ANCHORS = {
 }
 
 
-def _legend_layout(style: dict, font: dict) -> dict | None:
+def _auto_legend_corner(fig, x_range=None, y_range=None, zone_frac: float = 0.30) -> str:
+    """The corner ('top-left'/'top-right'/'bottom-left'/'bottom-right') with
+    the fewest data points in its own ``zone_frac`` x ``zone_frac`` region of
+    the axes -- a lightweight, data-driven stand-in for matplotlib's
+    ``loc='best'`` legend placement, which Plotly has no native equivalent
+    of. Reads x/y straight off the figure's own traces (added before this
+    runs, in every caller), so no caller has to pass its data separately;
+    ``x_range``/``y_range`` (each an optional ``[lo, hi]``) let a caller
+    that already computed the axis's displayed range hand it over directly,
+    falling back to the data's own extent otherwise. Ties (including "no
+    data at all") fall back to 'top-right', Plotly's own default corner.
+    """
+    xs_parts, ys_parts = [], []
+    for trace in fig.data:
+        x, y = getattr(trace, "x", None), getattr(trace, "y", None)
+        if x is None or y is None:
+            continue
+        try:
+            # A bar chart's category axis (e.g. sample names) is not
+            # numeric at all -- skip that trace for placement purposes
+            # rather than crashing the whole figure over it.
+            x_arr = np.asarray(x, dtype=float)
+            y_arr = np.asarray(y, dtype=float)
+        except (TypeError, ValueError):
+            continue
+        xs_parts.append(x_arr)
+        ys_parts.append(y_arr)
+    if not xs_parts:
+        return "top-right"
+    xs, ys = np.concatenate(xs_parts), np.concatenate(ys_parts)
+    finite = np.isfinite(xs) & np.isfinite(ys)
+    xs, ys = xs[finite], ys[finite]
+    if len(xs) == 0:
+        return "top-right"
+    x_lo, x_hi = (float(x_range[0]), float(x_range[1])) if x_range else (
+        float(np.min(xs)), float(np.max(xs)))
+    y_lo, y_hi = (float(y_range[0]), float(y_range[1])) if y_range else (
+        float(np.min(ys)), float(np.max(ys)))
+    if x_hi <= x_lo or y_hi <= y_lo:
+        return "top-right"
+    x_norm, y_norm = (xs - x_lo) / (x_hi - x_lo), (ys - y_lo) / (y_hi - y_lo)
+    counts = {
+        "top-left": np.count_nonzero((x_norm <= zone_frac) & (y_norm >= 1 - zone_frac)),
+        "top-right": np.count_nonzero((x_norm >= 1 - zone_frac) & (y_norm >= 1 - zone_frac)),
+        "bottom-left": np.count_nonzero((x_norm <= zone_frac) & (y_norm <= zone_frac)),
+        "bottom-right": np.count_nonzero((x_norm >= 1 - zone_frac) & (y_norm <= zone_frac)),
+    }
+    return min(counts, key=counts.get)
+
+
+def _legend_layout(style: dict, font: dict, fig=None, x_range=None, y_range=None) -> dict | None:
     """Legend kwargs for one figure, from a :func:`plot_style_controls` dict.
 
     ``None`` means "hidden" (caller should set ``showlegend=False``).
@@ -2096,11 +2150,19 @@ def _legend_layout(style: dict, font: dict) -> dict | None:
     iR Correction, LSV Analysis' Original LSV and Tafel plots) that set
     their own ``fig.update_layout`` for hover/dragmode reasons -- so every
     figure's legend obeys the same "Legend" dropdown and stays draggable
-    (see ``_PLOTLY_EDIT_CONFIG``) instead of only some of them.
+    (see ``_PLOTLY_EDIT_CONFIG``) instead of only some of them. When the
+    dropdown is set to ``"auto"``, ``fig`` (with its traces already added)
+    picks the actual corner via :func:`_auto_legend_corner`; a caller with
+    no figure handy for the "auto" case falls back to the fixed
+    'top-right' corner.
     """
-    position = style.get("legend_position", "outside-right")
+    position = style.get("legend_position", "auto")
     if position == "hidden":
         return None
+    if position == "auto":
+        position = (
+            _auto_legend_corner(fig, x_range, y_range) if fig is not None else "top-right"
+        )
     return dict(**_LEGEND_ANCHORS[position], font=font,
                 bgcolor="rgba(255,255,255,0.7)", tracegroupgap=18)
 
@@ -2131,10 +2193,10 @@ def apply_plot_style(fig, style: dict, xtitle: str, ytitle: str,
     family, size = _font_stack(style["font_family"]), int(style["font_size"])
     axis_font = {"family": family, "size": size}
     small_font = {"family": family, "size": max(9, round(size * 0.55))}
-    position = style.get("legend_position", "outside-right")
+    position = style.get("legend_position", "auto")
     title_size = size + 8
 
-    legend_kwargs = _legend_layout(style, small_font)
+    legend_kwargs = _legend_layout(style, small_font, fig=fig, y_range=yrange)
     # 10 px is not enough room for a tick label, let alone an axis title:
     # every exported figure came out with its y-axis numbers and both axis
     # titles clipped at the edge. One derivation for every figure, so the
@@ -3174,8 +3236,10 @@ def render_tafel_tab(shared_instrument_file: tuple[bytes, str] | None = None) ->
                  "this unit, then divided by the electrode area.",
         )
         area_cm2 = cur3.number_input(
-            "Electrode area (cm²)", min_value=1e-4, value=0.04, step=0.01,
-            format="%.4f", key="tafel_area_cm2",
+            "Electrode area (cm²)", min_value=1e-4, value=0.19625, step=0.001,
+            format="%.5f", key="tafel_area_cm2",
+            help="0.19625 cm² is the standard 5 mm-diameter RDE/RRDE "
+                 "glassy-carbon disk.",
         )
         display_unit = f"{current_unit}/cm²"
         st.caption(
@@ -3566,7 +3630,8 @@ def render_tafel_tab(shared_instrument_file: tuple[bytes, str] | None = None) ->
                 x=onset_v, line={"color": meta["color"], "dash": "dot", "width": 1.5},
             )
             onset_marked = True
-        orig_lsv_legend = _legend_layout(style, small_font)
+        orig_lsv_legend = _legend_layout(style, small_font, fig=lsv_fig,
+                                         x_range=lsv_x_range, y_range=lsv_y_range)
         orig_lsv_position = style.get("legend_position", "outside-right")
         orig_lsv_ytitle = f"Current ({display_unit})"
         orig_lsv_margin = {**_journal_margin(
@@ -3715,7 +3780,8 @@ def render_tafel_tab(shared_instrument_file: tuple[bytes, str] | None = None) ->
         f"Tafel plot — {' & '.join(distinct_reactions)}" if multi_reaction
         else "Tafel plot"
     )
-    tafel_legend = _legend_layout(style, small_font)
+    tafel_legend = _legend_layout(style, small_font, fig=fig,
+                                  x_range=tafel_x_range, y_range=tafel_y_range)
     tafel_legend_position = style.get("legend_position", "outside-right")
     tafel_ytitle = "Potential vs RHE / V"
     tafel_margin = {**_journal_margin(
@@ -4135,13 +4201,13 @@ def render_kl_tab() -> None:
              "fit and n always use A/cm² internally regardless of this.",
     )
     area_cm2 = cur3.number_input(
-        "Electrode area (cm²)", min_value=1e-4, value=0.196, step=0.001,
-        format="%.4f", key="kl_area_cm2",
+        "Electrode area (cm²)", min_value=1e-4, value=0.19625, step=0.001,
+        format="%.5f", key="kl_area_cm2",
         disabled=uploaded_is_density,
-        help="0.196 cm² is the standard 5 mm-diameter RDE glassy-carbon disk. "
-             "Used to convert the uploaded absolute current into the A/cm² "
-             "current density the Koutecký–Levich fit and n require. Not "
-             "needed (and disabled) when the upload is already a density.",
+        help="0.19625 cm² is the standard 5 mm-diameter RDE glassy-carbon "
+             "disk. Used to convert the uploaded absolute current into the "
+             "A/cm² current density the Koutecký–Levich fit and n require. "
+             "Not needed (and disabled) when the upload is already a density.",
     )
     display_unit = desired_unit if uploaded_is_density else f"{desired_unit}/cm²"
     if unit_hint:
@@ -6393,8 +6459,10 @@ def render_chrono_tab(shared_instrument_file: tuple[bytes, str] | None = None) -
                 key="chrono_current_unit_abs",
             )
             area_cm2 = st.number_input(
-                "Electrode area (cm²)", min_value=1e-4, value=0.196, step=0.01,
-                format="%.4f", key="chrono_area_cm2",
+                "Electrode area (cm²)", min_value=1e-4, value=0.19625, step=0.001,
+                format="%.5f", key="chrono_area_cm2",
+                help="0.19625 cm² is the standard 5 mm-diameter RDE/RRDE "
+                     "glassy-carbon disk.",
             )
             display_unit = f"{current_unit}/cm²"
         else:
