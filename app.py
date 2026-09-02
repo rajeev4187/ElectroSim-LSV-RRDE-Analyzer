@@ -5337,9 +5337,21 @@ def render_orr_tab(shared_instrument_file: tuple[bytes, str] | None = None) -> N
         # bottom edge (which is what "the title runs off the image" looks
         # like at a long label + large export font).
         fig_disk_height = _min_height_for_rotated_title(disk_ytitle, font_size, 0, 680)
+        # This two-row subplot is built by hand (make_subplots, not
+        # apply_plot_style), so unlike every other figure in this tab it was
+        # never wired to the "Legend" control -- it fell back to Plotly's own
+        # default legend position, which sits *outside* the plot with only a
+        # fixed 40 px margin to hold it, so it ran off the exported canvas
+        # for more than a couple of samples. Same auto-corner/margin pattern
+        # apply_plot_style itself uses (see _legend_layout, _legend_margin_extra).
+        disk_legend_font = {"family": _ARIAL, "size": max(11, round(font_size * 0.55))}
+        disk_legend = _legend_layout(style, disk_legend_font, fig=fig_disk, x_range=disk_x_range)
         fig_disk.update_layout(
             template="plotly_white", height=fig_disk_height, width=930,
-            font=axis_font_disk, margin={"l": left_margin, "r": 40},
+            font=axis_font_disk,
+            showlegend=disk_legend is not None,
+            **({"legend": disk_legend} if disk_legend is not None else {}),
+            margin={"l": left_margin, "r": 40, **_legend_margin_extra(style)},
         )
         fig_disk.update_xaxes(
             title=_axis_title("Potential vs RHE / V", font_size, family=_ARIAL),
@@ -6028,9 +6040,17 @@ def render_orr_tab(shared_instrument_file: tuple[bytes, str] | None = None) -> N
             rrde_ytitle = f"Current ({display_unit})"
             fig_rrde_height = _min_height_for_rotated_title(
                 rrde_ytitle, font_size, 0, 680)
+            # Same hand-built-subplot gap as fig_disk above: never wired to
+            # the "Legend" control, so it fell back to Plotly's own outside
+            # default with only a 40 px margin to hold it.
+            rrde_legend_font = {"family": _ARIAL, "size": max(11, round(font_size * 0.55))}
+            rrde_legend = _legend_layout(style, rrde_legend_font, fig=fig_rrde, x_range=rrde_x_range)
             fig_rrde.update_layout(
                 template="plotly_white", height=fig_rrde_height, width=930,
-                font=axis_font_rrde, margin={"l": left_margin, "r": 40},
+                font=axis_font_rrde,
+                showlegend=rrde_legend is not None,
+                **({"legend": rrde_legend} if rrde_legend is not None else {}),
+                margin={"l": left_margin, "r": 40, **_legend_margin_extra(style)},
             )
             fig_rrde.update_xaxes(
                 title=_axis_title("Potential vs RHE / V", font_size, family=_ARIAL),
