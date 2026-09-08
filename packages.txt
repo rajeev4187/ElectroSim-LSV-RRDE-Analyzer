@@ -1,4 +1,0 @@
-fonts-liberation
-fonts-noto-core
-fonts-noto-extra
-chromium
